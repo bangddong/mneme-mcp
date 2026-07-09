@@ -1,6 +1,6 @@
 @echo off
-REM Mneme MCP 서버 기동 스크립트 (부팅 시 자동 실행됨)
-REM 파이썬 결정 순서: 1) repo 내 .venv  2) 환경변수 MNEME_PYTHON  3) PATH의 python
+REM Mneme MCP server launcher (auto-run at boot)
+REM Python resolution order: 1) repo .venv  2) MNEME_PYTHON env  3) python on PATH
 cd /d "%~dp0"
 set "PYTHON_EXE=python"
 if defined MNEME_PYTHON set "PYTHON_EXE=%MNEME_PYTHON%"
