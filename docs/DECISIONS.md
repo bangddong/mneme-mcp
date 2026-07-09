@@ -11,6 +11,28 @@
 
 ---
 
+## 2026-07-09
+
+### 1. Public 전환 — 엔진/데이터 분리 (확정)
+mneme-mcp·wiki-agent는 **public(엔진)**, 위키는 **private(데이터)**. 누구나 엔진을
+clone해 자기 데이터를 꽂을 수 있고, 개인 지식은 노출되지 않는다.
+개인 상황에 기반한 판단 근거는 개인 위키로 분리(기준: "fork한 타인에게도 유효한가" — 헤더 노트),
+커밋 히스토리는 단일 커밋으로 재구성. `Dockerfile`+`compose.yaml` 추가로
+"clone → `docker compose up`" 이식 경로 확보(컨테이너 MCP handshake 검증).
+
+### 2. 페이지 단위 공유 준비 — visibility 필드 + bearer 인증 (확정)
+위키의 제한적 공유는 repo 가시성(전부 아니면 전무)이 아니라 3층으로 푼다:
+1. **frontmatter `visibility: public|shared|private`** (생략=private, lint 어휘 검사) —
+   지금은 **마킹만**. 기본값이 private이라 실수로 새는 방향이 없다.
+2. (later) public 페이지만 추려 정적 배포하는 파이프라인.
+3. **bearer 인증** (`MCP_AUTH_TOKEN` env, fastmcp `StaticTokenVerifier`) — shared 페이지
+   게이트 + 모바일 캡처 커넥터(Tailscale Funnel)의 선행 조건. 비우면 무인증(로컬 전용,
+   기존과 동일). 쉼표 구분 복수 토큰, `이름:토큰` 형식이면 접속자 식별.
+   ⚠️ 현재는 인증(전부/전무)만 — visibility 기반 응답 필터링(게스트 스코프)은
+   실제 공유 상대가 생길 때 붙인다(수요 검증 전 구현 금지 원칙, 07-02 #3과 동일).
+
+---
+
 ## 2026-07-02
 
 ### 1. 위키를 OKF(Open Knowledge Format) v0.1에 정합 (확정)

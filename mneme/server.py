@@ -21,7 +21,32 @@ from mneme import growth
 from mneme.watcher import start_watcher, stop_watcher
 from mneme.scheduler import start_scheduler, stop_scheduler
 
-mcp = FastMCP("mneme")
+def _build_auth():
+    """MCP_AUTH_TOKEN이 설정되면 bearer 정적 토큰 인증을 켠다.
+
+    비우면 인증 없음(로컬 전용, 기존과 동일). 외부 노출(Tailscale Funnel 등) 시 필수.
+    쉼표로 여러 토큰 허용 — `이름:토큰` 형식이면 이름이 client_id로 기록돼
+    누가 접속했는지 에피소드 로그에서 식별 가능.
+    """
+    raw = os.getenv("MCP_AUTH_TOKEN", "").strip()
+    if not raw:
+        return None
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
+    tokens: dict[str, dict] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        name, sep, tok = item.partition(":")
+        if sep:
+            tokens[tok.strip()] = {"client_id": name.strip() or "unnamed"}
+        else:
+            tokens[item] = {"client_id": "owner"}
+    return StaticTokenVerifier(tokens=tokens)
+
+
+mcp = FastMCP("mneme", auth=_build_auth())
 
 
 @mcp.tool()

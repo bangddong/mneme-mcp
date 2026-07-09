@@ -134,7 +134,7 @@ tags: [tag1, tag2]
 | 재시작 | 중지 → 시작 (`.env` 변경 후 필수) |
 | 로그 | `memory/server.log` (일반), `memory/server.err.log` (오류) |
 
-**`.env` 항목:** `LLM_BASE_URL`/`LLM_MODEL`(로컬 LLM) · `WIKI_DIR` · `DB_PATH` · `MCP_HOST`/`MCP_PORT` · `OUTER_LOOP_INTERVAL_MIN` · `DISCORD_WEBHOOK_URL`
+**`.env` 항목:** `LLM_BASE_URL`/`LLM_MODEL`(로컬 LLM) · `WIKI_DIR` · `DB_PATH` · `MCP_HOST`/`MCP_PORT` · `OUTER_LOOP_INTERVAL_MIN` · `DISCORD_WEBHOOK_URL` · `MCP_AUTH_TOKEN`(bearer 인증 — 비우면 무인증 로컬 전용, 외부 노출 시 필수)
 
 ---
 

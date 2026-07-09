@@ -107,6 +107,12 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
   이미지 빌드 + 컨테이너에서 MCP initialize 200 OK 검증 (Linux 동작 확인).
 - [x] **히스토리 squash**: 개인 맥락이 남은 과거 커밋을 제거하고 단일 커밋으로 재구성
   (구 히스토리는 로컬 `private-history` 브랜치 + bundle 백업) → public 전환 준비 완료.
+- [x] **PUBLIC 전환 완료**: mneme-mcp·wiki-agent public, 위키는 private 유지 (엔진/데이터 분리 — DECISIONS 07-09 #1)
+- [x] **visibility 필드**: OKF 선택 필드 `visibility: public|shared|private`(생략=private) —
+  lint 어휘 검사(`VISIBILITY_VOCAB`) + wiki CLAUDE.md·guide/writing-format 규약 동기. 마킹만, 파이프라인은 later (DECISIONS 07-09 #2)
+- [x] **bearer 인증**: `MCP_AUTH_TOKEN` env → fastmcp `StaticTokenVerifier`(비우면 무인증=기존 동일,
+  `이름:토큰` 복수 지원). 격리 인스턴스 검증: 무토큰 401 / 오토큰 401 / 유효 200.
+  ※ 라이브 서버는 재시작해야 반영 (07-07 wiki_inject 게이트 변경도 동일)
 
 ---
 

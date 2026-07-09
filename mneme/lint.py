@@ -28,6 +28,9 @@ REQUIRED_FRONTMATTER = ("type", "title", "timestamp", "tags")
 REQUIRED_SECTIONS = ("Summary", "Details", "Sources", "Related")
 # OKF type 어휘 (wiki/CLAUDE.md "문서 type 어휘" 표와 동기)
 TYPE_VOCAB = ("concept", "source", "lesson", "roadmap", "schema", "doc")
+# visibility 어휘 (선택 필드, 없으면 private 취급 — wiki/CLAUDE.md와 동기)
+# 지금은 마킹만 강제(어휘 검사). 공개 파이프라인/공유 게이트가 붙을 때 이 값을 읽는다.
+VISIBILITY_VOCAB = ("public", "shared", "private")
 STALE_DAYS = 180
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # [[target]] 또는 [[target|표시명]] — 레거시 위키링크 (stub 줄은 호출부에서 제외)
@@ -110,6 +113,11 @@ def lint_page_text(text: str, label: str = "content") -> list[str]:
         upd = fm.get("timestamp", "")
         if upd and not DATE_RE.match(upd):
             errors.append(f"[{label}] timestamp 형식 오류(YYYY-MM-DD): {upd}")
+        vis = fm.get("visibility", "")
+        if vis and vis not in VISIBILITY_VOCAB:
+            errors.append(
+                f"[{label}] visibility 어휘 밖: {vis} (허용: {', '.join(VISIBILITY_VOCAB)})"
+            )
     for sec in REQUIRED_SECTIONS:
         if not re.search(rf"^##\s+{sec}\b", text, re.MULTILINE):
             errors.append(f"[{label}] 필수 섹션 누락: ## {sec}")
