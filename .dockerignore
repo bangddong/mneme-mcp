@@ -1,0 +1,7 @@
+.git
+memory/
+wiki/
+.env
+*.bat
+docs/
+*.md

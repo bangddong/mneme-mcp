@@ -1,0 +1,19 @@
+<!-- mneme 연동 규약 블록 — install 스크립트가 {{...}}를 치환해 프로젝트 CLAUDE.md에 추가합니다. -->
+## mneme (외부 성장 두뇌) 사용 규칙
+
+`http://localhost:8080/mcp`에 상시 가동되는 공유 두뇌 MCP. 매 세션 초기화되지 않고
+경험·지식이 누적된다. **이 프로젝트의 에이전트 이름은 `{{AGENT_NAME}}`** — mneme 호출 시
+`agent`(또는 `source_agent`)에 항상 이 이름을 넘겨 "누가 한 일"인지 기록되게 한다.
+
+| 시점 | 호출 | 목적 |
+|------|------|------|
+| 작업 시작 전 | `skill_suggest(task, session_id)` | 관련 스킬·과거 교훈을 받아 계획에 반영 |
+| 세션 시작/주기적 | `growth_log()` | 자기평가가 쌓아둔 "조치 필요" 항목 확인 → 해소 시 `growth_resolve(id, note)` |
+| 지식 검색 | `wiki_search(query, session_id, agent="{{AGENT_NAME}}")` | 위키에서 관련 문서 검색 |
+| 새 역량 등장 시 | `skill_seed(name, description)` | 스킬 등록 (이 프로젝트 스킬은 `{{SKILL_PREFIX}}` 접두어) |
+| 지식 축적 | `wiki_inject(path, content, source_agent="{{AGENT_NAME}}", session_id)` | 위키 카테고리 `{{WIKI_CATEGORY}}/` 사용. content는 OKF 페이지 형식: frontmatter에 `type: concept`(필수)·title·description·`timestamp: YYYY-MM-DD`·tags + Summary/Details/Sources/Related 섹션. 링크는 위키 루트 절대경로(`/카테고리/pages/...md`), 미존재 페이지는 같은 줄에 `<!-- stub -->`. 페이지는 `pages/<서브폴더>/` 아래에 배치(직속 금지). **형식 위반 시 `action: "rejected"` + errors가 오면 고쳐서 재호출.** `index.md`/`log.md`는 서버가 자동 갱신하므로 직접 inject 금지 |
+| 작업 종료 후 | `episode_reflect(task, outcome, success, score, skills_used, session_id, agent="{{AGENT_NAME}}")` | 결과 반성 제출 → 성향 학습 |
+
+- `session_id`는 세션마다 임의의 고정 문자열 하나를 정해 일관되게 쓴다(검색 캐시 키).
+- mneme 서버가 꺼져 있으면 도구가 안 보인다 — **무시하고 평소대로 진행**하면 된다(선택적 의존).
+- 자세한 동작 원리·아키텍처는 `E:/development/mneme-mcp/docs/` 참고.

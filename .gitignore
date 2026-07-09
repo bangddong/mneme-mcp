@@ -1,0 +1,19 @@
+# 민감 정보
+.env
+
+# 런타임 데이터 (재생성 가능)
+memory/
+
+# wiki 데이터 (별도 관리)
+wiki/**
+!wiki/.gitkeep
+
+# Python 빌드 아티팩트
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+
+# 잡파일
+*.stackdump
