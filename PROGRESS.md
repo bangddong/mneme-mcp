@@ -4,7 +4,7 @@
 > 매 작업 시작·완료 시 갱신한다.
 > ⚠️ 이 파일은 public repo에 포함된다 — 개인 상황·일정 맥락은 적지 않는다 (개인 위키로).
 
-**최종 갱신**: 2026-07-09
+**최종 갱신**: 2026-07-12 (진척 점검 — §3 완료 항목 체크 정리)
 
 ---
 
@@ -95,7 +95,7 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
   → **에러 로그 07-06 개선 ①② 완료**. integration 템플릿에 계약 반영.
 - [x] 검증: 임시 위키 12케이스 통과(거부 5종/생성+예약파일 자동갱신/병합 게이트가 실제 LLM의
   Summary 누락 병합을 차단·원문 보존/같은 날 log 헤딩 누적). 실위키 전체 lint 오류 0.
-- [ ] 잔여: 연동 프로젝트에 설치된 규약 블록은 구버전 — `install.py` 재실행으로 갱신 필요(해당 repo 미커밋 상태라 보류).
+- [x] 잔여 해소(07-12): 연동 프로젝트의 구버전 규약 블록을 v2로 갱신 — 구 블록 제거 후 `install.py` 재실행(연동 프로젝트 별도 브랜치 커밋). ※ install.py는 기존 `## mneme` 블록이 있으면 skip이므로 갱신 시 구 블록 먼저 제거 필요.
 
 ### 2026-07-09 세션 (public 전환 준비)
 - [x] **개인 맥락 분리**: docs(DECISIONS/PROGRESS/INTEGRATION/PLAYBOOK)의 개인 상황 근거를
@@ -121,8 +121,8 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 ### ★ 다음 세션 (2026-07-03 이어서)
 - [x] **Discord 웹훅 연결 완료(07-03)**: `.env`에 URL 등록 + 서버 재시작 + `notify_degrading` 테스트 발송 성공(sent: True)
 - [x] **`mcp__mneme__*` 툴 정상 확인(07-03)**: mneme_status/growth_log/outer_loop_status 응답 정상
-- [ ] 백업 `~/.claude.json.bak-mneme` 삭제 (툴 확인 조건 충족 — 사용자 승인 대기)
-- [ ] **⚠️ skills 재시드**: skills 테이블이 비어 있음(07-03 발견). 06-25 사이클엔 `study-k8s-ingress`가 developing 승급 이력이 있으나 행 소실 — 에피소드 13건·loop_cycles는 온전, 코드에 삭제 경로 없음, 중복 DB 없음(원인 미상). 강사 모드 재개 전 `skill_seed`로 재시드 필요
+- [x] 백업 `~/.claude.json.bak-mneme` 삭제 완료(07-03)
+- [x] **skills 재시드 완료(07-03)**: `study-k8s-ingress` 복원 + `study-k8s-configmap-secret` 신규 (07-12 점검: seeding 2건 확인). 소실 원인은 여전히 미상 — 재발 시 추적
 - [ ] **강사 모드 학습 재개** — 스킬·에피소드가 쌓여야 Outer Loop(20 에피소드 게이트)·복습 알림·curriculum이 실제로 작동 시작. k8s stage 이어가기 또는 `curriculum_suggest()` 추천
 - [ ] (위키 쌓인 뒤) **소비 프로젝트 도메인 시드 반자동**: 위키 concept 페이지 훑어 빌드타임 시드 PR — PLAYBOOK §8 프롬프트
 - [ ] (보류 — 수요 검증 시) mneme 인증(bearer) + Claude 모바일 커스텀 커넥터 (Tailscale Funnel)
