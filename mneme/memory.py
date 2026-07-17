@@ -30,6 +30,7 @@ def init_db():
                 path TEXT PRIMARY KEY,
                 summary TEXT,
                 tags TEXT,
+                content_hash TEXT,   -- 원문 sha256 (미변경 페이지 재요약 스킵용)
                 updated_at TEXT,
                 updated_by TEXT
             );
@@ -127,4 +128,8 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_growth_open
                 ON growth_actions(status, dedup_key);
         """)
+        # 마이그레이션: 기존 DB의 wiki_index에 content_hash 컬럼 보강 (없으면 추가)
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(wiki_index)")]
+        if "content_hash" not in cols:
+            conn.execute("ALTER TABLE wiki_index ADD COLUMN content_hash TEXT")
     conn.close()

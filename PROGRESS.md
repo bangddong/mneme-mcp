@@ -4,7 +4,7 @@
 > 매 작업 시작·완료 시 갱신한다.
 > ⚠️ 이 파일은 public repo에 포함된다 — 개인 상황·일정 맥락은 적지 않는다 (개인 위키로).
 
-**최종 갱신**: 2026-07-12 (진척 점검 — §3 완료 항목 체크 정리)
+**최종 갱신**: 2026-07-14 (기동 시간 단축 — reindex 미변경 페이지 스킵 + 첫 pytest)
 
 ---
 
@@ -97,6 +97,15 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
   Summary 누락 병합을 차단·원문 보존/같은 날 log 헤딩 누적). 실위키 전체 lint 오류 0.
 - [x] 잔여 해소(07-12): 연동 프로젝트의 구버전 규약 블록을 v2로 갱신 — 구 블록 제거 후 `install.py` 재실행(연동 프로젝트 별도 브랜치 커밋). ※ install.py는 기존 `## mneme` 블록이 있으면 skip이므로 갱신 시 구 블록 먼저 제거 필요.
 
+### 2026-07-14 세션 (기동 시간 단축 · 첫 pytest)
+- [x] **reindex 미변경 페이지 스킵**: `wiki_index`에 `content_hash`(원문 sha256) 추가.
+  `index_file()`이 저장된 해시와 같고 FTS에도 남아 있으면 값비싼 `llm.generate_summary`를
+  건너뜀(`force=True`로 강제 재요약 가능). 기동 시 매번 전 페이지 재요약(~4분, 에러 로그 07-03)
+  → 최초 1회만 요약하고 이후 변경분만 재요약. `memory.init_db`에 무손실 마이그레이션
+  (기존 DB `ALTER TABLE ADD COLUMN`). 실 DB 54행은 다음 기동 때 1회 요약 후 스킵 전환.
+- [x] **첫 pytest 도입**: `tests/test_reindex_skip.py` 5케이스(최초 전량 요약/미변경 스킵/
+  변경분만 재요약/스킵 후 검색 정상/구DB 마이그레이션). 격리 WIKI_DIR·DB_PATH + summary 호출 카운터.
+
 ### 2026-07-09 세션 (public 전환 준비)
 - [x] **개인 맥락 분리**: docs(DECISIONS/PROGRESS/INTEGRATION/PLAYBOOK)의 개인 상황 근거를
   개인 위키로 이관하고 예시를 일반화(`myapp`). 분리 기준 = *"fork한 타인에게도 유효한가"*
@@ -151,10 +160,10 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 - [ ] 잔여: M17 본격화(난이도→실제 태스크 난이도 매핑·지식 갭 탐지)는 행동 데이터 축적 후
 
 ### 인프라 / 기타
-- [ ] **기동 시간 단축**: `reindex_all()`이 매 기동마다 전 페이지 LLM 요약 재생성(~4분). mtime/해시 비교로 미변경 페이지 스킵
+- [x] **기동 시간 단축(07-14)**: `content_hash`(sha256) 비교로 미변경 페이지 LLM 재요약 스킵. 최초 1회만 전량 요약, 이후 변경분만. `index_file(force=True)`로 강제 재요약 가능
 - [ ] **remote 연결**: GitHub private repo 생성 + push (사용자 요청 시)
 - [ ] 오케스트레이터: `execute_task`로 서브에이전트 spawn/조율 (별도 결정 필요)
-- [ ] 단위 테스트 작성 (pytest) — 현재 수동 검증만
+- [~] 단위 테스트 작성 (pytest) — `tests/` 신설(reindex 스킵 5케이스, 07-14). 나머지 모듈 커버리지는 잔여
 
 ---
 
@@ -167,7 +176,7 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 | 06-17 | `python -m mneme.server &` (Bash &) 백그라운드가 죽은 줄 알았으나 살아있음 | Bash 툴 `&`는 유지됨. run_in_background 서버가 포트 충돌(Errno 10048) | 포트 점유 확인 후 기존 프로세스 정리 |
 | 06-17 | print에서 `—`(em-dash) UnicodeEncodeError (cp949) | Windows 콘솔 인코딩 | 출력 ASCII화 / 추후 UTF-8 강제 (TODO) |
 | 06-18 | lint CLI 동일 em-dash cp949 오류 | 위와 동일 | `main()`에서 `sys.stdout.reconfigure(encoding="utf-8")` — server.py는 잔여 |
-| 07-03 | 서버 재시작 후 8080 바인딩까지 ~4분 걸려 죽은 걸로 오인 | 기동 시 `reindex_all()`이 콘텐츠 페이지마다 `llm.generate_summary`(로컬 Ollama) 호출 — 변경 여부 무관하게 매번 재생성 | 대기하면 정상 기동. 개선 TODO: mtime/해시 비교로 미변경 페이지 스킵 |
+| 07-03 | 서버 재시작 후 8080 바인딩까지 ~4분 걸려 죽은 걸로 오인 | 기동 시 `reindex_all()`이 콘텐츠 페이지마다 `llm.generate_summary`(로컬 Ollama) 호출 — 변경 여부 무관하게 매번 재생성 | **07-14 해소**: `content_hash` 비교로 미변경 페이지 스킵(최초 1회만 전량 요약). 이후 기동은 변경분만 재요약 |
 | 07-03 | skills 테이블 빈 상태 발견 (`study-k8s-ingress` 소실) | 원인 미상 — episodes/loop_cycles 온전, 코드 삭제 경로 없음, 중복 state.db 없음 | 재시드 예정. 재발 시 원인 추적 |
 | 07-06 | `wiki_inject` 병합이 문서 훼손: frontmatter `---` 구분자 삭제 + 한국어 마침표가 전각(。)으로 치환 → lint "frontmatter 없음" 에러 | 로컬 LLM(Ollama) 병합 프롬프트가 원문 형식을 보존하지 않음 (qwen 계열 중국어 토큰 누출 추정) | 파일 직접 수정으로 복구. ①② **07-07 구현 완료**(병합 후 lint→실패 시 원문 유지 `merge_rejected` / frontmatter 코드 보존). ③ diff 병합 옵션은 잔여 |
 
