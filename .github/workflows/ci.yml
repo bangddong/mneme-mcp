@@ -32,3 +32,17 @@ jobs:
 
       - name: Test
         run: pytest -q
+
+  # 브랜치 보호의 단일 필수 체크. 매트릭스 잡 이름을 필수 체크로 직접 걸면
+  # 매트릭스를 바꾸는 순간(예: 3.11 드롭) 존재하지 않는 체크를 영원히 기다려 머지가 잠긴다.
+  # 이 게이트 하나만 필수로 걸어두면 매트릭스는 자유롭게 바꿀 수 있다.
+  ci-ok:
+    if: always()  # test가 실패/취소돼도 실행돼야 한다 (안 그러면 skip → 체크 미보고로 잠김)
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify matrix result
+        # needs.test.result는 매트릭스 전체의 집계값 — 하나라도 실패하면 success가 아니다.
+        run: |
+          echo "test matrix result: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = "success"
