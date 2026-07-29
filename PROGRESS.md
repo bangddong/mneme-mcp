@@ -4,7 +4,7 @@
 > 매 작업 시작·완료 시 갱신한다.
 > ⚠️ 이 파일은 public repo에 포함된다 — 개인 상황·일정 맥락은 적지 않는다 (개인 위키로).
 
-**최종 갱신**: 2026-07-14 (기동 시간 단축 — reindex 미변경 페이지 스킵 + 첫 pytest)
+**최종 갱신**: 2026-07-29 (rename 인덱스 정합성 — watcher `on_moved` 신설)
 
 ---
 
@@ -106,6 +106,20 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 - [x] **첫 pytest 도입**: `tests/test_reindex_skip.py` 5케이스(최초 전량 요약/미변경 스킵/
   변경분만 재요약/스킵 후 검색 정상/구DB 마이그레이션). 격리 WIKI_DIR·DB_PATH + summary 호출 카운터.
 
+### 2026-07-29 세션 (rename 인덱스 정합성)
+- [x] **`watcher.on_moved` 신설**: 위키에서 `.md` 이름/위치를 바꾸면 옛 경로가 인덱스에 잔류하고
+  (wiki_search가 없는 파일 반환) 새 경로는 검색에 안 잡히던 문제 해결. src/dest 확장자를 **독립 판정**
+  (`.txt`→`.md`, `.md`→`.txt` rename 포함).
+- [x] **`_to_relative` 방어**: 이동은 감시 루트 밖을 오갈 수 있어 `relative_to`가 ValueError →
+  핸들러 예외는 옵저버 스레드를 죽인다. 루트 밖이면 `None` 반환으로 흘려보내고 remove만 수행.
+  양쪽 `resolve()` 후 비교(상대 `WIKI_DIR` 설정에서도 동작).
+- [x] **디렉토리 이동 서브트리 정산**: watchdog은 recursive 감시 시 하위 FileMovedEvent를 합성해 주지만
+  그 합성은 *dest*를 walk하므로 **디렉토리가 루트 밖으로 나가면 하위 이벤트가 아예 없다**(= 영구 잔류).
+  → `_move_directory`가 옛 prefix 인덱스 행을 직접 제거하고 dest 하위 `.md`를 재인덱싱. 합성 이벤트가
+  뒤따라 와도 `content_hash` 스킵으로 멱등.
+- [x] 검증: `tests/test_watcher_moved.py` 9케이스(파일 rename/카테고리 이동/루트 밖 반출·반입/
+  확장자 독립 판정 2종/디렉토리 rename·루트 밖 반출/합성 이벤트 멱등) + 실제 Observer 수동 e2e.
+
 ### 2026-07-09 세션 (public 전환 준비)
 - [x] **개인 맥락 분리**: docs(DECISIONS/PROGRESS/INTEGRATION/PLAYBOOK)의 개인 상황 근거를
   개인 위키로 이관하고 예시를 일반화(`myapp`). 분리 기준 = *"fork한 타인에게도 유효한가"*
@@ -161,9 +175,15 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 
 ### 인프라 / 기타
 - [x] **기동 시간 단축(07-14)**: `content_hash`(sha256) 비교로 미변경 페이지 LLM 재요약 스킵. 최초 1회만 전량 요약, 이후 변경분만. `index_file(force=True)`로 강제 재요약 가능
+- [ ] **watcher 잔여 2건 (07-29 rename 수정 중 발견, 별도 이슈)**:
+  ① `on_deleted`가 디렉토리를 무시 → 카테고리 폴더를 통째로 지우면 하위 `.md` 인덱스가 잔류
+     (rename의 `_move_directory`와 같은 서브트리 정산 필요).
+  ② watcher는 모든 `.md`를 인덱싱하는데 `reindex_all`은 `is_content_page`로 예약 파일
+     (`index.md`/`log.md`/`_*`/`CLAUDE.md`)을 제외 → `wiki_inject`가 예약 파일을 갱신할 때마다
+     스캐폴딩이 FTS에 들어가는 불일치. watcher 3핸들러에 동일 필터 적용 필요.
 - [ ] **remote 연결**: GitHub private repo 생성 + push (사용자 요청 시)
 - [ ] 오케스트레이터: `execute_task`로 서브에이전트 spawn/조율 (별도 결정 필요)
-- [~] 단위 테스트 작성 (pytest) — `tests/` 신설(reindex 스킵 5케이스, 07-14). 나머지 모듈 커버리지는 잔여
+- [~] 단위 테스트 작성 (pytest) — `tests/` 신설(reindex 스킵 5케이스 07-14 + watcher rename 9케이스 07-29, 총 14). 나머지 모듈 커버리지는 잔여
 
 ---
 
@@ -178,6 +198,7 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 | 06-18 | lint CLI 동일 em-dash cp949 오류 | 위와 동일 | `main()`에서 `sys.stdout.reconfigure(encoding="utf-8")` — server.py는 잔여 |
 | 07-03 | 서버 재시작 후 8080 바인딩까지 ~4분 걸려 죽은 걸로 오인 | 기동 시 `reindex_all()`이 콘텐츠 페이지마다 `llm.generate_summary`(로컬 Ollama) 호출 — 변경 여부 무관하게 매번 재생성 | **07-14 해소**: `content_hash` 비교로 미변경 페이지 스킵(최초 1회만 전량 요약). 이후 기동은 변경분만 재요약 |
 | 07-03 | skills 테이블 빈 상태 발견 (`study-k8s-ingress` 소실) | 원인 미상 — episodes/loop_cycles 온전, 코드 삭제 경로 없음, 중복 state.db 없음 | 재시드 예정. 재발 시 원인 추적 |
+| 07-29 | 위키에서 `.md` 이름/위치를 바꾸면 옛 경로가 `wiki_search`에 계속 잡히고(파일 없음) 새 경로는 검색 불가 | `WikiEventHandler`가 `on_created/on_modified/on_deleted`만 구현 — watchdog이 보내는 `FileMovedEvent`를 아무도 안 받음(기반 클래스 `on_moved`는 no-op) | `on_moved` 신설(옛 경로 remove + 새 경로 index, 확장자 독립 판정) + 루트 밖 경로 `None` 방어 + 디렉토리 이동 서브트리 정산. pytest 9케이스 |
 | 07-06 | `wiki_inject` 병합이 문서 훼손: frontmatter `---` 구분자 삭제 + 한국어 마침표가 전각(。)으로 치환 → lint "frontmatter 없음" 에러 | 로컬 LLM(Ollama) 병합 프롬프트가 원문 형식을 보존하지 않음 (qwen 계열 중국어 토큰 누출 추정) | 파일 직접 수정으로 복구. ①② **07-07 구현 완료**(병합 후 lint→실패 시 원문 유지 `merge_rejected` / frontmatter 코드 보존). ③ diff 병합 옵션은 잔여 |
 
 ---
@@ -216,7 +237,7 @@ mneme/
 ├── wiki.py          마크다운 R/W
 ├── index.py         FTS5 인덱싱/검색/summary
 ├── llm.py           로컬 LLM(OpenAI 호환, 기본 Ollama): 후보선별/충돌판단/요약/coherence채점/반성 + is_available
-├── watcher.py       watchdog 파일 감시
+├── watcher.py       watchdog 파일 감시 (생성/수정/삭제/이동 — 이동은 서브트리·루트 밖 정산 포함)
 ├── constitution.py  헌법 로더
 ├── constitution.yaml 3층 헌법 + 시나리오 K
 ├── cib.py           헌법 게이트
