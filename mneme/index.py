@@ -1,3 +1,4 @@
+import sqlite3
 import hashlib
 from datetime import datetime, timezone
 from mneme.memory import get_connection
@@ -64,18 +65,33 @@ def remove_from_index(path: str):
 
 
 def search_fts(query: str, limit: int = 10) -> list[dict]:
-    conn = get_connection()
-    rows = conn.execute(
-        """
+    """FTS5 전문 검색. 사용자 질의가 FTS5 구문으로 깨져도 예외를 내보내지 않는다.
+
+    MATCH 오른쪽은 FTS5 쿼리 문법으로 파싱된다. 사용자·에이전트가 넘기는 문자열은
+    임의라서 `"`(unterminated string), `*`, `NEAR(` 같은 토큰이 섞이면
+    sqlite3.OperationalError가 난다. 검색 도구가 질의 '모양' 때문에 터지면 안 되므로,
+    구문 오류일 때는 질의 전체를 하나의 구(phrase)로 escape해 재시도한다.
+    """
+    sql = """
         SELECT path, snippet(wiki_fts, 1, '[', ']', '...', 20) AS excerpt
         FROM wiki_fts
         WHERE wiki_fts MATCH ?
         ORDER BY rank
         LIMIT ?
-        """,
-        (query, limit),
-    ).fetchall()
-    conn.close()
+        """
+    conn = get_connection()
+    try:
+        try:
+            rows = conn.execute(sql, (query, limit)).fetchall()
+        except sqlite3.OperationalError:
+            # FTS5에서 큰따옴표는 안쪽에서 두 번 써서 escape한다.
+            phrase = '"' + query.replace('"', '""') + '"'
+            try:
+                rows = conn.execute(sql, (phrase, limit)).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+    finally:
+        conn.close()
     return [{"path": r["path"], "excerpt": r["excerpt"]} for r in rows]
 
 
