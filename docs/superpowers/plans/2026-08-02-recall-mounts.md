@@ -220,7 +220,14 @@ force_utf8_stdout() 한 곳으로 모은다. CLI 추가 시 네 번째 임시방
 
 ## Task 2: 에피소드 기록 헬퍼
 
-`server.py`의 세 곳(`wiki_search` 110행, `wiki_inject` 230행, `episode_reflect` 398행)에 생 SQL `INSERT INTO episodes`가 중복돼 있다. CLI와 MCP가 같은 형식으로 기록해야 하므로 하나로 모은다.
+`server.py`의 세 tool(`wiki_search`, `wiki_inject`, `episode_reflect`)에 생 SQL `INSERT INTO episodes`가 중복돼 있다. CLI와 MCP가 같은 형식으로 기록해야 하므로 하나로 모은다.
+
+위치는 행 번호가 아니라 조회로 찾는다 — 계획서를 쓴 뒤 `server.py`가 바뀌면 행 번호는 어긋난다
+(실제로 어긋났다: 초안의 110/230/398행은 `wiki_search` FTS 폴백 추가(#4) 이후 각각 +12 밀렸다):
+
+```bash
+grep -n "INSERT INTO episodes" mneme/server.py
+```
 
 **Files:**
 - Create: `mneme/episodes.py`
@@ -366,7 +373,7 @@ Expected: 3 passed
 from mneme import episodes as episode_log
 ```
 
-`wiki_search`(110행 부근) — 현재:
+`wiki_search` — 현재 (아래 블록을 그대로 찾아 치환한다):
 
 ```python
     # 이력 기록
@@ -388,7 +395,7 @@ from mneme import episodes as episode_log
     return output
 ```
 
-`wiki_inject`(230행 부근) — 현재:
+`wiki_inject` — 현재:
 
 ```python
     conn = get_connection()
@@ -407,7 +414,7 @@ from mneme import episodes as episode_log
                        result_summary=action, session_id=session_id)
 ```
 
-`episode_reflect`(398행 부근) — 현재:
+`episode_reflect` — 현재:
 
 ```python
     conn = get_connection()
@@ -1253,8 +1260,25 @@ def search(query: str, source: str | None = None, limit: int = 10) -> list[dict]
         {"source": r["source"], "path": r["path"], "excerpt": r["excerpt"]}
         for r in rows
     ]
+```
 
+> **`index.search_fts`와 계약이 다르다 — 의도된 것이다.** (이 계획 작성 이후 #4에서 갈라졌다)
+>
+> | | 문법 오류 질의(`Grafana "unclosed`) |
+> |---|---|
+> | `index.search_fts` | 질의 전체를 구(phrase)로 escape해 **재시도** → 결과 반환 |
+> | `recall.search` | `RecallQueryError` **raise** |
+>
+> `recall`은 CLI가 1차 사용자이고 `--help`가 "검색어 (FTS5 문법)"이라고 명시하므로,
+> 사용자가 직접 쓴 문법의 오류는 조용히 삼키는 것보다 알려주는 편이 낫다.
+> 대신 **MCP tool 경로에서는 예외를 밖으로 내보내지 않는다** — Task 6이 이를 잡아
+> `{"hits": [], "error": ...}`로 변환한다. 임의 문자열을 넘기는 에이전트가
+> 질의 '모양' 때문에 터지면 안 된다는 원칙은 양쪽이 같다.
+>
+> 결과적으로 같은 질의에 `wiki_search`는 결과를, `recall`은 0건+에러 문구를 준다.
+> 도구를 통합하게 되면 이 차이부터 정리한다.
 
+```python
 def main() -> None:
     console.force_utf8_stdout()
 
