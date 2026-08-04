@@ -80,6 +80,18 @@ def wiki_search(query: str, session_id: str, agent: str = "unknown") -> dict:
             else:
                 # FTS 미히트지만 LLM이 관련 있다 판단 → 문서 요약으로 excerpt 대체
                 results.append({"path": path, "excerpt": summary_by_path.get(path, "")})
+    else:
+        # LLM 부재/실패 폴백 — FTS만으로 검색한다.
+        #
+        # select_candidate_paths는 런타임이 꺼져 있으면 예외를 삼키고 []를 반환한다.
+        # 예전에는 그 []가 위 if를 통과하지 못해 **FTS 인덱스에 문서가 멀쩡히 있어도**
+        # 빈 결과가 나갔다. README의 "런타임이 꺼져 있어도 보수적 fallback으로 무중단
+        # 동작"이 검색 경로에서만 지켜지지 않던 지점이다.
+        #
+        # FTS는 요약이 아니라 **전문**을 색인하므로, LLM이 없어 summary가 비어 있어도
+        # (미인덱싱 상태에선 frontmatter 구분자 '---'가 들어간다) 검색 품질에 영향이 없다.
+        # LLM이 살아 있으면 위 경로가 그대로 쓰인다 — 대체가 아니라 폴백이다.
+        results = idx.search_fts(query, limit=5)
 
     # 로컬 LLM으로 최종 요약
     summary = ""
