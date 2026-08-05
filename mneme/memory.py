@@ -127,9 +127,46 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_growth_open
                 ON growth_actions(status, dedup_key);
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
         """)
         # 마이그레이션: 기존 DB의 wiki_index에 content_hash 컬럼 보강 (없으면 추가)
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(wiki_index)")]
         if "content_hash" not in cols:
             conn.execute("ALTER TABLE wiki_index ADD COLUMN content_hash TEXT")
+
+        _migrate_schema(conn)
     conn.close()
+
+
+# v2: 요약을 wiki_fts에 함께 색인 + 요약 언어를 한국어로 고정.
+# 구 DB는 FTS에 요약이 없고 언어도 섞여 있어(실측 한글26/중국어3/영어4) 재요약이 필요하다.
+SCHEMA_VERSION = 2
+
+
+def _migrate_schema(conn) -> None:
+    """스키마 버전을 올리며 필요한 이관을 '한 번만' 수행한다.
+
+    ⚠️ 멱등성이 핵심이다. 매 기동마다 content_hash를 비우면 서버 시작마다
+    전량 재요약이 돌아 132초(33건 실측)를 태운다.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is None:
+        # 마커가 없다 = v1 이전. wiki_index가 비어 있으면 신규 DB이므로 이관할 게 없다.
+        empty = conn.execute("SELECT COUNT(*) c FROM wiki_index").fetchone()["c"] == 0
+        current = SCHEMA_VERSION if empty else 1
+    else:
+        current = int(row["value"])
+
+    if current < 2:
+        # content_hash를 비워 index_file의 '미변경이면 재요약 스킵' 조건을 깨뜨린다.
+        # → 다음 reindex_all()이 전량 재요약하며 FTS에도 요약이 들어간다.
+        conn.execute("UPDATE wiki_index SET content_hash = NULL")
+
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
+        (str(SCHEMA_VERSION),),
+    )
