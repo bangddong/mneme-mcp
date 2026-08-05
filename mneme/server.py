@@ -48,6 +48,14 @@ def _build_auth():
 
 mcp = FastMCP("mneme", auth=_build_auth())
 
+# wiki_search 하이브리드 임계값.
+#   FTS_LIMIT  : FTS에서 가져올 최대 건수
+#   FTS_ENOUGH : 이 수만큼 나오면 LLM 선별(5~7초)을 생략한다.
+# 3으로 잡은 근거: 실측에서 FTS가 히트할 때 대개 3~10건이 나왔고(Grafana=3·EKS=4·mneme=8),
+# 3건 이상이면 LLM 보강이 순위를 개선하지 못했다(F1 상한 37%, 과다반환이 잦음).
+FTS_LIMIT = 5
+FTS_ENOUGH = 3
+
 
 @mcp.tool()
 def wiki_search(query: str, session_id: str, agent: str = "unknown") -> dict:
@@ -65,33 +73,33 @@ def wiki_search(query: str, session_id: str, agent: str = "unknown") -> dict:
         import json
         return json.loads(row["value"])
 
-    # 로컬 LLM으로 후보 path 선별
-    summaries = idx.get_all_summaries()
-    candidate_paths = llm.select_candidate_paths(query, summaries)
-    summary_by_path = {s["path"]: s.get("summary") or "" for s in summaries}
+    # FTS 우선, LLM은 보강 — 2026-08-05 실측으로 순서를 뒤집었다.
+    #
+    # 예전 구조는 LLM 선별이 1차 관문이고 FTS가 폴백이었다. 측정해보니 반대가 맞았다
+    # (위키 33건 · 모델 7종):
+    #   FTS : 즉시·정확. 단 글자 그대로만 매칭 (Grafana=3건·EKS=4건·mneme=8건을 정확히 집음)
+    #   LLM : 호출당 5~7초, F1 상한 37%. 과다반환(33건 중 23건)·헛질의 오탐이 잦음
+    #
+    # 게다가 요약을 FTS에 함께 색인하면서(index._fts_document) 한국어 키워드도 FTS로
+    # 잡히게 됐다. 그래서 LLM은 FTS가 부족할 때만 부른다 — 대부분의 질의가 즉시 끝난다.
+    #
+    # 옛 구조의 버그도 여기서 사라진다: 후보 path마다 동일 인자로 search_fts를 다시 쳤고
+    # (N회 중복 조회), limit=3 고정이라 FTS가 4위로 잡은 문서는 후보에 있어도 버려졌다.
+    results = idx.search_fts(query, limit=FTS_LIMIT)
 
-    results = []
-    if candidate_paths:
-        for path in candidate_paths:
-            fts_results = idx.search_fts(query, limit=3)
-            path_results = [r for r in fts_results if r["path"] == path]
-            if path_results:
-                results.extend(path_results)
-            else:
-                # FTS 미히트지만 LLM이 관련 있다 판단 → 문서 요약으로 excerpt 대체
+    if len(results) < FTS_ENOUGH:
+        # 의미 검색 보강. FTS는 글자가 일치해야만 찾으므로 표기 차이를 놓친다
+        # (예: 질의 '그라파나' vs 원문 'Grafana' — 요약 색인으로 상당수 해소되지만 전부는 아니다).
+        #
+        # LLM이 꺼져 있으면 select_candidate_paths가 예외를 삼키고 []를 반환하므로
+        # FTS 결과만 남는다 — README의 "런타임이 꺼져 있어도 무중단" 계약을 이 경로가 지킨다.
+        summaries = idx.get_all_summaries()
+        summary_by_path = {s["path"]: s.get("summary") or "" for s in summaries}
+        seen = {r["path"] for r in results}
+        for path in llm.select_candidate_paths(query, summaries):
+            if path not in seen:
+                seen.add(path)
                 results.append({"path": path, "excerpt": summary_by_path.get(path, "")})
-    else:
-        # LLM 부재/실패 폴백 — FTS만으로 검색한다.
-        #
-        # select_candidate_paths는 런타임이 꺼져 있으면 예외를 삼키고 []를 반환한다.
-        # 예전에는 그 []가 위 if를 통과하지 못해 **FTS 인덱스에 문서가 멀쩡히 있어도**
-        # 빈 결과가 나갔다. README의 "런타임이 꺼져 있어도 보수적 fallback으로 무중단
-        # 동작"이 검색 경로에서만 지켜지지 않던 지점이다.
-        #
-        # FTS는 요약이 아니라 **전문**을 색인하므로, LLM이 없어 summary가 비어 있어도
-        # (미인덱싱 상태에선 frontmatter 구분자 '---'가 들어간다) 검색 품질에 영향이 없다.
-        # LLM이 살아 있으면 위 경로가 그대로 쓰인다 — 대체가 아니라 폴백이다.
-        results = idx.search_fts(query, limit=5)
 
     # 로컬 LLM으로 최종 요약
     summary = ""

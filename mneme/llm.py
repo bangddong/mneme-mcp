@@ -209,8 +209,13 @@ def assess_episode(task: str, outcome: str) -> float | None:
 
 def generate_summary(path: str, content: str) -> str:
     """문서 1줄 요약 생성."""
+    # 출력 언어를 반드시 못박는다. 지정하지 않으면 모델마다 제각각이다
+    # (2026-08-05 실측 33건: qwen2.5:1.5b 한글 26/중국어 3/영어 4, qwen2.5:3b는 전부 중국어,
+    #  exaone3.5는 전부 영어). 지정하면 33/33 한국어로 결정적이 된다.
+    # 요약은 wiki_fts에도 색인되므로(index._fts_document) 언어가 흔들리면 검색까지 흔들린다.
     system = (
         "You are a wiki indexer. Summarize the given document in ONE sentence (max 120 chars). "
+        "Write the summary in Korean. "
         "Return ONLY the summary string — no JSON, no markdown."
     )
     user = f"Path: {path}\n\nContent:\n{content[:3000]}"

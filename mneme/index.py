@@ -10,6 +10,26 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _fts_document(content: str, summary: str | None) -> str:
+    """FTS5에 넣을 텍스트 — 원문 + 요약.
+
+    요약을 함께 색인하는 이유: FTS5(unicode61)는 글자 그대로만 매칭하는데,
+    이 위키는 한국어 문서에 기술용어를 영어로 쓴다. 그래서 원문만 색인하면
+    한국어 질의가 통째로 죽는다 (2026-08-05 실측, 33건 기준):
+
+        쿠버네티스 → 0건   그라파나 → 0건   시크릿 → 0건
+        모니터링   → 2건   비용     → 10건   (이 단어들은 원문에 그대로 있음)
+
+    요약은 한국어로 고정되므로(llm.generate_summary), 요약을 색인하면
+    '그라파나'가 'Grafana' 문서를 찾는 경로가 생긴다 — LLM 호출 없이.
+
+    wiki_fts는 FTS5 가상 테이블이라 ALTER TABLE로 컬럼을 못 늘린다.
+    별도 컬럼 대신 content에 이어붙이는 이유가 그것이다(스키마 마이그레이션 불필요).
+    """
+    summary = (summary or "").strip()
+    return f"{content}\n\n{summary}" if summary else content
+
+
 def index_file(path: str, updated_by: str = "system", force: bool = False):
     data = read_file(path)
     if data is None:
@@ -39,7 +59,7 @@ def index_file(path: str, updated_by: str = "system", force: bool = False):
         conn.execute("DELETE FROM wiki_fts WHERE path = ?", (path,))
         conn.execute(
             "INSERT INTO wiki_fts(path, content) VALUES (?, ?)",
-            (path, content),
+            (path, _fts_document(content, summary)),
         )
         conn.execute(
             """
