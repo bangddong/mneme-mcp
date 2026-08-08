@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from mneme.memory import get_connection
 from mneme.wiki import read_file, list_md_files
 from mneme import llm
+from mneme import korean
 
 
 def _content_hash(content: str) -> str:
@@ -91,6 +92,14 @@ def search_fts(query: str, limit: int = 10) -> list[dict]:
     임의라서 `"`(unterminated string), `*`, `NEAR(` 같은 토큰이 섞이면
     sqlite3.OperationalError가 난다. 검색 도구가 질의 '모양' 때문에 터지면 안 되므로,
     구문 오류일 때는 질의 전체를 하나의 구(phrase)로 escape해 재시도한다.
+
+    한국어 질의는 `korean.expand_query`로 넓혀서 넣는다 — `unicode61` 토크나이저가
+    조사(`비용은` → 0건)와 음차(`그라파나` → 0건)에서 조용히 빈 결과를 내기 때문.
+    근거·설계·기각한 대안(trigram)은 `mneme/korean.py` 참조.
+
+    ⚠️ **폴백은 원본 질의로 한다.** 확장식이 구문 오류를 냈을 때 확장식을 다시
+       escape하면 사용자가 친 적 없는 `(비용은 OR 비용)` 같은 문자열을 통째로
+       구(phrase)로 찾게 된다 — 반드시 0건이고, 원인도 안 보인다.
     """
     sql = """
         SELECT path, snippet(wiki_fts, 1, '[', ']', '...', 20) AS excerpt
@@ -102,7 +111,7 @@ def search_fts(query: str, limit: int = 10) -> list[dict]:
     conn = get_connection()
     try:
         try:
-            rows = conn.execute(sql, (query, limit)).fetchall()
+            rows = conn.execute(sql, (korean.expand_query(query), limit)).fetchall()
         except sqlite3.OperationalError:
             # FTS5에서 큰따옴표는 안쪽에서 두 번 써서 escape한다.
             phrase = '"' + query.replace('"', '""') + '"'
