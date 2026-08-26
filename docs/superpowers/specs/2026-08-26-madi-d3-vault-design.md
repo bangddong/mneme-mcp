@@ -1,6 +1,6 @@
 # Madi D3: Portable Vault Information Architecture
 
-**Status:** Proposed for product-owner review
+**Status:** Approved — authoritative D3 specification
 
 **Date:** 2026-08-26
 
@@ -791,6 +791,6 @@ memory boundaries. Privacy inheritance limits what personal ownership may export
 from employer, customer, or project sources. It does not conflict with ownership:
 ownership of a Vault is not authority to declassify another source's information.
 
-The design becomes approved only after product-owner review of this written
-specification. Production implementation and repository/package renaming remain
-out of scope until then.
+This document is the authoritative D3 specification. Production implementation
+must follow a separately reviewed migration plan. Repository/package renaming
+remains out of scope until a later explicit decision.
