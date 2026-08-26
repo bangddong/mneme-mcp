@@ -21,12 +21,16 @@
 - Madi Core must not import `mneme.llm`, FastMCP, watchdog, APScheduler, Claude, Codex, or Growth Lab modules.
 - A generation LLM, embedding provider, daemon, and agent hook are optional; their absence cannot break Core recall or ordinary agent work.
 - Portable canonical state is limited to Registry artifacts, immutable Session revisions, and versioned Memory records. CURRENT, PROFILE, SQLite, vector data, locks, and logs are generated/local.
+- Portable and local-only Registry, Session, and Memory artifacts use the same schemas through an explicit `StorageClass`/`ArtifactLocation` seam. Resolver/context code is read-only with respect to canonical artifacts.
 - Portable artifacts may never refer to local-only IDs, paths, counts, hashes, or existence. Local state may refer to portable state.
 - Candidate bodies are CAS-mutable. Accepted semantic bodies are immutable; material change creates a new Memory ID with `supersedes`.
 - A successful checkpoint writes an immutable Session revision before advancing a registry head. Git commit/push policy remains separate.
 - All portable writes enforce the most restrictive inherited portability ceiling and record a portable-safe policy evaluation receipt.
+- Active policy revisions and project/source policy assignments change only through Core CAS APIs. Generated-index policy fields are hints, never security authority; every output and sync preflight authorizes against current canonical policy pointers.
 - All new file I/O explicitly uses UTF-8. Atomic writers use same-directory temporary files and `os.replace`, or exclusive creation for immutable artifacts.
 - No task uses automatic semantic merge, force push, or last-write-wins for registry, session, memory, or policy conflicts.
+- The only automatic registry merge is a bounded structural retry for proven-disjoint additions of valid session heads while all non-head fields remain unchanged. Same-session changes, removals, lifecycle changes, policy changes, and preferred-head changes conflict explicitly.
+- Legacy `episodes` and unknown SQLite tables are potentially durable until reviewed. They are staged losslessly in local-only storage and are never discarded or promoted automatically; the original database remains untouched.
 - Existing `docs/superpowers/specs/2026-08-01-recall-mounts-design.md` and its plan are design evidence only: `mneme/mounts.py`, `mneme/recall.py`, and mount tables do not exist on current `main`.
 - Current workstation observation on 2026-08-26: `python`, `py`, `uv`, and `pytest` are unavailable. Task 0 must provision or select Python and establish a fresh baseline before any production edit.
 
@@ -76,6 +80,7 @@ mneme/
 │   ├── resolver.py
 │   ├── service.py
 │   ├── sessions.py
+│   ├── storage.py
 │   ├── vault.py
 │   ├── search/{fts.py,index.py,korean.py}
 │   ├── sources/{filesystem.py,registry.py}
@@ -101,6 +106,34 @@ mneme/
 | Phase 4 | Claude/Codex adapters and optional Growth Lab are isolated | Existing installer, legacy Growth tools | Growth closure | top-level Growth imports | Claude-only installer as default | None |
 | Phase 5 | Explicit dry-run/export and end-to-end migration evidence exist | Original Wiki and DB | None | migration reports | direct legacy writes for new Madi workflows | None |
 
+### Execution order and dependency gates
+
+Tasks execute in numeric order in one isolated migration worktree. Each task is a
+single subagent-driven-development unit with its own red/green/full-suite/commit
+cycle; later tasks may not borrow uncommitted code from an earlier task.
+
+| Task range | Hard dependency | Gate unlocked |
+|---|---|---|
+| 0 | Approved D3 and this plan | Isolated branch, reproducible baseline, exact existing CI matrix recorded |
+| 1–6 | Task 0, then previous task commit | Legacy behavior characterized; deterministic modules and legacy HTTP transport separated behind facades |
+| 7 | Tasks 1–6 | Read-only, fail-safe durable-data inventory before any Vault migration path |
+| 8 | Task 7 | Explicit portable/local storage locations and safe filesystem primitives |
+| 9 | Task 8 | Pure policy evaluation and immutable admission receipts |
+| 10 | Task 9 | Immutable policy revision creation and active-pointer CAS |
+| 11 | Task 10 | Project/source/workstream registries, policy assignment APIs, disjoint-head structural retry |
+| 12 | Task 11 | Immutable checkpoint revisions using the storage and head-update seams |
+| 13–14 | Task 12, then previous task commit | Read-only CURRENT resolver and Memory/PROFILE lifecycle over both storage classes |
+| 15 | Tasks 13–14 | Rebuildable FTS/source recall with candidate-hit provenance |
+| 16–18 | Task 15, then previous task commit | Doctor, CLI, and explicit Git/sync preflight |
+| 19 | Tasks 10–18 | Live-policy security gate proven across every generated/read/sync consumer without reindex |
+| 20 | Task 19 | Agent-neutral lifecycle/command/event contract and stdio MCP |
+| 21–22 | Task 20, then previous adapter task | Non-blocking Claude adapter, then pinned native Codex `PreCompact` translator |
+| 23 | Task 22 | Complete legacy Growth characterization before any Growth move |
+| 24 | Task 23 | Pure Growth dependency move with compatibility facades |
+| 25 | Task 24 | Scheduler/notify/legacy-server Growth integration isolated and reviewed separately |
+| 26 | Tasks 7, 11, 14, 17, 25 | Lossless local legacy staging with no automatic promotion/deletion |
+| 27 | All prior task commits | Clean/shallow clone, concurrency, compact, stale-policy privacy, migration, compatibility, and CI release evidence |
+
 ---
 
 ### Task 0: Isolated Worktree and Reproducible Baseline
@@ -111,6 +144,7 @@ mneme/
 **Interfaces:**
 - Produces: isolated worktree on `feat/madi-core-migration`
 - Produces: recorded baseline command, Python version, and test result in the execution log
+- Verifies: existing `.github/workflows/ci.yml` matrix is the cross-platform release gate
 
 - [ ] **Step 1: Create isolation with the required skill**
 
@@ -149,7 +183,24 @@ python -m pytest -q
 
 Expected: 42 current test functions are collected and the suite exits 0. If collection or tests fail, record the exact failure and repair the environment or create a separate baseline-fix plan before migration edits.
 
-- [ ] **Step 5: Do not commit environment-only setup**
+- [ ] **Step 5: Verify the existing CI matrix exactly**
+
+Inspect `.github/workflows/ci.yml` and record this repository evidence in the
+execution log:
+
+- job `test` runs `matrix.os = [ubuntu-latest, windows-latest]`;
+- `matrix.python-version = ["3.11", "3.13"]`;
+- each combination uses `actions/setup-python@v5`, installs `.[dev]`, and runs
+  `pytest -q`;
+- job `ci-ok` depends on the full matrix and fails unless its aggregate result is
+  `success`.
+
+The workflow already satisfies the requested Python/OS matrix, so this plan does
+not add a redundant CI-construction task. Execution must still open a PR and wait
+for all four matrix cells plus `ci-ok`; a local test run is not evidence for the
+Windows/Linux matrix.
+
+- [ ] **Step 6: Do not commit environment-only setup**
 
 Run `git status --short`. Expected: clean.
 
@@ -602,7 +653,7 @@ Expected Phase 1 state: the old command and tests behave identically; Core searc
 **Interfaces:**
 - Produces: `LegacyInventory(db_path: Path, tables: dict[str, LegacyTable], sha256: str)`
 - Produces: `inspect_legacy_db(path: Path) -> LegacyInventory`
-- Produces classifications: `generated`, `candidate-durable`, `growth-local`, `transient`
+- Produces classifications: `generated`, `local-transient`, `candidate-durable-local`, `growth-local`, `needs-review`
 
 - [ ] **Step 1: Test read-only inventory and classifications**
 
@@ -616,10 +667,14 @@ def test_inventory_is_read_only_and_classifies_mixed_state(legacy_db):
     after = sha256(legacy_db.read_bytes()).hexdigest()
     assert before == after == report.sha256
     assert report.tables["wiki_fts"].classification == "generated"
-    assert report.tables["facts"].classification == "candidate-durable"
-    assert report.tables["episodes"].classification == "transient"
+    assert report.tables["facts"].classification == "candidate-durable-local"
+    assert report.tables["episodes"].classification == "candidate-durable-local"
     assert report.tables["skills"].classification == "growth-local"
 ```
+
+Add a table unknown to current Mneme and assert it is `needs-review`, never
+`generated` or `local-transient`. Record each classification reason and the exact
+table schema so later staging can be audited without reopening it read-write.
 
 - [ ] **Step 2: Verify the test fails**
 
@@ -629,7 +684,14 @@ Expected: import failure for `mneme.migration.legacy`.
 
 - [ ] **Step 3: Implement read-only inspection**
 
-Open SQLite with URI `file:<absolute-path>?mode=ro`, query `sqlite_master` and row counts, never call `init_db`, and close before hashing. Classify `wiki_fts`, `wiki_index`, `working`, and `meta` as generated/transient; `facts` as candidate-durable; `episodes` as transient raw evidence; and `skills`, `loop_cycles`, `self_model`, `growth_actions` as growth-local. Unknown tables are `candidate-durable` so migration fails safe.
+Open SQLite with URI `file:<absolute-path>?mode=ro`, query `sqlite_master`, column
+metadata, and row counts, never call `init_db`, and close before hashing. Classify
+`wiki_fts` and `wiki_index` as generated; known runtime `working`/`meta` rows as
+`local-transient` only where their schema and semantics are recognized; `facts`
+and `episodes` as `candidate-durable-local`; and `skills`, `loop_cycles`,
+`self_model`, and `growth_actions` as `growth-local`. Unknown tables are
+`needs-review`. Classification controls staging defaults, never deletion, and no
+classification raises portability above local-only.
 
 - [ ] **Step 4: Run focused and full tests**
 
@@ -653,10 +715,12 @@ git commit -m "feat: inventory legacy state without mutating durable data"
 - Create: `mneme/core/errors.py`
 - Create: `mneme/core/fs.py`
 - Create: `mneme/core/artifacts.py`
+- Create: `mneme/core/storage.py`
 - Create: `mneme/core/vault.py`
 - Create: `mneme/core/validation/vault.py`
 - Create: `tests/core/test_vault.py`
 - Create: `tests/core/test_fs.py`
+- Create: `tests/core/test_storage.py`
 
 **Interfaces:**
 - Produces: `Vault.open(root: Path, state_home: Path) -> Vault`
@@ -664,6 +728,9 @@ git commit -m "feat: inventory legacy state without mutating durable data"
 - Produces: `write_new(path: Path, text: str) -> None`
 - Produces: `write_yaml_cas(path: Path, value: dict, expected_generation: int) -> None`
 - Produces: `read_frontmatter(path: Path) -> tuple[dict, str]`
+- Produces: `StorageClass.PORTABLE | LOCAL_ONLY`
+- Produces: `ArtifactLocation(storage_class, root, relative_path)` and `StorageRouter`
+- Produces: canonical `ArtifactStore`/`ArtifactReader` and generated-only `ViewStore` boundaries
 
 - [ ] **Step 1: Test exact portable/local layout**
 
@@ -681,18 +748,35 @@ def test_initialize_creates_only_portable_registries_in_vault(tmp_path):
 
 Add tests that `write_new` raises `ArtifactExists`, CAS rejects a stale generation, YAML serialization is stable, and Markdown frontmatter round-trips UTF-8.
 
+Add storage-boundary tests that portable and local-only Registry, Session, and
+Memory locations use the same family codecs/schema; only their roots differ.
+Require every canonical writer to receive an explicit `StorageClass` or
+`ArtifactLocation`. Reject a portable artifact whose metadata or body references
+any local-only ID, path, hash, count, label, or existence at write time. A local
+artifact may reference a portable artifact. Assert `ViewStore` cannot write under
+either canonical artifact tree.
+
 - [ ] **Step 2: Verify missing imports**
 
-Run: `python -m pytest tests/core/test_vault.py tests/core/test_fs.py -v`
+Run: `python -m pytest tests/core/test_vault.py tests/core/test_fs.py tests/core/test_storage.py -v`
 
 - [ ] **Step 3: Implement minimal Vault mechanics**
 
-Initialize `.madi/schema-version`, `.madi/vault.yaml`, `.madi/policy-index.yaml`, an immutable default policy revision, and empty `projects/`, `sources/`, `workstreams/`, `memory/`. Create local `bindings`, `overlays`, `evidence`, `pending`, `views`, `index`, `cache`, `locks`, and `logs` outside the Vault. Store typed owner `{type: person, id: owner_id}`. Do not create a database.
+Initialize `.madi/schema-version`, `.madi/vault.yaml`, an empty generation-0
+`.madi/policy-index.yaml`, `.madi/policies/`, and empty `projects/`, `sources/`,
+`workstreams/`, `memory/`. Create local `bindings`, `overlays`, `evidence`,
+`pending`, `views`, `index`, `cache`, `locks`, and `logs` outside the Vault. Store
+typed owner `{type: person, id: owner_id}`. `StorageRouter` maps canonical families
+to portable or local roots, while `ViewStore` maps only to `local_root/views`.
+Resolver and context modules will receive read interfaces later and never receive
+an `ArtifactStore`. Do not create a policy revision through a bootstrap-only file
+shortcut; Task 10 creates and activates the default through the official API. Do
+not create a database.
 
 - [ ] **Step 4: Run focused and full tests**
 
 ```powershell
-python -m pytest tests/core/test_vault.py tests/core/test_fs.py -v
+python -m pytest tests/core/test_vault.py tests/core/test_fs.py tests/core/test_storage.py -v
 python -m pytest -q
 ```
 
@@ -743,9 +827,12 @@ Add a test that a portable-safe opaque attestation can replace a confidential so
 
 Run: `python -m pytest tests/core/test_policy.py -v`
 
-- [ ] **Step 3: Implement immutable revision loading and evaluation**
+- [ ] **Step 3: Implement pure evaluation and immutable receipts**
 
-Use the most restrictive ceiling. Keep original receipt fields immutable. A policy revision referenced by a current artifact remains loadable even if no longer active. Return structured violations; do not attempt Git-history deletion.
+Use the most restrictive ceiling and accept already-loaded immutable PolicyRule
+values as inputs. Keep original receipt fields immutable. Return structured
+violations; do not attempt Git-history deletion. Task 10 owns revision persistence,
+active pointers, and retaining older referenced revisions.
 
 - [ ] **Step 4: Run focused and full tests**
 
@@ -763,7 +850,74 @@ git commit -m "feat: enforce inherited portability ceilings with receipts"
 
 ---
 
-### Task 10: Add Project, Source, and Workstream Registries with CAS
+### Task 10: Add Immutable Policy Revision and Active-Pointer APIs
+
+**Files:**
+- Modify: `mneme/core/policy.py`
+- Modify: `mneme/core/vault.py`
+- Create: `tests/core/test_policy_store.py`
+
+**Interfaces:**
+- Produces: `PolicyStore.create_revision(policy_id, revision, rule, storage_class) -> PolicyRef`
+- Produces: `PolicyStore.activate(policy_ref, expected_generation) -> PolicyIndex`
+- Produces: `PolicyStore.load_active(policy_id, storage_class) -> PolicyRef`
+- Produces: `PolicyStore.bootstrap_default() -> PolicyRef`, implemented only by composing create + activate
+
+- [ ] **Step 1: Test immutable creation and active-revision CAS**
+
+Create revision `1`, activate it at policy-index generation 0, create a stricter
+revision `2`, and assert activation with stale generation 0 fails without changing
+the active pointer. Activate revision `2` with the current generation and assert
+revision `1` remains readable. A second write to either revision path, including
+different content under the same revision name, must fail rather than overwrite.
+
+Repeat creation and activation for `StorageClass.LOCAL_ONLY` and assert the same
+policy schema is stored below the local overlay root. Assert a portable policy
+index cannot reference a local-only revision.
+
+Assert a newly initialized Vault obtains its default active revision only through
+`PolicyStore.bootstrap_default`, whose observable writes are exactly one immutable
+revision plus one generation-CAS activation. Re-running bootstrap is idempotent
+only when the existing immutable content/digest and active pointer match.
+
+- [ ] **Step 2: Verify tests fail**
+
+Run: `python -m pytest tests/core/test_policy_store.py -v`
+
+- [ ] **Step 3: Implement the official policy lifecycle path**
+
+Create policy revision files only through `PolicyStore.create_revision`. Change an
+active pointer only through `PolicyStore.activate` using policy-index generation
+CAS. Reuse deterministic codecs and the storage router; never edit YAML through a
+service or adapter shortcut. Revision creation and activation are separate
+operations, so an interrupted activation leaves an unreferenced immutable revision
+that `doctor` can report without attaching automatically.
+
+Project/source assignment is the corresponding registry mutation and is added in
+Task 11 after those registries exist. From Task 11 onward, tests and E2E scenarios
+must use these APIs plus registry assignment APIs; direct YAML mutation is allowed
+only in corruption/doctor fixtures.
+
+Wire Vault initialization to `bootstrap_default`; it must not grow a second
+private policy-write implementation.
+
+- [ ] **Step 4: Run focused and full tests**
+
+```powershell
+python -m pytest tests/core/test_policy.py tests/core/test_policy_store.py -v
+python -m pytest -q
+```
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add mneme/core/policy.py mneme/core/vault.py tests/core/test_policy_store.py
+git commit -m "feat: add immutable policy lifecycle APIs"
+```
+
+---
+
+### Task 11: Add Project, Source, and Workstream Registries with CAS
 
 **Files:**
 - Create: `mneme/core/registries.py`
@@ -774,7 +928,10 @@ git commit -m "feat: enforce inherited portability ceilings with receipts"
 - Produces: `HeadRef(session: str, revision: str)`
 - Produces: `WorkstreamRegistry(id, generation, project, status, mode, active_heads, preferred_head)`
 - Produces: `RegistryStore.create_workstream`, `load_workstream`, `update_workstream`
+- Produces: `add_active_head(head, observed_base, head_validator) -> WorkstreamRegistry`
 - Produces: `register_project`, `register_source`, `bind_source`
+- Produces: `assign_project_policy(project_id, policy_ref, expected_generation)`
+- Produces: `assign_source_policy(source_id, policy_ref, expected_generation)`
 
 - [ ] **Step 1: Test CAS and authority boundaries**
 
@@ -790,15 +947,54 @@ def test_workstream_update_requires_expected_generation(vault):
         store.update_workstream(changed.with_status("active"), expected_generation=0)
 ```
 
-Add tests that portable project/source registries reject absolute paths and credential-like values, a local binding accepts an absolute path outside the Vault, and a confidential-only project creates no portable stub.
+Add tests that portable project/source registries reject absolute paths and
+credential-like values, a local binding accepts an absolute path outside the
+Vault, and a confidential-only project creates no portable stub. Construct both
+portable and local-only Registry stores through `StorageRouter` and assert they
+use the same codec/schema.
+
+Create policy revisions through `PolicyStore.create_revision`; assign them with
+`assign_project_policy` and `assign_source_policy`. Each assignment validates that
+the referenced immutable revision exists, rejects portable-to-local references,
+and CAS-updates only the subject registry. Assert stale assignment generations
+fail and no test changes registry YAML directly.
+
+Add a two-writer test from the same registry generation: writer A adds head
+`session-a/000001`, then writer B adds the distinct valid head
+`session-b/000001`. `add_active_head` must reload and structurally retry so the
+final registry contains both. Add negative cases for the same session with a
+different revision, a concurrent preferred-head change, a removal, lifecycle or
+policy change; each remains an explicit `RegistryConflict`. Use an injected fake
+head validator in this registry unit test; Task 12 supplies the real immutable
+Session reader/validator once that artifact exists.
 
 - [ ] **Step 2: Verify tests fail**
 
 Run: `python -m pytest tests/core/test_registries.py -v`
 
-- [ ] **Step 3: Implement bounded registries**
+- [ ] **Step 3: Implement bounded registries and the proven-disjoint retry**
 
-Serialize only IDs, lifecycle, explicit resolution mode, active/preferred heads, safe locator, authority, and policy refs. Project registries describe personal association, never project facts. Source binding is written only under local state.
+Serialize only IDs, lifecycle, explicit resolution mode, active/preferred heads,
+safe locator, authority, and policy refs. Project registries describe personal
+association, never project facts. Source binding is written only under local
+state. Every store is created with an explicit artifact location.
+
+`add_active_head` performs a bounded reload + CAS retry (maximum three CAS
+attempts) only when all of these are proven from the caller's observed base and
+the reloaded registry:
+
+1. the requested mutation is a pure addition of one distinct session head;
+2. registry identity, project, status, resolution mode, preferred head, and policy
+   references are unchanged;
+3. existing heads were only added, never removed or changed;
+4. the requested session has no different head; and
+5. the referenced immutable Session revision exists and validates.
+
+On each retry, CAS against the newly loaded generation. Exhaustion or any failed
+predicate returns a structured conflict. This is a structural set-union of proven
+disjoint references, not semantic merging or last-write-wins. The Registry layer
+does not invent or parse Session semantics; it requires the caller-supplied head
+validator.
 
 - [ ] **Step 4: Run focused and full tests**
 
@@ -816,14 +1012,14 @@ git commit -m "feat: add explicit CAS-protected Vault registries"
 
 ---
 
-### Task 11: Persist Immutable Session Revisions as Checkpoints
+### Task 12: Persist Immutable Session Revisions as Checkpoints
 
 **Files:**
 - Create: `mneme/core/sessions.py`
 - Create: `tests/core/test_sessions.py`
 
 **Interfaces:**
-- Produces: `CheckpointRequest(workstream_id, session_id, expected_parent, expected_registry_generation, body, relations, policy_evaluation)`
+- Produces: `CheckpointRequest(workstream_id, session_id, storage_class, expected_parent, expected_registry_generation, body, relations, policy_evaluation)`
 - Produces: `SessionRevisionRef(session: str, revision: str)`
 - Produces: `SessionStore.create_revision(request: CheckpointRequest) -> SessionRevisionRef`
 
@@ -840,7 +1036,18 @@ def test_checkpoint_writes_revision_then_advances_head(vault, valid_checkpoint):
     assert store.registries.load_workstream("ws-1").active_heads == (ref.as_head(),)
 ```
 
-Add tests that a second write to `000001.md` fails, a registry CAS failure leaves an orphan revision without changing the head, revision 2 is self-contained, and multiple handoff relations do not terminate the source session.
+Add tests that a second write to `000001.md` fails, a true registry conflict leaves
+an orphan revision without changing the head, revision 2 is self-contained, and
+multiple handoff relations do not terminate the source session. Test portable and
+local-only revisions through the same Session codec/store with explicit storage
+class, and reject a portable revision containing a local-only relation or
+provenance reference before any file is created.
+
+Add an integrated checkpoint race: two writers create revisions in different
+session directories from the same workstream generation. The second head update
+must use Task 11's proven-disjoint retry, leaving both valid heads registered and
+neither revision orphaned. A same-session lineage race and a concurrent preferred
+head change still produce an explicit orphan/conflict for doctor review.
 
 - [ ] **Step 2: Verify tests fail**
 
@@ -848,7 +1055,13 @@ Run: `python -m pytest tests/core/test_sessions.py -v`
 
 - [ ] **Step 3: Implement checkpoint ordering**
 
-Validate the host-composed body, write `000001.md` with exclusive creation, then CAS-update the workstream. Include session/workstream/adapter identity, objective, current state, verified facts, completed work, blockers, next actions, source refs, relations, semantic hash, and policy receipt. Never call Git or a generation provider.
+Validate the host-composed body and one-way reference invariant, write `000001.md`
+with exclusive creation through `ArtifactStore`, then call
+`RegistryStore.add_active_head` with the real Session revision reader as its head
+validator. Include session/workstream/adapter identity,
+objective, current state, verified facts, completed work, blockers, next actions,
+source refs, relations, semantic hash, and policy receipt. Never call Git or a
+generation provider.
 
 - [ ] **Step 4: Run focused and full tests**
 
@@ -866,7 +1079,7 @@ git commit -m "feat: persist immutable session revisions as checkpoints"
 
 ---
 
-### Task 12: Resolve Workstreams and Compose Portable/Local CURRENT
+### Task 13: Resolve Workstreams and Compose Portable/Local CURRENT
 
 **Files:**
 - Create: `mneme/core/resolver.py`
@@ -877,7 +1090,7 @@ git commit -m "feat: persist immutable session revisions as checkpoints"
 **Interfaces:**
 - Produces: `ResolutionState` values `resolved`, `divergent`, `degraded`, `invalid`
 - Produces: `resolve_workstream(registry, load_revision) -> ResolvedWorkstream`
-- Produces: `render_current(vault, workstream_id: str, mode: Literal["portable", "effective-local"]) -> ContextView`
+- Produces: `render_current(readers, workstream_id: str, mode: Literal["portable", "effective-local"]) -> ContextView`
 
 - [ ] **Step 1: Encode the resolution truth table**
 
@@ -909,7 +1122,12 @@ Run: `python -m pytest tests/core/test_resolver.py tests/core/test_current_overl
 
 - [ ] **Step 4: Implement deterministic resolution and generated views**
 
-Use only registry-declared heads. Never infer from timestamps or all sessions. Write generated CURRENT only to `local_root/views/CURRENT.md`; portable rendering never reads overlay paths. Effective-local output exposes `portable_status`, `overlay_status`, and `effective_status` exactly as D3 section 7.1 defines.
+Use only registry-declared heads. Never infer from timestamps or all sessions.
+Resolver/context receive read interfaces only and return a `ContextView`; they do
+not own any artifact or view write. A separate `ViewStore` may persist the returned
+projection only to `local_root/views/CURRENT.md`. Portable rendering never reads
+overlay paths. Effective-local output exposes `portable_status`, `overlay_status`,
+and `effective_status` exactly as D3 section 7.1 defines.
 
 - [ ] **Step 5: Run focused/full tests and commit**
 
@@ -922,7 +1140,7 @@ git commit -m "feat: resolve explicit heads into generated CURRENT views"
 
 ---
 
-### Task 13: Add Candidate and Immutable Accepted Memory Lifecycles
+### Task 14: Add Candidate and Immutable Accepted Memory Lifecycles
 
 **Files:**
 - Create: `mneme/core/memories.py`
@@ -932,7 +1150,7 @@ git commit -m "feat: resolve explicit heads into generated CURRENT views"
 **Interfaces:**
 - Produces independent: `MemoryKind`, `MemoryStatus`, `MemoryScope`, `MemoryAuthority`, `Portability`
 - Produces: `MemoryStore.submit_candidate`, `edit_candidate`, `promote`, `supersede`, `retire`
-- Produces: `render_profile(vault, scope) -> ContextView`
+- Produces: `render_profile(readers, scope) -> ContextView`
 
 - [ ] **Step 1: Test independent axes and candidate portability**
 
@@ -950,11 +1168,20 @@ def test_portable_candidate_is_not_implicitly_accepted(memory_store, receipt):
     assert (memory_store.vault.root / f"memory/{record.id}.md").exists()
 ```
 
-Add tests for local-only accepted memory, candidate CAS editing, promotion freezing semantic hash, semantic edit rejection after acceptance, a new ID with `supersedes`, derived reverse link, retirement-envelope mutation, and authorized privacy deletion not claiming Git erasure.
+Add tests for local-only accepted memory through the same schema/codec, candidate
+CAS editing, promotion freezing semantic hash, semantic edit rejection after
+acceptance, a new ID with `supersedes`, derived reverse link,
+retirement-envelope mutation, and authorized privacy deletion not claiming Git
+erasure. A portable candidate or accepted memory that references a local-only
+artifact must fail before creation; the corresponding local-to-portable reference
+is valid.
 
 - [ ] **Step 2: Test generated PROFILE**
 
-Create accepted preference, lesson, and retired preference records. Assert PROFILE contains only the active accepted preference with its ID, remains under local views, and shows unresolved conflicting preferences rather than choosing one.
+Create accepted preference, lesson, and retired preference records. Assert PROFILE
+contains only the active accepted preference with its ID and shows unresolved
+conflicting preferences rather than choosing one. `render_profile` returns a view
+without writing; only `ViewStore` may persist it under local views.
 
 - [ ] **Step 3: Verify tests fail**
 
@@ -975,7 +1202,7 @@ git commit -m "feat: add candidate and immutable accepted memory records"
 
 ---
 
-### Task 14: Register Read-Only Project Sources and Build Rebuildable Recall
+### Task 15: Register Read-Only Project Sources and Build Rebuildable Recall
 
 **Files:**
 - Create: `mneme/core/search/index.py`
@@ -1015,7 +1242,14 @@ Run: `python -m pytest tests/core/test_sources.py tests/core/test_recall.py test
 
 - [ ] **Step 4: Implement deterministic indexing and progressive disclosure**
 
-Index Registry metadata, Session revisions, Memory records, and available source chunks in separate FTS rows. Store content hash, authority, portability, policy status, source ID/path, artifact ID/revision, and excerpt offsets. Default recall is FTS/BM25 with Korean expansion. Missing mounts produce diagnostics and `degraded`, not failed startup.
+Index Registry metadata, Session revisions, Memory records, and available source
+chunks in separate FTS rows. Store content hash, authority, portability, policy
+status, source ID/path, artifact ID/revision, and excerpt offsets. Those stored
+policy fields are diagnostic/cache hints only; `GeneratedIndex.search` returns
+candidate hits, and `CoreService.recall` authorizes them against current canonical
+artifacts and policy pointers before exposure. Default recall is FTS/BM25 with
+Korean expansion. Missing mounts produce diagnostics and `degraded`, not failed
+startup. Task 19 locks the no-reindex tightening case across every consumer.
 
 - [ ] **Step 5: Run focused/full tests and commit**
 
@@ -1028,7 +1262,7 @@ git commit -m "feat: add rebuildable FTS recall over Vault and mounted sources"
 
 ---
 
-### Task 15: Add Deterministic Doctor and Safe Repair Boundaries
+### Task 16: Add Deterministic Doctor and Safe Repair Boundaries
 
 **Files:**
 - Create: `mneme/core/doctor.py`
@@ -1065,7 +1299,7 @@ git commit -m "feat: add deterministic Vault doctor"
 
 ---
 
-### Task 16: Add the Provisional Vault CLI Without Renaming the Package
+### Task 17: Add the Provisional Vault CLI Without Renaming the Package
 
 **Files:**
 - Create: `mneme/cli.py`
@@ -1103,7 +1337,7 @@ git commit -m "feat: add provisional Vault CLI beside legacy server"
 
 ---
 
-### Task 17: Add Explicit Git Sync Primitives
+### Task 18: Add Explicit Git Sync Primitives
 
 **Files:**
 - Create: `mneme/core/git_sync.py`
@@ -1112,12 +1346,15 @@ git commit -m "feat: add provisional Vault CLI beside legacy server"
 - Modify: `tests/test_cli.py`
 
 **Interfaces:**
-- Produces: `inspect_sync`, `fetch`, `commit_paths`, `fast_forward`, `push`
+- Produces: `inspect_sync`, `sync_preflight`, `fetch`, `commit_paths`, `fast_forward`, `push`
 - Produces CLI: `python -m mneme.cli sync {status,fetch,commit,fast-forward,push}`
 
 - [ ] **Step 1: Test refusal paths**
 
-Initialize local Git repositories under `tmp_path`. Assert `fast_forward` refuses dirty state and divergence, `commit_paths` includes only explicit doctor-validated Vault paths, `push` has no force mode, and checkpoint never invokes a Git function.
+Initialize local Git repositories under `tmp_path`. Assert `fast_forward` refuses
+dirty state and divergence, `commit_paths` includes only explicit
+doctor-and-policy-validated Vault paths, `push` has no force mode, and checkpoint
+never invokes a Git function.
 
 - [ ] **Step 2: Test checkpoint/commit separation**
 
@@ -1129,7 +1366,11 @@ Run: `python -m pytest tests/core/test_git_sync.py -v`
 
 - [ ] **Step 4: Implement and verify**
 
-Use argument-list `subprocess.run` calls, never shell strings. Fetch before fast-forward, refuse merge/rebase/force automatically, return structured divergence/conflict status, and allow push only after doctor/sync preflight succeeds.
+Use argument-list `subprocess.run` calls, never shell strings. Fetch before
+fast-forward, refuse merge/rebase/force automatically, return structured
+divergence/conflict status, and allow commit/push only after doctor and a live
+policy-aware sync preflight succeed. Task 19 adds the stale-index security
+regression once every generated consumer exists.
 
 ```powershell
 python -m pytest tests/core/test_git_sync.py -v
@@ -1145,7 +1386,82 @@ git commit -m "feat: add explicit non-merging Git sync primitives"
 
 ---
 
-### Task 18: Separate Lifecycle Events, Core Commands, and MCP Transport
+### Task 19: Enforce Current Policy Independently of Stale Generated State
+
+**Files:**
+- Create: `mneme/core/security.py`
+- Modify: `mneme/core/service.py`
+- Modify: `mneme/core/context.py`
+- Modify: `mneme/core/memories.py`
+- Modify: `mneme/core/git_sync.py`
+- Modify: `mneme/core/storage.py`
+- Create: `tests/core/test_policy_staleness.py`
+
+**Interfaces:**
+- Produces: `PolicyAuthorizer.authorize_current(artifact_ref, operation) -> PolicyDecision`
+- Produces: live authorization gates for `recall`, `context`, `profile`, `export`, and `sync_preflight`
+- Treats: index rows and generated-view policy status as non-authoritative cache metadata
+
+- [ ] **Step 1: Write the no-reindex tightening regression**
+
+Using only the official APIs from Tasks 10 and 11:
+
+1. create and activate a policy revision permitting `personal-vault`;
+2. assign it to a source and project;
+3. create a portable Session revision and accepted preference Memory derived from
+   that source;
+4. build FTS, CURRENT, and PROFILE while the artifacts are allowed;
+5. create and activate a stricter local-only revision and CAS-assign it to the
+   source/project;
+6. deliberately do **not** reindex and do not manually edit any YAML.
+
+Assert that `CoreService.recall`, portable CURRENT, PROFILE, export, and sync
+preflight expose none of the now-disallowed body or provenance. Sync preflight
+blocks commit/push of the affected current-tree artifact and emits only a
+local-safe remediation code. The artifact and its original admission receipt
+remain physically present; the result repeats D3's no-retroactive-erasure limit.
+
+- [ ] **Step 2: Prove caches cannot grant authority**
+
+Seed or tamper a generated FTS row and cached view metadata to say `allowed` under
+the older policy generation. Assert the live result is still denied. Conversely,
+a stale generated `denied` value cannot replace a current live allow decision;
+Core may request rebuild but must evaluate canonical policy itself. Direct YAML
+edits are used only in this cache-corruption fixture, never to tighten the source
+policy.
+
+Assert `ViewStore.load` refuses a CURRENT/PROFILE projection whose recorded live
+authorization-input fingerprint differs from current canonical vault policy,
+project/source policy assignments, or their immutable revision digests. Checking
+only the global policy-index generation is insufficient because a project/source
+assignment can change independently. The service rerenders through read-only
+context/profile functions; it never asks the resolver to mutate canonical state.
+
+- [ ] **Step 3: Verify tests fail**
+
+Run: `python -m pytest tests/core/test_policy_staleness.py -v`
+
+- [ ] **Step 4: Implement one live authorization gate**
+
+Resolve each candidate artifact's current vault/project/source policy pointers
+from Registry/Policy stores, compare them with the immutable write receipt, and
+authorize the requested operation. All outward paths call this same gate after an
+index lookup and before rendering or Git action. Unknown, missing, or unreadable
+current policy fails closed. Keep remediation details local-only and do not delete
+or rewrite Git history.
+
+- [ ] **Step 5: Run focused and full tests, then commit**
+
+```powershell
+python -m pytest tests/core/test_policy.py tests/core/test_policy_store.py tests/core/test_policy_staleness.py -v
+python -m pytest -q
+git add mneme/core tests/core/test_policy_staleness.py
+git commit -m "feat: enforce live policy over stale generated state"
+```
+
+---
+
+### Task 20: Separate Lifecycle Events, Core Commands, and MCP Transport
 
 **Files:**
 - Create: `mneme/core/contracts.py`
@@ -1162,7 +1478,9 @@ Lifecycle names are `session_started`, `session_resumed`, `pre_compact`,
 `milestone_reached`, `session_ended`, and `agent_switched`. Command names are
 `get_context`, `open_session`, `create_session_revision`, `submit_memory`,
 `promote_memory`, `retire_memory`, `set_active_heads`, `set_preferred_head`, and
-`register_source`. Successful mutations return the corresponding D3 Domain event;
+`register_source`; authorized administrative commands are `create_policy_revision`,
+`activate_policy_revision`, `assign_project_policy`, and `assign_source_policy`.
+Successful mutations return the corresponding D3 Domain event;
 source/index/sync availability produces an Operational event only.
 
 - [ ] **Step 1: Test vocabulary separation**
@@ -1179,7 +1497,11 @@ def test_lifecycle_event_cannot_mutate_core(service):
     assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
 ```
 
-Add tests that `create_session_revision` returns `session_revision_created`, operational `source_unavailable` is local-only, and no Domain event log becomes a fourth canonical artifact.
+Add tests that `create_session_revision` returns `session_revision_created`,
+operational `source_unavailable` is local-only, and no Domain event log becomes a
+fourth canonical artifact. Assert policy lifecycle commands delegate only to the
+Task 10/11 APIs, preserve their authorization/CAS failures, and cannot accept a
+raw filesystem path as an update shortcut.
 
 - [ ] **Step 2: Test stdio tools by direct function call**
 
@@ -1204,7 +1526,7 @@ git commit -m "feat: add agent-neutral Core contract and stdio MCP transport"
 
 ---
 
-### Task 19: Add a Non-Blocking Claude Adapter in Parallel with Legacy Integration
+### Task 21: Add a Non-Blocking Claude Adapter in Parallel with Legacy Integration
 
 **Files:**
 - Create: `mneme/adapters/__init__.py`
@@ -1263,12 +1585,15 @@ git commit -m "feat: add opt-in non-blocking Claude adapter"
 
 ---
 
-### Task 20: Add the Codex Adapter Without Hard-Coding Undocumented Payloads
+### Task 22: Bind the Official Codex PreCompact Schema to the Agent-Neutral Contract
 
 **Files:**
 - Create: `mneme/adapters/codex.py`
+- Create: `tests/fixtures/codex/pre_compact.native.json`
 - Create: `tests/fixtures/codex/pre_compact.normalized.json`
 - Create: `integration/madi/codex/AGENTS.md.template`
+- Create: `integration/madi/codex/hooks.json`
+- Create: `integration/madi/codex/pre_compact_hook.py`
 - Create: `integration/madi/codex/README.md`
 - Create: `integration/madi/install_codex.py`
 - Create: `tests/adapters/test_codex.py`
@@ -1276,19 +1601,42 @@ git commit -m "feat: add opt-in non-blocking Claude adapter"
 
 **Interfaces:**
 - Produces: `CodexAdapter.handle(envelope) -> AdapterResult`
+- Produces: `translate_pre_compact(native_payload, local_binding) -> LifecycleEvent`
 - Consumes: the same versioned adapter envelope and Core commands as Claude
 
-- [ ] **Step 1: Record the capability boundary before binding**
+- [ ] **Step 1: Pin the official native contract and its provenance**
 
-Recheck installed Codex hook documentation and official OpenAI documentation at
-execution. The required implementation in this task is the adapter-owned normalized
-envelope plus manual/threshold wrapper fallback, represented by
-`pre_compact.normalized.json`. Record inspected versions and sources in the adapter
-README. If a stable native PreCompact schema is newly established, stop and amend
-this plan with its exact fixture and translator test before adding that bridge; do
-not improvise native field names during execution.
+Treat the current official `PreCompact` command-hook payload as a supported native
+contract, not a discovery condition. Record all of the following in
+`integration/madi/codex/README.md`:
 
-- [ ] **Step 2: Test normalized behavior independent of native payload**
+- adapter schema ID: `openai-codex-hooks/pre-compact@2026-08-26+a26f1806`;
+- release-behavior source, checked 2026-08-26:
+  `https://learn.chatgpt.com/docs/hooks`;
+- generated input schema pinned to OpenAI Codex commit
+  `a26f1806a4f4b8cfec2ea1be129963815a61e58c`:
+  `https://github.com/openai/codex/blob/a26f1806a4f4b8cfec2ea1be129963815a61e58c/codex-rs/hooks/schema/generated/pre-compact.command.input.schema.json`;
+- the official warning that the release documentation is behavioral authority and
+  `main` schemas may contain unreleased fields.
+
+The native fixture contains the seven required fields from that contract:
+`session_id: string`, `transcript_path: string|null`, `cwd: string`,
+`hook_event_name: "PreCompact"`, `model: string`, `turn_id: string`, and
+`trigger: "manual"|"auto"`. The pinned generated schema also permits optional
+`agent_id` and `agent_type`; the translator may ignore them. Do not invent a
+workstream field: resolve session/workstream association only from machine-local
+adapter bindings.
+
+- [ ] **Step 2: Test native-to-normalized translation**
+
+Load `pre_compact.native.json` and assert translation yields the normalized
+`LifecycleEvent(version=1, name="pre_compact", adapter="codex", session_id=...)`
+plus non-canonical trigger/turn metadata. Assert `transcript_path`, `cwd`, `model`,
+and optional agent fields never enter a canonical command, Session body, Memory,
+or portable Registry. Missing required fields, the wrong event name, and an
+unknown trigger return a structured non-blocking adapter error.
+
+- [ ] **Step 3: Test normalized behavior against Core**
 
 ```python
 def test_codex_precompact_uses_same_core_command(service, checkpoint_file):
@@ -1306,45 +1654,52 @@ def test_codex_precompact_uses_same_core_command(service, checkpoint_file):
     assert result.domain_events[0].name == "session_revision_created"
 ```
 
-Add agent-switch coverage: Codex creates its own session with `continues_from` the Claude revision and changes `preferred_head` only through an explicit Core command.
+Add agent-switch coverage: Codex creates its own session with `continues_from` the
+Claude revision and changes `preferred_head` only through an explicit Core
+command. A lifecycle event without host-composed semantic checkpoint material
+requests a checkpoint and writes no canonical artifact.
 
-- [ ] **Step 3: Test installer and fallback**
+- [ ] **Step 4: Test the native hook runner, installer, and fallback**
 
-Assert `AGENTS.md` instructions are idempotent, identify Madi as optional, use no credential or absolute Vault path, and tell Codex to continue ordinary work if checkpoint fails.
+Feed the native fixture to the hook runner over stdin and assert it invokes the
+translator. Assert `hooks.json` registers `PreCompact` for `manual|auto`, and the
+installer preserves existing hooks/config while adding Madi once. `AGENTS.md`
+instructions identify Madi as optional, use no credential or absolute Vault path,
+and tell Codex to continue ordinary work if checkpoint fails. Core/unavailable or
+invalid payload returns warning diagnostics without blocking normal Codex work.
 
-- [ ] **Step 4: Implement and verify**
+- [ ] **Step 5: Implement and verify**
 
 ```powershell
 python -m pytest tests/adapters/test_codex.py tests/integration/test_install_codex.py -v
 python -m pytest -q
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```powershell
 git add mneme/adapters/codex.py integration/madi/codex integration/madi/install_codex.py tests
-git commit -m "feat: add agent-neutral Codex checkpoint adapter"
+git commit -m "feat: translate official Codex PreCompact hooks"
 ```
 
 ---
 
-### Task 21: Isolate the Complete Growth Lab Behind Compatibility Facades
+### Task 23: Characterize the Complete Legacy Growth Surface
 
 **Files:**
 - Create: `tests/characterization/test_legacy_growth.py`
-- Create: `mneme/growth_lab/__init__.py`
-- Move: `mneme/cib.py`, `constitution.py`, `constitution.yaml`, `skills.py`, `outer_loop.py`, `self_model.py`, `growth.py`, `scheduler.py`, `notify.py`, `log.py` under `mneme/growth_lab/`
-- Create: compatibility facades at every moved top-level module path
-- Modify: `mneme/transports/legacy_http.py`
-- Create: `tests/core/test_growth_optional.py`
 
 **Interfaces:**
 - Preserves: all current Growth tool/module signatures
-- Produces: import boundary where `mneme.core` succeeds with Growth modules blocked
+- Produces: executable characterization evidence before any Growth file moves
 
 - [ ] **Step 1: Characterize Growth before moving**
 
-Add deterministic tests for `cib.clip`, seed-protected negative reward rejection, Outer Loop insufficient-episode gate, `self_model.assess` no-LLM graceful path, scheduler tick order, and legacy MCP Growth response shapes. Stub the generation provider and isolate `DB_PATH`.
+Add deterministic tests for `cib.clip`, seed-protected negative reward rejection,
+Outer Loop insufficient-episode gate, `self_model.assess` no-LLM graceful path,
+Growth DB/log shapes, scheduler tick order, notify failure behavior, and legacy MCP
+Growth response shapes. Stub the generation provider and network notifier, and
+isolate `DB_PATH`.
 
 - [ ] **Step 2: Run characterization before edits**
 
@@ -1352,29 +1707,118 @@ Run: `python -m pytest tests/characterization/test_legacy_growth.py -v`
 
 Expected: all pass on the current top-level modules.
 
-- [ ] **Step 3: Move the dependency closure and add facades**
+- [ ] **Step 3: Run the full unchanged suite**
 
-Update internal Growth imports to `mneme.growth_lab.*`. Keep top-level modules as explicit re-export facades so legacy server and user imports work. Load `constitution.yaml` relative to its new module. Core and stdio MCP modules must not import Growth.
+Run: `python -m pytest -q`
 
-- [ ] **Step 4: Verify optional failure and compatibility**
+Expected: the new tests describe current behavior without any production change.
 
-```powershell
-python -m pytest tests/characterization/test_legacy_growth.py tests/core/test_growth_optional.py -v
-python -m pytest -q
-```
-
-Expected: Growth failure/unavailability does not affect Core; legacy Growth tools still pass.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit characterization only**
 
 ```powershell
-git add mneme/growth_lab mneme/cib.py mneme/constitution.py mneme/skills.py mneme/outer_loop.py mneme/self_model.py mneme/growth.py mneme/scheduler.py mneme/notify.py mneme/log.py mneme/transports tests
-git commit -m "refactor: isolate optional self-growth features in Growth Lab"
+git add tests/characterization/test_legacy_growth.py
+git commit -m "test: characterize legacy Growth behavior"
 ```
 
 ---
 
-### Task 22: Stage Legacy Wiki and SQLite Data Without Promotion or Deletion
+### Task 24: Move Pure Growth Dependencies Behind Compatibility Facades
+
+**Files:**
+- Create: `mneme/growth_lab/__init__.py`
+- Move: `mneme/cib.py`, `constitution.py`, `constitution.yaml`, `skills.py`, `outer_loop.py`, `self_model.py`, `growth.py`, `log.py` under `mneme/growth_lab/`
+- Create: compatibility facades at each moved top-level module path
+- Create: `tests/growth_lab/test_facades.py`
+- Create: `tests/core/test_growth_optional.py`
+
+**Interfaces:**
+- Preserves: current pure Growth functions, database seams, resources, and import paths
+- Produces: import boundary where `mneme.core` succeeds with Growth modules blocked
+
+- [ ] **Step 1: Test the move boundary before moving**
+
+Add tests that old and new import paths expose the same objects/signatures,
+top-level monkeypatches still affect runtime lookup, `constitution.yaml` resolves
+relative to the new package, and importing Core with every `mneme.growth_lab.*`
+module blocked succeeds. Do not include scheduler, notifier, or legacy-server
+wiring in this task.
+
+- [ ] **Step 2: Verify the focused test fails**
+
+Run: `python -m pytest tests/growth_lab/test_facades.py tests/core/test_growth_optional.py -v`
+
+- [ ] **Step 3: Move the pure dependency closure and add facades**
+
+Move the listed modules and update intra-Growth imports to
+`mneme.growth_lab.*`. Keep `scheduler.py` and `notify.py` at their top-level paths
+for Task 25; when `outer_loop` needs notify, retain that compatibility import until
+the integration task. Use module-object aliases for monkeypatch-sensitive facades.
+Do not modify `mneme/transports/legacy_http.py` here.
+
+- [ ] **Step 4: Verify characterization and optionality**
+
+```powershell
+python -m pytest tests/characterization/test_legacy_growth.py tests/growth_lab/test_facades.py tests/core/test_growth_optional.py -v
+python -m pytest -q
+```
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add mneme/growth_lab mneme/cib.py mneme/constitution.py mneme/skills.py mneme/outer_loop.py mneme/self_model.py mneme/growth.py mneme/log.py tests
+git commit -m "refactor: move pure Growth dependencies behind facades"
+```
+
+---
+
+### Task 25: Isolate Scheduler, Notify, and Legacy Growth Integration
+
+**Files:**
+- Move: `mneme/scheduler.py`, `mneme/notify.py` under `mneme/growth_lab/`
+- Create: compatibility facades at `mneme/scheduler.py` and `mneme/notify.py`
+- Modify: `mneme/growth_lab/outer_loop.py`
+- Modify: `mneme/transports/legacy_http.py`
+- Create: `tests/growth_lab/test_legacy_integration.py`
+
+**Interfaces:**
+- Preserves: scheduler/notify functions, lifecycle order, and legacy MCP Growth response shapes
+- Ensures: scheduler, notifier, and legacy HTTP imports do not enter Madi Core/stdio paths
+
+- [ ] **Step 1: Add focused integration tests**
+
+Reuse Task 23 characterization fixtures to assert scheduler start/stop and tick
+order, notify success/failure with network stubs, and every legacy HTTP Growth tool
+response. Assert importing/running Core and stdio MCP with scheduler, notify,
+FastMCP legacy server, and Growth modules blocked still succeeds.
+
+- [ ] **Step 2: Verify the new package-path tests fail**
+
+Run: `python -m pytest tests/growth_lab/test_legacy_integration.py -v`
+
+- [ ] **Step 3: Move only integration dependencies**
+
+Move scheduler and notify, update Growth internal imports and the legacy HTTP
+transport, and leave top-level compatibility facades. Preserve watcher and legacy
+HTTP startup order. Growth/scheduler/notify failure remains confined to the legacy
+or optional Growth surface and never prevents Core recall/context.
+
+- [ ] **Step 4: Verify characterization and full compatibility**
+
+```powershell
+python -m pytest tests/characterization/test_legacy_growth.py tests/growth_lab tests/core/test_growth_optional.py -v
+python -m pytest -q
+```
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add mneme/growth_lab mneme/scheduler.py mneme/notify.py mneme/transports/legacy_http.py tests
+git commit -m "refactor: isolate optional Growth runtime integration"
+```
+
+---
+
+### Task 26: Stage Legacy Wiki and SQLite Data Without Promotion or Deletion
 
 **Files:**
 - Modify: `mneme/migration/legacy.py`
@@ -1385,26 +1829,48 @@ git commit -m "refactor: isolate optional self-growth features in Growth Lab"
 **Interfaces:**
 - Produces: `stage_legacy(db_path, wiki_path, vault, local_pending) -> MigrationReport`
 - Produces CLI: `python -m mneme.cli migrate inspect` and `migrate stage`
+- Produces: local-only `pending/legacy/<db-sha256>/` lossless staging bundle
 - Does not produce accepted portable memories
 
 - [ ] **Step 1: Test byte-for-byte preservation**
 
-Create a closed legacy DB containing rows in every table and an external Wiki. Run `stage_legacy`; assert DB and Wiki file hashes are unchanged, no table is dropped, and no source file is moved.
+Create a closed legacy DB containing rows in every table and an external Wiki. Run
+`stage_legacy`; assert DB and Wiki file hashes are unchanged, no table is dropped,
+and no source file is moved. Assert local
+`pending/legacy/<db-sha256>/source/state.db` is byte-for-byte identical to the
+original and the manifest records both hashes. The original path remains the
+legacy runtime authority and is never replaced by the staged copy.
+
+Include NULL, INTEGER, REAL, TEXT, and BLOB episode values. In addition to the
+byte-exact DB snapshot, assert the review export preserves every table/column,
+SQLite storage class, value (BLOB as tagged base64), schema SQL, row count, and a
+deterministic row locator/ordinal. Compare per-table typed-export checksums. If the
+source hash changes during snapshot, staging fails without publishing a partial
+bundle.
 
 - [ ] **Step 2: Test classification destinations**
 
 Assert:
 
 - Wiki becomes a read-only source registry plus a machine-local binding, not copied project truth.
-- `facts` become review inputs under local `pending/legacy/facts.ndjson`, never accepted memory.
-- `episodes` become local raw-evidence metadata only; transcript/tool payload is not put in Git.
+- `facts` are `candidate-durable-local` review inputs under the local staging bundle, never accepted memory.
+- `episodes` are `candidate-durable-local`/`needs-review`; every original field and payload is preserved in the local-only snapshot and typed review export, never reduced to metadata-only and never put in Git automatically.
 - skills/loops/self-model/growth-actions remain a local Growth Lab export.
 - generated tables are reported rebuildable and not exported as durable Markdown.
-- unknown tables stop staging with a fail-closed report.
+- unknown tables are `needs-review`: they are included losslessly in the local DB snapshot and typed export, then block any portable registration/promotion with a fail-closed report.
+
+All files in this bundle live below `MADI_STATE_HOME`, not the Vault, and are
+treated as potentially confidential. No row count, table name, hash, local ID, or
+bundle existence leaks into a portable artifact unless a later policy-authorized
+human action explicitly supplies a portable-safe value.
 
 - [ ] **Step 3: Test promotion remains separate**
 
-Calling `migrate stage` cannot create `memory/*.md` or Session revisions. A later human/host-reviewed `remember` command supplies sanitized content and a fresh policy evaluation.
+Calling `migrate stage` cannot create `memory/*.md` or Session revisions. A later
+human/host-reviewed `remember` command supplies sanitized content and a fresh
+policy evaluation. Candidate classification is not acceptance and never raises
+portability. Wiki source registration, if authorized, uses the Task 10/11 policy
+and source APIs rather than direct YAML edits.
 
 - [ ] **Step 4: Implement and verify**
 
@@ -1422,7 +1888,7 @@ git commit -m "feat: stage legacy Mneme data for reviewed Madi migration"
 
 ---
 
-### Task 23: Prove Clean Clone, Concurrency, Compact, Privacy, and Compatibility
+### Task 27: Prove Clean Clone, Concurrency, Compact, Privacy, and Compatibility
 
 **Files:**
 - Create: `tests/e2e/test_clean_clone.py`
@@ -1451,11 +1917,30 @@ Simulate Claude revisions `000001` through `000004` across three PreCompact comm
 
 - [ ] **Step 3: Test concurrency and conflict behavior**
 
-Create two agents in separate session directories and an intentional `parallel` registry. Assert `divergent`, not invalid. Race two preferred-head CAS updates and assert one explicit conflict. Race the same Session revision and assert no overwrite. Verify no semantic auto-merge path exists.
+Create two agents in separate session directories from the same registry
+generation. Checkpoint both and assert the second disjoint head addition takes the
+bounded reload/CAS path: both immutable revisions are active and neither is an
+orphan. With `parallel` mode and no preferred head, assert `divergent`, not
+invalid. Race two preferred-head CAS updates and assert one explicit conflict.
+Race the same Session lineage/revision and assert no overwrite. Verify the retry
+rejects removals and non-head-field changes and that no semantic auto-merge path
+exists.
 
 - [ ] **Step 4: Test privacy and unavailable Madi**
 
-Seed local evidence with a credential, customer identifier, internal URL, source snippet, and log. Assert portable Git contains none of the sensitive values or local IDs/hashes/counts. Tighten source policy, assert generated output/sync blocks the affected artifact, and assert the report says prior Git propagation cannot be erased. Stop Core and assert both adapters return `block_host=False`.
+Seed local evidence with a credential, customer identifier, internal URL, source
+snippet, and log. Assert portable Git contains none of the sensitive values or
+local IDs/hashes/counts. Create/activate/assign a stricter source policy through
+the Task 10/11 APIs—never direct YAML—then deliberately skip reindex. Assert
+recall, portable CURRENT, PROFILE, export, and sync preflight block the affected
+artifact despite stale generated `allowed` state, while the report says prior Git
+propagation cannot be erased. Stop Core and assert both adapters return
+`block_host=False`.
+
+Stage a legacy database containing a full episode payload and an unknown table.
+Assert the original hash is unchanged, the local snapshot/export is lossless, the
+rows are `candidate-durable-local`/`needs-review`, and portable memory remains
+empty until explicit reviewed promotion.
 
 - [ ] **Step 5: Run the release matrix**
 
@@ -1470,9 +1955,18 @@ python -c "import mneme.server; assert callable(mneme.server.main)"
 
 Expected: tests pass; doctor has no invalid issue; reindex works with generation unavailable; legacy server remains importable.
 
+Open the PR and require `.github/workflows/ci.yml` job `test` to pass on all four
+cells—Ubuntu/Windows × Python 3.11/3.13—and require the aggregate `ci-ok` job.
+Record the workflow run URL/IDs in the review evidence.
+
 - [ ] **Step 6: Update coexistence documentation**
 
-Document the opt-in Vault path, generated local state, migration inspection/staging, provisional `mneme-vault` command, legacy HTTP compatibility, no-retroactive-deletion guarantee, and rollback: stop using new adapters and continue the untouched legacy path. Do not announce repository/package rename or legacy-data deletion.
+Document the opt-in Vault path, generated local state, official policy lifecycle
+commands/APIs, migration inspection/lossless local staging, provisional
+`mneme-vault` command, legacy HTTP compatibility, pinned Codex hook schema,
+no-retroactive-deletion guarantee, and rollback: stop using new adapters and
+continue the untouched legacy path. Do not announce repository/package rename or
+legacy-data deletion.
 
 - [ ] **Step 7: Commit**
 
@@ -1487,31 +1981,36 @@ git commit -m "test: verify incremental Mneme to Madi migration invariants"
 
 | Approved D3 section | Implemented/verified by |
 |---|---|
-| 1–5: artifact families, ownership, layout, mutation | Tasks 8–13 |
-| 6: project/source/workstream registries and resolution states | Tasks 10, 12, 14 |
-| 7: portable/local overlay and exact CURRENT composition | Tasks 12, 23 |
-| 8: immutable Session checkpoint and handoff relations | Tasks 11, 18–20, 23 |
-| 9: independent Memory axes, acceptance, supersession, PROFILE | Task 13 |
-| 10: privacy ceiling, policy receipt, policy-time limitation | Tasks 9, 15, 23 |
-| 11: concurrency and Git conflict policy | Tasks 10–12, 17, 23 |
-| 12: lifecycle/command/domain/operational vocabularies | Task 18 |
-| 13: compact lifecycle and Claude/Codex handoff | Tasks 19, 20, 23 |
-| 14: progressive FTS retrieval and provenance | Tasks 4, 14 |
-| 15: clean/shallow clone and failure scenarios | Tasks 15, 17, 23 |
-| 16: typed personal owner and future scope compatibility | Tasks 8, 10, 13 |
-| 17: non-destructive Mneme migration | Tasks 1–7, 21, 22 |
-| 18: all testable invariants | Task 23 release matrix |
+| 1–5: artifact families, ownership, layout, mutation | Tasks 8–14 |
+| 6: project/source/workstream registries and resolution states | Tasks 11, 13, 15 |
+| 7: portable/local overlay and exact CURRENT composition | Tasks 8, 11–14, 19, 27 |
+| 8: immutable Session checkpoint and handoff relations | Tasks 12, 20–22, 27 |
+| 9: independent Memory axes, acceptance, supersession, PROFILE | Tasks 14, 19 |
+| 10: privacy ceiling, policy receipt, policy-time limitation | Tasks 9–11, 14, 19, 27 |
+| 11: concurrency and Git conflict policy | Tasks 11–13, 18, 27 |
+| 12: lifecycle/command/domain/operational vocabularies | Task 20 |
+| 13: compact lifecycle and Claude/Codex handoff | Tasks 12, 20–22, 27 |
+| 14: progressive FTS retrieval and provenance | Tasks 4, 15, 19 |
+| 15: clean/shallow clone and failure scenarios | Tasks 16, 18, 19, 27 |
+| 16: typed personal owner and future scope compatibility | Tasks 8, 11, 14 |
+| 17: non-destructive Mneme migration | Tasks 1–7, 23–27 |
+| 18: all testable invariants | Task 0 CI evidence and Task 27 release matrix |
 | 19–20: accepted trade-offs and authoritative verdict | Global constraints and every review gate |
 
 Self-review verdict: every binding D3 section has an implementation task and a
 verification task. No approved invariant requires a repository/package rename,
 legacy-data deletion, mandatory generation provider, daemon, or semantic merge.
+The one automatic concurrency path is the D3-approved structural union of proven
+disjoint head additions. It cannot change semantic bodies, preferred heads,
+policies, lifecycle, or existing session lineage.
 
 ---
 
 ## Final Verification and Review Gate
 
-After Task 23, invoke `superpowers:verification-before-completion`, then `superpowers:requesting-code-review`. Review must compare the branch against the approved D3, not only this plan.
+After Task 27, invoke `superpowers:verification-before-completion`, then
+`superpowers:requesting-code-review`. Review must compare the branch against the
+approved D3, not only this plan.
 
 Run fresh:
 
@@ -1526,15 +2025,17 @@ git log --oneline --decorate main..HEAD
 The branch is ready for integration review only when:
 
 - every task commit exists and the worktree is clean;
-- legacy and new tests pass on Python 3.11 and 3.13, Windows and Linux CI;
+- legacy and new tests pass in the existing `.github/workflows/ci.yml` four-cell matrix: Python 3.11/3.13 on `ubuntu-latest`/`windows-latest`, followed by `ci-ok`;
 - `mneme.server:main` remains runnable;
 - Core recall/context works with generation and Growth imports blocked;
 - a deleted generated DB rebuilds from Markdown and current source mounts;
 - a shallow clone restores synced portable semantics;
-- concurrent agents cannot silently overwrite heads or revisions;
+- disjoint concurrent session heads survive bounded structural retry, while same-session/preferred-head conflicts remain explicit;
 - compact/checkpoint survives repeated compaction and agent switch;
-- privacy inheritance and later-policy-tightening tests pass;
-- legacy DB/Wiki hashes prove no mutation or deletion;
+- portable/local writers share schemas but portable-to-local references fail before write;
+- policy revisions and assignments use official CAS APIs, and tightening blocks recall/CURRENT/PROFILE/export/sync without reindex;
+- legacy DB/Wiki hashes prove no mutation or deletion, and episodes/unknown tables remain losslessly staged local review data;
+- the Codex native fixture/translator matches the pinned official `PreCompact` schema and source recorded in its README;
 - no repository/package rename or destructive cleanup appears in the diff.
 
 Only after code review should `superpowers:finishing-a-development-branch` be used to choose PR/integration handling. Direct merge or push to protected `main` is not part of this plan.
