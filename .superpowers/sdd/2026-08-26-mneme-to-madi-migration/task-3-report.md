@@ -35,4 +35,13 @@ DONE
 
 ## Deviations
 
-- Backslash-separated source input is rejected rather than accepted after separator normalization. This is the stricter interpretation of the task's explicit fail-closed requirement for alternate separators; returned/listed paths remain normalized as POSIX-relative strings.
+None.
+
+## Review round 1
+
+- **Source-fix commit:** `2ab283b628201a5a0d678bdb45da1e9f36416f29` (`fix: normalize safe filesystem source paths`).
+- **Red:** New Windows-separator and in-root-symlink tests failed against the previous implementation (2 failed, 2 passed), proving the previous blanket backslash and symlink rejections.
+- **Second red:** The non-Markdown-target symlink test failed as expected (1 failed, 4 passed), proving that a `.md` link could otherwise resolve to a non-Markdown target.
+- **Green:** `python -m pytest tests/core/sources/test_filesystem.py tests/core/validation/test_wiki_facade.py tests/characterization/test_legacy_contracts.py -v` passed (12 passed).
+- **Full:** `python -m pytest -q` passed (55 passed).
+- **Change:** Source paths now normalize `\\` to `/` before validation; drive-qualified, UNC/rooted, absolute, and traversal paths remain rejected. Symlinks are accepted only when their resolved Markdown target remains within the configured root; resolved escapes and non-Markdown targets are rejected.
