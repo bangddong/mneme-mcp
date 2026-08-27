@@ -1,0 +1,365 @@
+from pathlib import Path, PurePosixPath
+
+import pytest
+
+
+@pytest.fixture
+def storage(tmp_path):
+    from mneme.core.storage import ArtifactReader, ArtifactStore, StorageRouter
+
+    portable_root = tmp_path / "vault"
+    local_root = tmp_path / "local"
+    portable_root.mkdir()
+    local_root.mkdir()
+    router = StorageRouter(portable_root=portable_root, local_root=local_root)
+    return router, ArtifactStore(router), ArtifactReader(router)
+
+
+@pytest.mark.parametrize(
+    ("family", "relative_path"),
+    [
+        ("registry", ".madi/policy-index.yaml"),
+        ("session", "workstreams/ws-1/sessions/ses-1/000001.md"),
+        ("memory", "memory/mem-1.md"),
+    ],
+)
+def test_portable_and_local_routes_share_family_codec_and_only_roots_differ(
+    storage, family, relative_path
+):
+    from mneme.core.artifacts import ArtifactFamily
+    from mneme.core.storage import StorageClass
+
+    router, _, _ = storage
+    artifact_family = ArtifactFamily(family)
+    portable = router.location(artifact_family, StorageClass.PORTABLE, relative_path)
+    local = router.location(artifact_family, StorageClass.LOCAL_ONLY, relative_path)
+
+    assert portable.storage_class is StorageClass.PORTABLE
+    assert local.storage_class is StorageClass.LOCAL_ONLY
+    assert portable.root == router.portable_root
+    assert local.root == router.local_root / "overlays"
+    assert portable.relative_path == local.relative_path == PurePosixPath(relative_path)
+    assert router.codec(artifact_family, StorageClass.PORTABLE) is router.codec(
+        artifact_family, StorageClass.LOCAL_ONLY
+    )
+    assert router.codec(artifact_family, StorageClass.PORTABLE).schema == f"madi.{family}.v1"
+
+
+@pytest.mark.parametrize(
+    ("family", "relative_path", "body"),
+    [
+        ("registry", "projects/proj-1.yaml", None),
+        ("session", "workstreams/ws-1/sessions/ses-1/000001.md", "checkpoint 한글"),
+        ("memory", "memory/mem-1.md", "remember 한글"),
+    ],
+)
+def test_canonical_store_round_trips_same_document_in_both_storage_classes(
+    storage, family, relative_path, body
+):
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily, ReferenceManifest
+    from mneme.core.storage import StorageClass
+
+    _, store, reader = storage
+    artifact_family = ArtifactFamily(family)
+    document = ArtifactDocument(
+        metadata={"generation": 0, "id": "artifact-1"},
+        body=body,
+        references=ReferenceManifest.complete(),
+    )
+
+    for storage_class in StorageClass:
+        location = store.write_new(
+            artifact_family,
+            storage_class=storage_class,
+            relative_path=relative_path,
+            document=document,
+        )
+        assert reader.read(artifact_family, location=location) == document
+
+
+def test_canonical_writer_requires_explicit_storage_class(storage):
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily, ReferenceManifest
+
+    _, store, _ = storage
+    document = ArtifactDocument(
+        metadata={"generation": 0}, references=ReferenceManifest.complete()
+    )
+    with pytest.raises(TypeError):
+        store.write_new(
+            ArtifactFamily.REGISTRY,
+            relative_path="projects/proj-1.yaml",
+            document=document,
+        )
+
+
+@pytest.mark.parametrize("kind", ["id", "path", "hash", "count", "label", "existence"])
+def test_portable_write_rejects_each_typed_local_only_reference_before_creation(
+    storage, kind
+):
+    from mneme.core.artifacts import (
+        ArtifactDocument,
+        ArtifactFamily,
+        ArtifactReference,
+        ReferenceKind,
+        ReferenceManifest,
+    )
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.storage import StorageClass
+
+    router, store, _ = storage
+    relative_path = "memory/portable.md"
+    document = ArtifactDocument(
+        metadata={"generation": 0, "id": "portable"},
+        body="sanitized body",
+        references=ReferenceManifest.complete(
+            body=(
+                ArtifactReference(
+                    kind=ReferenceKind(kind),
+                    storage_class=StorageClass.LOCAL_ONLY,
+                    value="confidential-value",
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(PortabilityViolation):
+        store.write_new(
+            ArtifactFamily.MEMORY,
+            storage_class=StorageClass.PORTABLE,
+            relative_path=relative_path,
+            document=document,
+        )
+    assert not router.location(
+        ArtifactFamily.MEMORY, StorageClass.PORTABLE, relative_path
+    ).path.exists()
+
+
+def test_portable_write_fails_closed_without_complete_reference_manifest(storage):
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.storage import StorageClass
+
+    router, store, _ = storage
+    relative_path = "memory/unclassified.md"
+    with pytest.raises(PortabilityViolation):
+        store.write_new(
+            ArtifactFamily.MEMORY,
+            storage_class=StorageClass.PORTABLE,
+            relative_path=relative_path,
+            document=ArtifactDocument(metadata={"generation": 0}, body="body"),
+        )
+    assert not router.location(
+        ArtifactFamily.MEMORY, StorageClass.PORTABLE, relative_path
+    ).path.exists()
+
+
+def test_local_artifact_may_reference_portable_artifact(storage):
+    from mneme.core.artifacts import (
+        ArtifactDocument,
+        ArtifactFamily,
+        ArtifactReference,
+        ReferenceKind,
+        ReferenceManifest,
+    )
+    from mneme.core.storage import StorageClass
+
+    _, store, reader = storage
+    document = ArtifactDocument(
+        metadata={"generation": 0, "id": "local-memory"},
+        body="private consequence",
+        references=ReferenceManifest.complete(
+            metadata=(
+                ArtifactReference(
+                    kind=ReferenceKind.ID,
+                    storage_class=StorageClass.PORTABLE,
+                    value="portable-memory",
+                ),
+            )
+        ),
+    )
+    location = store.write_new(
+        ArtifactFamily.MEMORY,
+        storage_class=StorageClass.LOCAL_ONLY,
+        relative_path="memory/local-memory.md",
+        document=document,
+    )
+    loaded = reader.read(ArtifactFamily.MEMORY, location=location)
+    assert loaded.metadata == document.metadata
+    assert loaded.body == document.body
+
+
+@pytest.mark.parametrize(
+    ("family", "relative_path", "body"),
+    [
+        ("registry", "projects/proj-1.yaml", None),
+        ("memory", "memory/mem-1.md", "candidate v1"),
+    ],
+)
+def test_canonical_cas_updates_exact_generation_and_rejects_stale_write(
+    storage, family, relative_path, body
+):
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily, ReferenceManifest
+    from mneme.core.errors import ConcurrentWrite
+    from mneme.core.storage import StorageClass
+
+    _, store, reader = storage
+    artifact_family = ArtifactFamily(family)
+    initial = ArtifactDocument(
+        metadata={"generation": 0, "id": "artifact-1"},
+        body=body,
+        references=ReferenceManifest.complete(),
+    )
+    store.write_new(
+        artifact_family,
+        storage_class=StorageClass.PORTABLE,
+        relative_path=relative_path,
+        document=initial,
+    )
+    updated = ArtifactDocument(
+        metadata={"generation": 1, "id": "artifact-1"},
+        body=None if body is None else "candidate v2",
+        references=ReferenceManifest.complete(),
+    )
+
+    location = store.write_cas(
+        artifact_family,
+        storage_class=StorageClass.PORTABLE,
+        relative_path=relative_path,
+        document=updated,
+        expected_generation=0,
+    )
+    assert reader.read(artifact_family, location=location) == updated
+    lock_files = list((store.router.local_root / "locks").glob("*.lock"))
+    assert len(lock_files) == 1
+    assert not list(store.router.portable_root.rglob("*.lock"))
+
+    stale = ArtifactDocument(
+        metadata={"generation": 1, "id": "artifact-1"},
+        body=None if body is None else "stale candidate",
+        references=ReferenceManifest.complete(),
+    )
+    with pytest.raises(ConcurrentWrite):
+        store.write_cas(
+            artifact_family,
+            storage_class=StorageClass.PORTABLE,
+            relative_path=relative_path,
+            document=stale,
+            expected_generation=0,
+        )
+    assert reader.read(artifact_family, location=location) == updated
+
+
+def test_canonical_cas_rejects_local_reference_before_mutating_portable_file(storage):
+    from mneme.core.artifacts import (
+        ArtifactDocument,
+        ArtifactFamily,
+        ArtifactReference,
+        ReferenceKind,
+        ReferenceManifest,
+    )
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.storage import StorageClass
+
+    _, store, reader = storage
+    relative_path = "memory/mem-1.md"
+    initial = ArtifactDocument(
+        metadata={"generation": 0, "id": "mem-1"},
+        body="portable body",
+        references=ReferenceManifest.complete(),
+    )
+    location = store.write_new(
+        ArtifactFamily.MEMORY,
+        storage_class=StorageClass.PORTABLE,
+        relative_path=relative_path,
+        document=initial,
+    )
+    leaking = ArtifactDocument(
+        metadata={"generation": 1, "id": "mem-1"},
+        body="body naming local evidence",
+        references=ReferenceManifest.complete(
+            body=(
+                ArtifactReference(
+                    kind=ReferenceKind.EXISTENCE,
+                    storage_class=StorageClass.LOCAL_ONLY,
+                    value=True,
+                ),
+            )
+        ),
+    )
+
+    with pytest.raises(PortabilityViolation):
+        store.write_cas(
+            ArtifactFamily.MEMORY,
+            storage_class=StorageClass.PORTABLE,
+            relative_path=relative_path,
+            document=leaking,
+            expected_generation=0,
+        )
+    assert reader.read(ArtifactFamily.MEMORY, location=location) == initial
+
+
+@pytest.mark.parametrize(
+    ("family", "relative_path"),
+    [
+        ("registry", "memory/not-registry.yaml"),
+        ("session", "workstreams/ws/sessions/ses/../../escape.md"),
+        ("memory", "../memory/escape.md"),
+        ("memory", "memory/not-markdown.yaml"),
+    ],
+)
+def test_router_rejects_paths_outside_the_selected_canonical_family(
+    storage, family, relative_path
+):
+    from mneme.core.artifacts import ArtifactFamily
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import StorageClass
+
+    router, _, _ = storage
+    with pytest.raises(UnsafePath):
+        router.location(ArtifactFamily(family), StorageClass.PORTABLE, relative_path)
+
+
+def test_store_rejects_existing_parent_symlink_escape(storage, tmp_path):
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily, ReferenceManifest
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import StorageClass
+
+    router, store, _ = storage
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    projects = router.portable_root / "projects"
+    try:
+        projects.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(UnsafePath):
+        store.write_new(
+            ArtifactFamily.REGISTRY,
+            storage_class=StorageClass.PORTABLE,
+            relative_path="projects/proj-1.yaml",
+            document=ArtifactDocument(
+                metadata={"generation": 0}, references=ReferenceManifest.complete()
+            ),
+        )
+    assert not (outside / "proj-1.yaml").exists()
+
+
+def test_view_store_only_targets_named_generated_views_under_local_root(tmp_path):
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import ViewStore
+
+    local_root = tmp_path / "local"
+    views = ViewStore(local_root)
+    current = views.write("CURRENT.md", "generated\r\nprojection")
+    assert current == local_root / "views" / "CURRENT.md"
+    assert current.read_text(encoding="utf-8") == "generated\nprojection\n"
+
+    for path in (
+        "../overlays/memory/mem-1.md",
+        "../../vault/memory/mem-1.md",
+        "nested/CURRENT.md",
+        "memory.md",
+    ):
+        with pytest.raises(UnsafePath):
+            views.write(path, "forbidden")
