@@ -35,6 +35,8 @@ def search_table(
     """
     if not _TABLE_IDENTIFIER.fullmatch(table):
         raise ValueError(f"Unsafe FTS table identifier: {table!r}")
+    if limit <= 0:
+        return []
 
     sql = f"""
         SELECT path, snippet({table}, 1, '[', ']', '...', 20) AS excerpt
@@ -54,6 +56,6 @@ def search_table(
             return []
 
     return [
-        SearchHit(path=row["path"], excerpt=row["excerpt"], source=source)
+        SearchHit(path=row[0], excerpt=row[1], source=source)
         for row in rows
     ]
