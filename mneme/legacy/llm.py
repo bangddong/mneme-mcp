@@ -17,6 +17,7 @@ from mneme.providers.openai_compatible import OpenAICompatibleProvider
 
 
 _provider = OpenAICompatibleProvider()
+_TIMEOUT = 120.0
 
 
 def _base_url() -> str:
@@ -38,6 +39,7 @@ def _call(system: str, user: str, json_mode: bool = False) -> str:
     json_mode=True면 response_format으로 JSON 출력을 강제한다(Ollama 등 지원).
     실패 시 RuntimeError — 호출부의 try/except fallback이 받는다.
     """
+    _provider._timeout = _TIMEOUT
     return _provider.complete(system, user, json_mode=json_mode)
 
 

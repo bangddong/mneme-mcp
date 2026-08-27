@@ -96,3 +96,23 @@ def test_complete_wraps_transport_and_response_errors(monkeypatch):
         OpenAICompatibleProvider().complete("system", "user")
 
     assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
+
+
+def test_legacy_call_uses_the_current_timeout_compatibility_seam(monkeypatch):
+    from mneme import llm
+
+    seen = {}
+
+    def post(url, json, timeout):
+        seen["timeout"] = timeout
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "answer"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", post)
+    monkeypatch.setattr(llm, "_TIMEOUT", 7.5)
+
+    assert llm._call("system", "user") == "answer"
+    assert seen["timeout"] == 7.5
