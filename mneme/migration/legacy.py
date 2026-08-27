@@ -68,6 +68,7 @@ class _FileSnapshot:
 
 
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _FTS5_INTERNAL_SUFFIXES = frozenset({"data", "idx", "content", "docsize", "config"})
 
 _KNOWN_COLUMN_NAMES = {
@@ -147,10 +148,12 @@ def inspect_legacy_db(path: Path) -> LegacyInventory:
     db_path = _resolve_legacy_path(path)
     before = _snapshot(db_path)
     _require_sqlite_header(db_path)
+    _require_no_sidecars(db_path, phase="before inspection")
 
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(_readonly_uri(db_path), uri=True)
+        connection.execute("BEGIN")
         tables = _read_tables(connection)
     except sqlite3.DatabaseError as error:
         raise _safe_sqlite_error(db_path, error) from error
@@ -163,6 +166,7 @@ def inspect_legacy_db(path: Path) -> LegacyInventory:
             connection.close()
 
     after = _snapshot_after_inspection(db_path)
+    _require_no_sidecars(db_path, phase="after inspection")
     if after != before:
         raise LegacyDatabaseChangedError(
             f"legacy database changed during inspection; retry after writers stop: {db_path}"
@@ -223,8 +227,31 @@ def _require_sqlite_header(path: Path) -> None:
 
 
 def _readonly_uri(path: Path) -> str:
-    """Build an encoded SQLite URI from an absolute path, including Windows paths."""
-    return f"{path.as_uri()}?mode=ro"
+    """Build a Windows-safe immutable read-only URI from an absolute path.
+
+    ``immutable=1`` prevents SQLite from creating or updating source journal/WAL
+    support files.  Databases with any such sidecar are rejected before opening,
+    because immutable access would otherwise ignore uncheckpointed WAL content.
+    """
+    return f"{path.as_uri()}?mode=ro&immutable=1"
+
+
+def _require_no_sidecars(path: Path, *, phase: str) -> None:
+    try:
+        sidecars = [
+            sidecar
+            for suffix in _SQLITE_SIDECAR_SUFFIXES
+            if (sidecar := path.with_name(f"{path.name}{suffix}")).exists()
+        ]
+    except OSError as error:
+        raise LegacyInspectionError(
+            f"cannot check SQLite sidecars {phase}: {path}"
+        ) from error
+    if sidecars:
+        names = ", ".join(sidecar.name for sidecar in sidecars)
+        raise LegacyDatabaseChangedError(
+            f"SQLite sidecar present {phase}; inspection requires a closed database: {names}"
+        )
 
 
 def _read_tables(connection: sqlite3.Connection) -> dict[str, LegacyTable]:

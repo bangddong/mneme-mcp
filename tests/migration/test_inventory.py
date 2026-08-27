@@ -253,3 +253,60 @@ def test_inventory_requires_recognized_runtime_table_semantics(tmp_path: Path):
 
     assert report.tables["working"].classification == "needs-review"
     assert report.tables["meta"].classification == "needs-review"
+
+
+def test_inventory_rejects_live_wal_without_changing_any_source_file(
+    legacy_db: Path,
+):
+    """Opening an active WAL database must fail before inspection can touch its sidecars."""
+    from mneme.migration.legacy import LegacyDatabaseChangedError, inspect_legacy_db
+
+    writer = sqlite3.connect(legacy_db)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("INSERT INTO facts(content) VALUES ('uncheckpointed fact')")
+        writer.commit()
+
+        source_files = [
+            legacy_db,
+            legacy_db.with_name(f"{legacy_db.name}-wal"),
+            legacy_db.with_name(f"{legacy_db.name}-shm"),
+        ]
+        assert all(path.exists() for path in source_files)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in source_files}
+
+        with pytest.raises(LegacyDatabaseChangedError, match="sidecar"):
+            inspect_legacy_db(legacy_db)
+
+        after = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in source_files}
+        assert after == before
+    finally:
+        writer.close()
+
+
+def test_inventory_rejects_sidecar_and_schema_change_appearing_during_inspection(
+    legacy_db: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A concurrent WAL schema update must invalidate the entire would-be report."""
+    import mneme.migration.legacy as legacy
+
+    original_read_tables = legacy._read_tables
+    writers: list[sqlite3.Connection] = []
+
+    def read_then_change_schema(connection: sqlite3.Connection):
+        tables = original_read_tables(connection)
+        writer = sqlite3.connect(legacy_db)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("ALTER TABLE facts ADD COLUMN concurrent_value TEXT")
+        writer.execute("INSERT INTO facts(content, concurrent_value) VALUES ('new fact', 'new')")
+        writer.commit()
+        writers.append(writer)
+        return tables
+
+    monkeypatch.setattr(legacy, "_read_tables", read_then_change_schema)
+    try:
+        with pytest.raises(legacy.LegacyDatabaseChangedError, match="sidecar"):
+            legacy.inspect_legacy_db(legacy_db)
+    finally:
+        for writer in writers:
+            writer.close()
