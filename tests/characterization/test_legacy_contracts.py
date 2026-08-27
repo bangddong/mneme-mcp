@@ -1,6 +1,27 @@
 import pytest
 
 
+LEGACY_TABLES = (
+    "wiki_fts",
+    "wiki_index",
+    "facts",
+    "episodes",
+    "skills",
+    "working",
+    "loop_cycles",
+    "self_model",
+    "growth_actions",
+    "meta",
+)
+
+
+def snapshot_legacy_tables(conn):
+    return {
+        table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY 1")]
+        for table in LEGACY_TABLES
+    }
+
+
 def test_search_without_llm_keeps_shape_cache_and_episode(legacy_runtime, monkeypatch):
     from mneme import llm, server
 
@@ -65,17 +86,19 @@ def test_reinitialization_preserves_every_legacy_table_row(legacy_runtime):
         conn.execute("INSERT INTO facts(content) VALUES('keep-fact')")
         conn.execute("INSERT INTO episodes(agent, tool) VALUES('keep-agent', 'keep-tool')")
         conn.execute("INSERT INTO skills(name, description) VALUES('keep-skill', 'keep')")
+        conn.execute(
+            "INSERT INTO working(session_id, key, value, expires_at) VALUES(?, ?, ?, ?)",
+            ("keep-session", "keep-key", "keep-value", "2099-01-01"),
+        )
+        conn.execute("INSERT INTO loop_cycles(episodes_processed) VALUES(1)")
+        conn.execute("INSERT INTO self_model(episodes_seen) VALUES(1)")
         conn.execute("INSERT INTO growth_actions(kind, status) VALUES('keep-growth', 'open')")
-    before = {
-        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in ("facts", "episodes", "skills", "growth_actions")
-    }
+        conn.execute("INSERT INTO meta(key, value) VALUES('keep-meta', 'keep-value')")
+    before = snapshot_legacy_tables(conn)
+    assert all(before.values())
     conn.close()
     memory.init_db()
     conn = memory.get_connection()
-    after = {
-        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        for table in before
-    }
+    after = snapshot_legacy_tables(conn)
     conn.close()
     assert after == before
