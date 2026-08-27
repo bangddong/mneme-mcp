@@ -33,15 +33,17 @@ class FileSystemSource:
             return None
 
     def _candidate_for(self, path: str) -> Path | None:
-        if not isinstance(path, str) or not path or "\\" in path:
+        if not isinstance(path, str) or not path:
             return None
 
-        posix_path = PurePosixPath(path)
-        windows_path = PureWindowsPath(path)
+        normalized_path = path.replace("\\", "/")
+        posix_path = PurePosixPath(normalized_path)
+        windows_path = PureWindowsPath(normalized_path)
         if (
             posix_path.is_absolute()
             or windows_path.is_absolute()
             or windows_path.drive
+            or windows_path.root
             or ".." in posix_path.parts
         ):
             return None
@@ -50,12 +52,10 @@ class FileSystemSource:
 
     def _is_safe_candidate(self, candidate: Path) -> bool:
         try:
-            relative = candidate.relative_to(self.root)
-            current = self.root
-            for part in relative.parts:
-                current = current / part
-                if current.is_symlink():
-                    return False
-            return candidate.resolve().is_relative_to(self.root)
+            resolved = candidate.resolve()
+            return (
+                resolved.is_relative_to(self.root)
+                and resolved.suffix.lower() == ".md"
+            )
         except (OSError, ValueError):
             return False
