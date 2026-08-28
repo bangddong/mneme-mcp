@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from mneme.core.errors import InvalidArtifact
 from mneme.core.fs import dump_frontmatter, dump_yaml, normalize_text
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from mneme.core.storage import StorageClass
+class StorageClass(str, Enum):
+    PORTABLE = "portable"
+    LOCAL_ONLY = "local-only"
 
 
 class ArtifactFamily(str, Enum):
@@ -38,6 +38,35 @@ class ArtifactReference:
     storage_class: StorageClass
     value: str | int | bool
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ReferenceKind):
+            raise InvalidArtifact("artifact reference kind must be a ReferenceKind")
+        if not isinstance(self.storage_class, StorageClass):
+            raise InvalidArtifact(
+                "artifact reference storage_class must be a StorageClass"
+            )
+        if self.kind in {
+            ReferenceKind.ID,
+            ReferenceKind.PATH,
+            ReferenceKind.HASH,
+            ReferenceKind.LABEL,
+        }:
+            if not isinstance(self.value, str) or not self.value:
+                raise InvalidArtifact(
+                    f"{self.kind.value} reference value must be a non-empty string"
+                )
+        elif self.kind is ReferenceKind.COUNT:
+            if (
+                not isinstance(self.value, int)
+                or isinstance(self.value, bool)
+                or self.value < 0
+            ):
+                raise InvalidArtifact(
+                    "count reference value must be a non-negative integer"
+                )
+        elif self.kind is ReferenceKind.EXISTENCE and not isinstance(self.value, bool):
+            raise InvalidArtifact("existence reference value must be a boolean")
+
 
 @dataclass(frozen=True)
 class ReferenceManifest:
@@ -46,6 +75,16 @@ class ReferenceManifest:
     metadata: tuple[ArtifactReference, ...] = ()
     body: tuple[ArtifactReference, ...] = ()
     is_complete: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, tuple) or not isinstance(self.body, tuple):
+            raise InvalidArtifact("reference manifest sections must be tuples")
+        if not all(isinstance(item, ArtifactReference) for item in self.all):
+            raise InvalidArtifact(
+                "reference manifest entries must be ArtifactReference values"
+            )
+        if not isinstance(self.is_complete, bool):
+            raise InvalidArtifact("reference manifest completeness must be boolean")
 
     @classmethod
     def complete(
@@ -68,6 +107,16 @@ class ArtifactDocument:
     references: ReferenceManifest | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise InvalidArtifact("artifact metadata must be a mapping")
+        if self.body is not None and not isinstance(self.body, str):
+            raise InvalidArtifact("artifact body must be text or None")
+        if self.references is not None and not isinstance(
+            self.references, ReferenceManifest
+        ):
+            raise InvalidArtifact(
+                "artifact references must be a ReferenceManifest or None"
+            )
         if isinstance(self.body, str):
             object.__setattr__(self, "body", normalize_text(self.body))
 
@@ -92,7 +141,7 @@ class ArtifactCodec:
         return ArtifactDocument(
             metadata=metadata,
             body=body,
-            references=ReferenceManifest.complete(),
+            references=ReferenceManifest(),
         )
 
 

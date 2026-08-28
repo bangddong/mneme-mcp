@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+
 from mneme.core.artifacts import (
     FAMILY_CODECS,
     ArtifactCodec,
     ArtifactDocument,
     ArtifactFamily,
+    StorageClass,
 )
 from mneme.core.errors import InvalidArtifact, UnsafePath
 from mneme.core.fs import (
@@ -27,11 +28,6 @@ from mneme.core.validation.vault import (
     validate_relative_path,
     validate_separate_roots,
 )
-
-
-class StorageClass(str, Enum):
-    PORTABLE = "portable"
-    LOCAL_ONLY = "local-only"
 
 
 @dataclass(frozen=True)
@@ -114,6 +110,9 @@ class StorageRouter:
         )
         if location.root != expected_root:
             raise UnsafePath("artifact location root does not match its storage class")
+
+    def view_store(self) -> ViewStore:
+        return ViewStore._from_router(self)
 
 
 class ArtifactStore:
@@ -209,9 +208,15 @@ class ViewStore:
 
     _NAMES = frozenset({"CURRENT.md", "PROFILE.md"})
 
-    def __init__(self, local_root: Path):
-        self.local_root = Path(local_root).resolve(strict=False)
-        self.root = self.local_root / "views"
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("obtain ViewStore from StorageRouter.view_store() or Vault.views")
+
+    @classmethod
+    def _from_router(cls, router: StorageRouter) -> ViewStore:
+        instance = object.__new__(cls)
+        instance.local_root = router.local_root
+        instance.root = router.local_root / "views"
+        return instance
 
     def write(self, relative_path: str, text: str) -> Path:
         if relative_path not in self._NAMES:

@@ -17,6 +17,11 @@ def validate_identifier(value: str, *, label: str) -> None:
         raise InvalidArtifact(f"unsafe {label}: {value!r}")
 
 
+def validate_owner_id(value: object) -> None:
+    if not isinstance(value, str) or value == "":
+        raise InvalidArtifact("owner id must be a non-empty string")
+
+
 def validate_separate_roots(portable_root: Path, local_root: Path) -> None:
     portable = Path(portable_root).resolve(strict=False)
     local = Path(local_root).resolve(strict=False)

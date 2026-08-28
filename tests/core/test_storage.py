@@ -74,7 +74,10 @@ def test_canonical_store_round_trips_same_document_in_both_storage_classes(
             relative_path=relative_path,
             document=document,
         )
-        assert reader.read(artifact_family, location=location) == document
+        loaded = reader.read(artifact_family, location=location)
+        assert loaded.metadata == document.metadata
+        assert loaded.body == document.body
+        assert loaded.references == ReferenceManifest()
 
 
 def test_canonical_writer_requires_explicit_storage_class(storage):
@@ -108,15 +111,18 @@ def test_portable_write_rejects_each_typed_local_only_reference_before_creation(
 
     router, store, _ = storage
     relative_path = "memory/portable.md"
+    reference_value = (
+        1 if kind == "count" else True if kind == "existence" else "confidential-value"
+    )
     document = ArtifactDocument(
         metadata={"generation": 0, "id": "portable"},
         body="sanitized body",
         references=ReferenceManifest.complete(
             body=(
-                ArtifactReference(
-                    kind=ReferenceKind(kind),
-                    storage_class=StorageClass.LOCAL_ONLY,
-                    value="confidential-value",
+                    ArtifactReference(
+                        kind=ReferenceKind(kind),
+                        storage_class=StorageClass.LOCAL_ONLY,
+                        value=reference_value,
                 ),
             )
         ),
@@ -153,6 +159,64 @@ def test_portable_write_fails_closed_without_complete_reference_manifest(storage
     ).path.exists()
 
 
+@pytest.mark.parametrize(
+    ("kind", "storage_class", "value"),
+    [
+        ("raw-id", "enum", "secret"),
+        ("enum", "raw-local", "secret"),
+        ("enum", "enum", ""),
+    ],
+)
+def test_malformed_reference_types_fail_before_any_artifact_path_is_created(
+    storage, kind, storage_class, value
+):
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.storage import StorageClass
+
+    router, _, _ = storage
+    with pytest.raises(InvalidArtifact):
+        ArtifactReference(
+            ReferenceKind.ID if kind == "enum" else kind,
+            StorageClass.LOCAL_ONLY if storage_class == "enum" else storage_class,
+            value,
+        )
+    assert not (router.portable_root / "memory").exists()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"metadata": [], "is_complete": True},
+        {"metadata": ("not-a-reference",), "is_complete": True},
+        {"is_complete": "yes"},
+    ],
+)
+def test_malformed_reference_manifest_fails_before_path_creation(storage, kwargs):
+    from mneme.core.artifacts import ReferenceManifest
+    from mneme.core.errors import InvalidArtifact
+
+    router, _, _ = storage
+    with pytest.raises(InvalidArtifact):
+        ReferenceManifest(**kwargs)
+    assert not (router.portable_root / "memory").exists()
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [("count", True), ("count", -1), ("existence", "yes"), ("path", 42)],
+)
+def test_reference_values_are_validated_by_disclosure_kind(storage, kind, value):
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.storage import StorageClass
+
+    router, _, _ = storage
+    with pytest.raises(InvalidArtifact):
+        ArtifactReference(ReferenceKind(kind), StorageClass.LOCAL_ONLY, value)
+    assert not (router.portable_root / "memory").exists()
+
+
 def test_local_artifact_may_reference_portable_artifact(storage):
     from mneme.core.artifacts import (
         ArtifactDocument,
@@ -186,6 +250,52 @@ def test_local_artifact_may_reference_portable_artifact(storage):
     loaded = reader.read(ArtifactFamily.MEMORY, location=location)
     assert loaded.metadata == document.metadata
     assert loaded.body == document.body
+
+
+def test_decoded_local_artifact_requires_fresh_manifest_before_portable_rewrite(
+    storage,
+):
+    from mneme.core.artifacts import (
+        ArtifactDocument,
+        ArtifactFamily,
+        ArtifactReference,
+        ReferenceKind,
+        ReferenceManifest,
+    )
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.storage import StorageClass
+
+    router, store, reader = storage
+    local_document = ArtifactDocument(
+        metadata={"generation": 0, "id": "local-memory"},
+        body="local body naming confidential evidence",
+        references=ReferenceManifest.complete(
+            body=(
+                ArtifactReference(
+                    ReferenceKind.ID,
+                    StorageClass.LOCAL_ONLY,
+                    "local-evidence-1",
+                ),
+            )
+        ),
+    )
+    local_location = store.write_new(
+        ArtifactFamily.MEMORY,
+        storage_class=StorageClass.LOCAL_ONLY,
+        relative_path="memory/local-memory.md",
+        document=local_document,
+    )
+
+    decoded = reader.read(ArtifactFamily.MEMORY, location=local_location)
+    assert decoded.references == ReferenceManifest()
+    with pytest.raises(PortabilityViolation):
+        store.write_new(
+            ArtifactFamily.MEMORY,
+            storage_class=StorageClass.PORTABLE,
+            relative_path="memory/copied-local-memory.md",
+            document=decoded,
+        )
+    assert not (router.portable_root / "memory/copied-local-memory.md").exists()
 
 
 @pytest.mark.parametrize(
@@ -228,7 +338,10 @@ def test_canonical_cas_updates_exact_generation_and_rejects_stale_write(
         document=updated,
         expected_generation=0,
     )
-    assert reader.read(artifact_family, location=location) == updated
+    loaded = reader.read(artifact_family, location=location)
+    assert loaded.metadata == updated.metadata
+    assert loaded.body == updated.body
+    assert loaded.references == ReferenceManifest()
     lock_files = list((store.router.local_root / "locks").glob("*.lock"))
     assert len(lock_files) == 1
     assert not list(store.router.portable_root.rglob("*.lock"))
@@ -246,7 +359,10 @@ def test_canonical_cas_updates_exact_generation_and_rejects_stale_write(
             document=stale,
             expected_generation=0,
         )
-    assert reader.read(artifact_family, location=location) == updated
+    loaded = reader.read(artifact_family, location=location)
+    assert loaded.metadata == updated.metadata
+    assert loaded.body == updated.body
+    assert loaded.references == ReferenceManifest()
 
 
 def test_canonical_cas_rejects_local_reference_before_mutating_portable_file(storage):
@@ -295,7 +411,10 @@ def test_canonical_cas_rejects_local_reference_before_mutating_portable_file(sto
             document=leaking,
             expected_generation=0,
         )
-    assert reader.read(ArtifactFamily.MEMORY, location=location) == initial
+    loaded = reader.read(ArtifactFamily.MEMORY, location=location)
+    assert loaded.metadata == initial.metadata
+    assert loaded.body == initial.body
+    assert loaded.references == ReferenceManifest()
 
 
 @pytest.mark.parametrize(
@@ -347,10 +466,21 @@ def test_store_rejects_existing_parent_symlink_escape(storage, tmp_path):
 
 def test_view_store_only_targets_named_generated_views_under_local_root(tmp_path):
     from mneme.core.errors import UnsafePath
-    from mneme.core.storage import ViewStore
+    from mneme.core.storage import StorageRouter, ViewStore
 
+    portable_root = tmp_path / "vault"
     local_root = tmp_path / "local"
-    views = ViewStore(local_root)
+    router = StorageRouter(portable_root, local_root)
+    for forbidden_root in (
+        portable_root / "memory",
+        portable_root / "projects",
+        portable_root / "workstreams",
+        local_root,
+    ):
+        with pytest.raises(TypeError):
+            ViewStore(forbidden_root)
+
+    views = router.view_store()
     current = views.write("CURRENT.md", "generated\r\nprojection")
     assert current == local_root / "views" / "CURRENT.md"
     assert current.read_text(encoding="utf-8") == "generated\nprojection\n"
