@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict
 from datetime import datetime, timezone
 
 import pytest
@@ -65,13 +65,17 @@ def test_opaque_attestation_replaces_confidential_policy_reference_in_receipt():
         "7",
         Portability.PERSONAL_VAULT,
         HASH_A,
-        opaque_attestation=OpaquePolicyAttestation(ATTESTATION_A, HASH_B),
+        opaque_attestation=OpaquePolicyAttestation.create(
+            ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+        ),
     )
 
     receipt = evaluate_portability(Portability.PERSONAL_VAULT, (rule,), HASH_D)
 
     assert receipt.allowed is True
-    assert receipt.refs == (OpaquePolicyAttestation(ATTESTATION_A, HASH_B),)
+    assert receipt.refs == (
+        OpaquePolicyAttestation.create(ATTESTATION_A, "7", Portability.PERSONAL_VAULT),
+    )
     assert "customer-source-42" not in repr(receipt)
 
 
@@ -84,7 +88,9 @@ def test_reevaluation_creates_a_new_denied_receipt_without_mutating_admission():
         reevaluate_portability,
     )
 
-    attestation = OpaquePolicyAttestation(ATTESTATION_A, HASH_B)
+    attestation = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
     admitted = evaluate_portability(
         Portability.PERSONAL_VAULT,
         (
@@ -107,7 +113,9 @@ def test_reevaluation_creates_a_new_denied_receipt_without_mutating_admission():
                 "8",
                 Portability.LOCAL_ONLY,
                 HASH_C,
-                opaque_attestation=attestation,
+                opaque_attestation=OpaquePolicyAttestation.create(
+                    ATTESTATION_B, "8", Portability.LOCAL_ONLY
+                ),
             ),
         ),
     )
@@ -166,19 +174,129 @@ def test_evaluation_rejects_non_rule_tuple_entries_before_evaluating_ceiling():
     ["customer-source-42", "C:/customer/source", "https://internal.example/source", "attest secret"],
 )
 def test_opaque_attestation_rejects_free_text_and_source_identifier_leaks(unsafe_value):
-    from mneme.core.policy import InvalidPolicy, OpaquePolicyAttestation
+    from mneme.core.policy import InvalidPolicy, OpaquePolicyAttestation, Portability
 
     with pytest.raises(InvalidPolicy):
-        OpaquePolicyAttestation(unsafe_value, HASH_A)
+        OpaquePolicyAttestation.create(unsafe_value, "7", Portability.PERSONAL_VAULT)
 
 
 def test_opaque_attestation_accepts_generated_token_and_sha256_digest():
-    from mneme.core.policy import OpaquePolicyAttestation
+    from mneme.core.policy import OpaquePolicyAttestation, Portability
 
-    attestation = OpaquePolicyAttestation(ATTESTATION_A, HASH_A)
+    attestation = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
 
     assert attestation.attestation_id == ATTESTATION_A
-    assert attestation.digest == HASH_A
+    assert attestation.digest != HASH_A
+
+
+def test_opaque_attestation_recomputes_portable_digest_and_rejects_source_hash():
+    from mneme.core.policy import InvalidPolicy, OpaquePolicyAttestation, Portability
+
+    attestation = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
+
+    assert attestation.digest != HASH_A
+    with pytest.raises(InvalidPolicy):
+        OpaquePolicyAttestation.from_receipt(
+            ATTESTATION_A, "7", Portability.PERSONAL_VAULT, HASH_A
+        )
+
+
+def test_receipt_owns_validated_attestation_copy_after_caller_mutation():
+    from mneme.core.policy import OpaquePolicyAttestation, PolicyRule, Portability, evaluate_portability
+
+    caller_attestation = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
+    caller_rule = PolicyRule(
+        "customer-source-42",
+        "7",
+        Portability.PERSONAL_VAULT,
+        HASH_A,
+        opaque_attestation=caller_attestation,
+    )
+    receipt = evaluate_portability(Portability.PERSONAL_VAULT, (caller_rule,), HASH_D)
+    serialized_before = asdict(receipt)
+
+    object.__setattr__(caller_attestation, "digest", HASH_A)
+    object.__setattr__(caller_rule, "opaque_attestation", None)
+
+    assert asdict(receipt) == serialized_before
+    assert receipt.refs[0] is not caller_attestation
+    assert HASH_A not in repr(receipt)
+
+
+def test_approved_rule_provenance_is_bound_to_the_authorizing_policy_reference():
+    from mneme.core.policy import (
+        ApprovedRuleProvenance,
+        PolicyRef,
+        PolicyRule,
+        Portability,
+        evaluate_portability,
+    )
+
+    receipt = evaluate_portability(
+        Portability.PERSONAL_VAULT,
+        (
+            PolicyRule(
+                "source",
+                "7",
+                Portability.PERSONAL_VAULT,
+                HASH_A,
+                approved_rule_id=DERIVATIVE_RULE,
+            ),
+        ),
+        HASH_D,
+    )
+
+    assert receipt.approved_rules == (
+        ApprovedRuleProvenance(
+            DERIVATIVE_RULE,
+            PolicyRef("source", "7", HASH_A),
+        ),
+    )
+    assert receipt.approved_rule_ids == (DERIVATIVE_RULE,)
+
+
+def test_receipt_rejects_unbound_approved_rule_identifier():
+    from mneme.core.policy import InvalidPolicy, PolicyEvaluation, Portability
+
+    with pytest.raises(InvalidPolicy):
+        PolicyEvaluation(
+            Portability.LOCAL_ONLY,
+            Portability.LOCAL_ONLY,
+            True,
+            datetime.now(timezone.utc),
+            "madi.policy.v1",
+            (),
+            HASH_D,
+            approved_rules=(DERIVATIVE_RULE,),
+        )
+
+
+def test_same_approved_rule_with_conflicting_authorizers_fails_closed():
+    from mneme.core.policy import InvalidPolicy, PolicyRule, Portability, evaluate_portability
+
+    first = PolicyRule(
+        "source-a",
+        "7",
+        Portability.PERSONAL_VAULT,
+        HASH_A,
+        approved_rule_id=DERIVATIVE_RULE,
+    )
+    second = PolicyRule(
+        "source-b",
+        "7",
+        Portability.PERSONAL_VAULT,
+        HASH_B,
+        approved_rule_id=DERIVATIVE_RULE,
+    )
+
+    with pytest.raises(InvalidPolicy, match="authorizer"):
+        evaluate_portability(Portability.PERSONAL_VAULT, (first, second), HASH_D)
 
 
 @pytest.mark.parametrize("unsafe_revision", ["../7", "C:/policy", "https://policy", "revision 7"])
@@ -207,7 +325,9 @@ def test_same_policy_cannot_be_supplied_as_both_opaque_and_raw_provenance(opaque
         "7",
         Portability.PERSONAL_VAULT,
         HASH_A,
-        opaque_attestation=OpaquePolicyAttestation(ATTESTATION_A, HASH_B),
+        opaque_attestation=OpaquePolicyAttestation.create(
+            ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+        ),
     )
     rules = (opaque, raw) if opaque_first else (raw, opaque)
 
@@ -242,14 +362,18 @@ def test_conflicting_policy_identity_fields_fail_closed(conflict):
                 "7",
                 Portability.PERSONAL_VAULT,
                 HASH_A,
-                OpaquePolicyAttestation(ATTESTATION_A, HASH_B),
+                OpaquePolicyAttestation.create(
+                    ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+                ),
             ),
             PolicyRule(
                 "source",
                 "7",
                 Portability.PERSONAL_VAULT,
                 HASH_A,
-                OpaquePolicyAttestation(ATTESTATION_B, HASH_C),
+                OpaquePolicyAttestation.create(
+                    ATTESTATION_B, "7", Portability.PERSONAL_VAULT
+                ),
             ),
         )
 
