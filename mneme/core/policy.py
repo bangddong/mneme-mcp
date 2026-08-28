@@ -7,14 +7,28 @@ rules and returns a new immutable receipt for every decision.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
+import math
 import re
-from typing import Final, TypeAlias
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
-from mneme.core.errors import InvalidArtifact, MadiError
+from mneme.core.artifacts import (
+    ArtifactDocument,
+    ArtifactFamily,
+    ArtifactReference,
+    ReferenceKind,
+    ReferenceManifest,
+    StorageClass,
+)
+from mneme.core.errors import ArtifactExists, InvalidArtifact, MadiError
+
+if TYPE_CHECKING:
+    from mneme.core.vault import Vault
 
 
 POLICY_EVALUATOR_VERSION: Final = "madi.policy.v1"
@@ -26,6 +40,11 @@ _APPROVED_RULE_ID = re.compile(
     r"^rule-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _POLICY_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_POLICY_REVISION_SCHEMA: Final = "madi.policy-revision.v1"
+_POLICY_INDEX_SCHEMA: Final = "madi.policy-index.v1"
+_DEFAULT_POLICY_ID: Final = "vault-default"
+_DEFAULT_POLICY_REVISION: Final = "1"
+_DEFAULT_POLICY_RULE: Final = {"ceiling": "personal-vault"}
 
 
 class PolicyError(MadiError):
@@ -125,6 +144,324 @@ class PolicyRef:
         _require_policy_token(self.policy_id, label="policy id")
         _require_policy_token(self.revision, label="policy revision")
         _require_sha256(self.digest, label="policy digest")
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyIndex:
+    """The CAS-protected active policy pointers for one storage class."""
+
+    generation: int
+    policies: Mapping[str, PolicyRef]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.generation, int)
+            or isinstance(self.generation, bool)
+            or self.generation < 0
+        ):
+            raise InvalidPolicy("policy index generation must be a non-negative integer")
+        if not isinstance(self.policies, Mapping):
+            raise InvalidPolicy("policy index policies must be a mapping")
+        copied: dict[str, PolicyRef] = {}
+        for policy_id, ref in self.policies.items():
+            _require_policy_token(policy_id, label="policy index id")
+            if not isinstance(ref, PolicyRef) or ref.policy_id != policy_id:
+                raise InvalidPolicy("policy index entries must match their PolicyRef ids")
+            copied[policy_id] = PolicyRef(ref.policy_id, ref.revision, ref.digest)
+        object.__setattr__(self, "policies", MappingProxyType(copied))
+
+
+class PolicyStore:
+    """Official immutable policy-revision and active-pointer lifecycle API."""
+
+    def __init__(self, vault: Vault):
+        self._vault = vault
+
+    def create_revision(
+        self,
+        policy_id: str,
+        revision: str,
+        rule: Mapping[str, Any],
+        storage_class: StorageClass,
+    ) -> PolicyRef:
+        """Create one immutable policy revision through the canonical store."""
+        self._validate_storage_class(storage_class)
+        _require_policy_token(policy_id, label="policy id")
+        _require_policy_token(revision, label="policy revision")
+        document = self._revision_document(policy_id, revision, rule)
+        encoded = self._vault.router.codec(
+            ArtifactFamily.REGISTRY, storage_class
+        ).encode(document)
+        self._vault.artifacts.write_new(
+            ArtifactFamily.REGISTRY,
+            storage_class=storage_class,
+            relative_path=self._revision_path(policy_id, revision),
+            document=document,
+        )
+        return PolicyRef(policy_id, revision, sha256(encoded.encode("utf-8")).hexdigest())
+
+    def activate(self, policy_ref: PolicyRef, expected_generation: int) -> PolicyIndex:
+        """CAS-advance the index that owns an immutable policy revision."""
+        if not isinstance(policy_ref, PolicyRef):
+            raise InvalidPolicy("policy activation requires a PolicyRef")
+        self._validate_generation(expected_generation)
+        storage_class = self._storage_class_for_ref(policy_ref)
+        self._ensure_index(storage_class)
+        current = self._read_index(storage_class)
+        policies = dict(current.policies)
+        policies[policy_ref.policy_id] = policy_ref
+        document = self._index_document(expected_generation + 1, policies, storage_class)
+        self._vault.artifacts.write_cas(
+            ArtifactFamily.REGISTRY,
+            storage_class=storage_class,
+            relative_path=".madi/policy-index.yaml",
+            document=document,
+            expected_generation=expected_generation,
+        )
+        return PolicyIndex(expected_generation + 1, policies)
+
+    def load_active(
+        self, policy_id: str, storage_class: StorageClass
+    ) -> PolicyRef:
+        """Load and verify the active immutable revision from one routed index."""
+        _require_policy_token(policy_id, label="policy id")
+        self._validate_storage_class(storage_class)
+        index = self._read_index(storage_class)
+        try:
+            ref = index.policies[policy_id]
+        except KeyError as exc:
+            raise InvalidArtifact(f"policy has no active revision: {policy_id}") from exc
+        actual = self._load_revision(ref.policy_id, ref.revision, storage_class)
+        if actual != ref:
+            raise InvalidArtifact("active policy index digest does not match its revision")
+        return actual
+
+    def bootstrap_default(self) -> PolicyRef:
+        """Ensure the exact default policy exists and is active via public lifecycle APIs."""
+        document = self._revision_document(
+            _DEFAULT_POLICY_ID, _DEFAULT_POLICY_REVISION, _DEFAULT_POLICY_RULE
+        )
+        expected = PolicyRef(
+            _DEFAULT_POLICY_ID,
+            _DEFAULT_POLICY_REVISION,
+            sha256(
+                self._vault.router.codec(
+                    ArtifactFamily.REGISTRY, StorageClass.PORTABLE
+                )
+                .encode(document)
+                .encode("utf-8")
+            ).hexdigest(),
+        )
+        try:
+            created = self.create_revision(
+                _DEFAULT_POLICY_ID,
+                _DEFAULT_POLICY_REVISION,
+                _DEFAULT_POLICY_RULE,
+                StorageClass.PORTABLE,
+            )
+        except ArtifactExists:
+            created = self._load_revision(
+                _DEFAULT_POLICY_ID, _DEFAULT_POLICY_REVISION, StorageClass.PORTABLE
+            )
+            if created != expected:
+                raise InvalidArtifact("default policy revision does not match bootstrap content")
+        if created != expected:
+            raise InvalidArtifact("default policy revision digest is not deterministic")
+
+        index = self._read_index(StorageClass.PORTABLE)
+        current = index.policies.get(_DEFAULT_POLICY_ID)
+        if current == created:
+            return created
+        if current is not None:
+            raise InvalidArtifact("default policy pointer does not match bootstrap revision")
+        self.activate(created, index.generation)
+        return created
+
+    def _storage_class_for_ref(self, policy_ref: PolicyRef) -> StorageClass:
+        matches: list[StorageClass] = []
+        for storage_class in StorageClass:
+            location = self._vault.router.location(
+                ArtifactFamily.REGISTRY,
+                storage_class,
+                self._revision_path(policy_ref.policy_id, policy_ref.revision),
+            )
+            if not location.path.exists():
+                continue
+            actual = self._load_revision(
+                policy_ref.policy_id, policy_ref.revision, storage_class
+            )
+            if actual != policy_ref:
+                raise InvalidArtifact("policy revision digest does not match stored content")
+            matches.append(storage_class)
+        if not matches:
+            raise InvalidArtifact("policy revision does not exist in a routed storage class")
+        if len(matches) != 1:
+            raise InvalidArtifact("policy revision is ambiguous across storage classes")
+        return matches[0]
+
+    def _load_revision(
+        self, policy_id: str, revision: str, storage_class: StorageClass
+    ) -> PolicyRef:
+        location = self._vault.router.location(
+            ArtifactFamily.REGISTRY,
+            storage_class,
+            self._revision_path(policy_id, revision),
+        )
+        document = self._vault.reader.read(ArtifactFamily.REGISTRY, location=location)
+        metadata = document.metadata
+        expected_keys = {"schema", "policy_id", "revision", "rule"}
+        if set(metadata) != expected_keys:
+            raise InvalidArtifact("policy revision has an invalid schema")
+        if (
+            metadata.get("schema") != _POLICY_REVISION_SCHEMA
+            or metadata.get("policy_id") != policy_id
+            or metadata.get("revision") != revision
+        ):
+            raise InvalidArtifact("policy revision identity does not match its path")
+        canonical = self._revision_document(policy_id, revision, metadata.get("rule"))
+        encoded = self._vault.router.codec(
+            ArtifactFamily.REGISTRY, storage_class
+        ).encode(canonical)
+        try:
+            raw = location.path.read_bytes()
+        except OSError as exc:
+            raise InvalidArtifact(f"cannot read policy revision: {location.path}") from exc
+        if raw != encoded.encode("utf-8"):
+            raise InvalidArtifact("policy revision is not canonically encoded")
+        return PolicyRef(policy_id, revision, sha256(raw).hexdigest())
+
+    def _read_index(self, storage_class: StorageClass) -> PolicyIndex:
+        location = self._vault.router.location(
+            ArtifactFamily.REGISTRY, storage_class, ".madi/policy-index.yaml"
+        )
+        document = self._vault.reader.read(ArtifactFamily.REGISTRY, location=location)
+        metadata = document.metadata
+        if set(metadata) == {"generation", "policies"}:
+            if metadata != {"generation": 0, "policies": {}}:
+                raise InvalidArtifact("policy index has an invalid schema")
+            return PolicyIndex(0, {})
+        if set(metadata) != {"schema", "generation", "policies"}:
+            raise InvalidArtifact("policy index has an invalid schema")
+        if metadata.get("schema") != _POLICY_INDEX_SCHEMA:
+            raise InvalidArtifact("policy index has an unsupported schema")
+        generation = metadata.get("generation")
+        policies = metadata.get("policies")
+        self._validate_generation(generation)
+        if not isinstance(policies, dict):
+            raise InvalidArtifact("policy index policies must be a mapping")
+        parsed: dict[str, PolicyRef] = {}
+        for policy_id, value in policies.items():
+            _require_policy_token(policy_id, label="policy index id")
+            if not isinstance(value, dict) or set(value) != {"revision", "digest"}:
+                raise InvalidArtifact("policy index reference has an invalid schema")
+            parsed[policy_id] = PolicyRef(policy_id, value["revision"], value["digest"])
+        return PolicyIndex(generation, parsed)
+
+    def _ensure_index(self, storage_class: StorageClass) -> None:
+        location = self._vault.router.location(
+            ArtifactFamily.REGISTRY, storage_class, ".madi/policy-index.yaml"
+        )
+        if location.path.exists():
+            return
+        self._vault.artifacts.write_new(
+            ArtifactFamily.REGISTRY,
+            storage_class=storage_class,
+            relative_path=".madi/policy-index.yaml",
+            document=self._index_document(0, {}, storage_class),
+        )
+
+    @staticmethod
+    def _revision_path(policy_id: str, revision: str) -> str:
+        _require_policy_token(policy_id, label="policy id")
+        _require_policy_token(revision, label="policy revision")
+        return f".madi/policies/{policy_id}/{revision}.yaml"
+
+    @staticmethod
+    def _validate_generation(generation: object) -> None:
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+        ):
+            raise InvalidArtifact("policy index generation must be a non-negative integer")
+
+    @staticmethod
+    def _validate_storage_class(storage_class: object) -> None:
+        if not isinstance(storage_class, StorageClass):
+            raise InvalidArtifact("policy lifecycle requires an explicit StorageClass")
+
+    @staticmethod
+    def _canonical_rule(rule: object) -> dict[str, Any]:
+        if not isinstance(rule, Mapping):
+            raise InvalidArtifact("policy rule must be a mapping")
+        return {
+            key: PolicyStore._canonical_rule_value(value)
+            for key, value in rule.items()
+            if PolicyStore._validate_rule_key(key)
+        }
+
+    @staticmethod
+    def _validate_rule_key(key: object) -> bool:
+        if not isinstance(key, str) or not key:
+            raise InvalidArtifact("policy rule mapping keys must be non-empty text")
+        return True
+
+    @staticmethod
+    def _canonical_rule_value(value: object) -> Any:
+        if value is None or isinstance(value, (str, bool)):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise InvalidArtifact("policy rule numbers must be finite")
+            return value
+        if isinstance(value, list):
+            return [PolicyStore._canonical_rule_value(item) for item in value]
+        if isinstance(value, Mapping):
+            return {
+                key: PolicyStore._canonical_rule_value(item)
+                for key, item in value.items()
+                if PolicyStore._validate_rule_key(key)
+            }
+        raise InvalidArtifact("policy rule must contain canonical YAML data")
+
+    def _revision_document(
+        self, policy_id: str, revision: str, rule: object
+    ) -> ArtifactDocument:
+        return ArtifactDocument(
+            metadata={
+                "schema": _POLICY_REVISION_SCHEMA,
+                "policy_id": policy_id,
+                "revision": revision,
+                "rule": self._canonical_rule(rule),
+            },
+            references=ReferenceManifest.complete(),
+        )
+
+    @staticmethod
+    def _index_document(
+        generation: int,
+        policies: Mapping[str, PolicyRef],
+        storage_class: StorageClass,
+    ) -> ArtifactDocument:
+        index = PolicyIndex(generation, policies)
+        return ArtifactDocument(
+            metadata={
+                "schema": _POLICY_INDEX_SCHEMA,
+                "generation": index.generation,
+                "policies": {
+                    policy_id: {"revision": ref.revision, "digest": ref.digest}
+                    for policy_id, ref in sorted(index.policies.items())
+                },
+            },
+            references=ReferenceManifest.complete(
+                metadata=tuple(
+                    ArtifactReference(ReferenceKind.ID, storage_class, policy_id)
+                    for policy_id in sorted(index.policies)
+                )
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True, init=False)

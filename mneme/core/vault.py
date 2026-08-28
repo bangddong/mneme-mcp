@@ -176,6 +176,9 @@ class Vault:
             owned.remove(portable_stage)
             owned.add(portable_root)
             vault = cls.open(portable_root, local_state_home)
+            from mneme.core.policy import PolicyStore
+
+            PolicyStore(vault).bootstrap_default()
         except Exception:
             for path in sorted(owned, key=lambda item: len(item.parts), reverse=True):
                 _remove_owned_tree(path)

@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+from hashlib import sha256
 
 import pytest
 
@@ -51,8 +53,13 @@ def test_initialize_creates_exact_portable_and_local_layout(tmp_path):
 
     assert (vault.root / ".madi/schema-version").read_text(encoding="utf-8") == "1\n"
     assert vault.local_root == tmp_path / "state" / "vaults" / vault.id
-    assert _relative_entries(vault.root) == (PORTABLE_DIRECTORIES, PORTABLE_FILES)
-    assert _relative_entries(vault.local_root) == (LOCAL_DIRECTORIES, set())
+    assert _relative_entries(vault.root) == (
+        PORTABLE_DIRECTORIES | {".madi/policies/vault-default"},
+        PORTABLE_FILES | {".madi/policies/vault-default/1.yaml"},
+    )
+    local_directories, local_files = _relative_entries(vault.local_root)
+    assert local_directories == LOCAL_DIRECTORIES
+    assert all(path.startswith("locks/") for path in local_files)
     assert read_yaml(vault.root / ".madi/vault.yaml") == {
         "generation": 0,
         "id": vault.id,
@@ -60,8 +67,16 @@ def test_initialize_creates_exact_portable_and_local_layout(tmp_path):
         "schema_version": 1,
     }
     assert read_yaml(vault.root / ".madi/policy-index.yaml") == {
-        "generation": 0,
-        "policies": {},
+        "generation": 1,
+        "policies": {
+            "vault-default": {
+                "digest": sha256(
+                    (vault.root / ".madi/policies/vault-default/1.yaml").read_bytes()
+                ).hexdigest(),
+                "revision": "1",
+            },
+        },
+        "schema": "madi.policy-index.v1",
     }
     assert not (vault.root / "CURRENT.md").exists()
     assert not (vault.root / "PROFILE.md").exists()
@@ -111,7 +126,7 @@ def test_open_rejects_each_missing_required_portable_layout_entry(
 
     initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
     missing = initialized.root / relative_path
-    missing.unlink() if missing.is_file() else missing.rmdir()
+    missing.unlink() if missing.is_file() else shutil.rmtree(missing)
 
     with pytest.raises(InvalidArtifact):
         Vault.open(initialized.root, initialized.state_home)
@@ -140,7 +155,7 @@ def test_open_rejects_each_missing_required_local_layout_entry(tmp_path, relativ
     from mneme.core.vault import Vault
 
     initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
-    (initialized.local_root / relative_path).rmdir()
+    shutil.rmtree(initialized.local_root / relative_path)
 
     with pytest.raises(InvalidArtifact):
         Vault.open(initialized.root, initialized.state_home)
