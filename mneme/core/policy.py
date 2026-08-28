@@ -132,6 +132,18 @@ def _require_policy_token(value: object, *, label: str) -> str:
     return value
 
 
+def _require_policy_index_generation(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise InvalidArtifact("policy index generation must be a non-negative integer")
+    return value
+
+
+def _require_storage_class(value: object) -> StorageClass:
+    if not isinstance(value, StorageClass):
+        raise InvalidArtifact("policy lifecycle requires an explicit StorageClass")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyRef:
     """An exact immutable policy-revision identity safe to include in a receipt."""
@@ -152,6 +164,7 @@ class PolicyIndex:
 
     generation: int
     policies: Mapping[str, PolicyRef]
+    storage_class: StorageClass = StorageClass.PORTABLE
 
     def __post_init__(self) -> None:
         if (
@@ -162,6 +175,7 @@ class PolicyIndex:
             raise InvalidPolicy("policy index generation must be a non-negative integer")
         if not isinstance(self.policies, Mapping):
             raise InvalidPolicy("policy index policies must be a mapping")
+        _require_storage_class(self.storage_class)
         copied: dict[str, PolicyRef] = {}
         for policy_id, ref in self.policies.items():
             _require_policy_token(policy_id, label="policy index id")
@@ -169,6 +183,35 @@ class PolicyIndex:
                 raise InvalidPolicy("policy index entries must match their PolicyRef ids")
             copied[policy_id] = PolicyRef(ref.policy_id, ref.revision, ref.digest)
         object.__setattr__(self, "policies", MappingProxyType(copied))
+
+
+def parse_policy_index(
+    metadata: object, storage_class: StorageClass
+) -> PolicyIndex:
+    """Parse the one authoritative policy-index schema for a routed root."""
+    _require_storage_class(storage_class)
+    if not isinstance(metadata, dict):
+        raise InvalidArtifact("policy index must be a mapping")
+    if set(metadata) == {"generation", "policies"}:
+        if metadata != {"generation": 0, "policies": {}}:
+            raise InvalidArtifact("policy index has an invalid bootstrap schema")
+        return PolicyIndex(0, {}, storage_class)
+    if set(metadata) != {"schema", "generation", "policies"}:
+        raise InvalidArtifact("policy index has an invalid schema")
+    if metadata.get("schema") != _POLICY_INDEX_SCHEMA:
+        raise InvalidArtifact("policy index has an unsupported schema")
+    generation = metadata.get("generation")
+    _require_policy_index_generation(generation)
+    policies = metadata.get("policies")
+    if not isinstance(policies, dict):
+        raise InvalidArtifact("policy index policies must be a mapping")
+    parsed: dict[str, PolicyRef] = {}
+    for policy_id, value in policies.items():
+        _require_policy_token(policy_id, label="policy index id")
+        if not isinstance(value, dict) or set(value) != {"revision", "digest"}:
+            raise InvalidArtifact("policy index reference has an invalid schema")
+        parsed[policy_id] = PolicyRef(policy_id, value["revision"], value["digest"])
+    return PolicyIndex(generation, parsed, storage_class)
 
 
 class PolicyStore:
@@ -218,7 +261,7 @@ class PolicyStore:
             document=document,
             expected_generation=expected_generation,
         )
-        return PolicyIndex(expected_generation + 1, policies)
+        return PolicyIndex(expected_generation + 1, policies, storage_class)
 
     def load_active(
         self, policy_id: str, storage_class: StorageClass
@@ -335,27 +378,7 @@ class PolicyStore:
             ArtifactFamily.REGISTRY, storage_class, ".madi/policy-index.yaml"
         )
         document = self._vault.reader.read(ArtifactFamily.REGISTRY, location=location)
-        metadata = document.metadata
-        if set(metadata) == {"generation", "policies"}:
-            if metadata != {"generation": 0, "policies": {}}:
-                raise InvalidArtifact("policy index has an invalid schema")
-            return PolicyIndex(0, {})
-        if set(metadata) != {"schema", "generation", "policies"}:
-            raise InvalidArtifact("policy index has an invalid schema")
-        if metadata.get("schema") != _POLICY_INDEX_SCHEMA:
-            raise InvalidArtifact("policy index has an unsupported schema")
-        generation = metadata.get("generation")
-        policies = metadata.get("policies")
-        self._validate_generation(generation)
-        if not isinstance(policies, dict):
-            raise InvalidArtifact("policy index policies must be a mapping")
-        parsed: dict[str, PolicyRef] = {}
-        for policy_id, value in policies.items():
-            _require_policy_token(policy_id, label="policy index id")
-            if not isinstance(value, dict) or set(value) != {"revision", "digest"}:
-                raise InvalidArtifact("policy index reference has an invalid schema")
-            parsed[policy_id] = PolicyRef(policy_id, value["revision"], value["digest"])
-        return PolicyIndex(generation, parsed)
+        return parse_policy_index(document.metadata, storage_class)
 
     def _ensure_index(self, storage_class: StorageClass) -> None:
         location = self._vault.router.location(
@@ -378,17 +401,11 @@ class PolicyStore:
 
     @staticmethod
     def _validate_generation(generation: object) -> None:
-        if (
-            not isinstance(generation, int)
-            or isinstance(generation, bool)
-            or generation < 0
-        ):
-            raise InvalidArtifact("policy index generation must be a non-negative integer")
+        _require_policy_index_generation(generation)
 
     @staticmethod
     def _validate_storage_class(storage_class: object) -> None:
-        if not isinstance(storage_class, StorageClass):
-            raise InvalidArtifact("policy lifecycle requires an explicit StorageClass")
+        _require_storage_class(storage_class)
 
     @staticmethod
     def _canonical_rule(rule: object) -> dict[str, Any]:
@@ -445,7 +462,7 @@ class PolicyStore:
         policies: Mapping[str, PolicyRef],
         storage_class: StorageClass,
     ) -> ArtifactDocument:
-        index = PolicyIndex(generation, policies)
+        index = PolicyIndex(generation, policies, storage_class)
         return ArtifactDocument(
             metadata={
                 "schema": _POLICY_INDEX_SCHEMA,

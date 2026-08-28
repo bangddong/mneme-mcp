@@ -95,6 +95,81 @@ def test_open_reads_identity_from_complete_portable_and_local_layout(tmp_path):
     assert opened.local_root == initialized.local_root
 
 
+@pytest.mark.parametrize(
+    "index",
+    [
+        {"generation": 9, "policies": {}},
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": {},
+            "unexpected": True,
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": True,
+            "policies": {},
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": [],
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": {"policy": {"revision": "1"}},
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": {"policy": {"revision": "1", "digest": "not-a-digest"}},
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": {
+                "policy": {
+                    "revision": "1",
+                    "digest": "0" * 64,
+                    "storage_class": "local-only",
+                }
+            },
+        },
+        {
+            "schema": "madi.policy-index.v1",
+            "generation": 1,
+            "policies": {"missing-revision": {"revision": "1", "digest": "0" * 64}},
+        },
+    ],
+)
+def test_open_rejects_noncanonical_or_unresolvable_policy_indexes(tmp_path, index):
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.fs import dump_yaml
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    (initialized.root / ".madi/policy-index.yaml").write_text(
+        dump_yaml(index), encoding="utf-8"
+    )
+
+    with pytest.raises(InvalidArtifact):
+        Vault.open(initialized.root, initialized.state_home)
+
+
+def test_open_accepts_only_the_exact_empty_bootstrap_policy_index_form(tmp_path):
+    from mneme.core.fs import dump_yaml
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    (initialized.root / ".madi/policy-index.yaml").write_text(
+        dump_yaml({"generation": 0, "policies": {}}), encoding="utf-8"
+    )
+
+    opened = Vault.open(initialized.root, initialized.state_home)
+    assert opened.id == initialized.id
+
+
 def test_open_rejects_missing_local_state_instead_of_creating_it(tmp_path):
     from mneme.core.errors import InvalidArtifact
     from mneme.core.vault import Vault

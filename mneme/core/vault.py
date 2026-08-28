@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from mneme.core.errors import ArtifactExists, InvalidArtifact
 from mneme.core.fs import dump_yaml, read_yaml, write_new
+from mneme.core.artifacts import StorageClass
 from mneme.core.storage import ArtifactReader, ArtifactStore, StorageRouter, ViewStore
 from mneme.core.validation.vault import (
     validate_identifier,
@@ -103,18 +104,17 @@ class Vault:
         ):
             raise InvalidArtifact("Vault metadata has an invalid foundational schema")
         policy_index = read_yaml(portable_root / ".madi/policy-index.yaml")
-        policy_generation = policy_index.get("generation")
-        if (
-            not isinstance(policy_generation, int)
-            or isinstance(policy_generation, bool)
-            or policy_generation < 0
-            or not isinstance(policy_index.get("policies"), dict)
-        ):
-            raise InvalidArtifact("policy index has an invalid foundational schema")
         local_root = local_state_home / "vaults" / vault_id
         validate_separate_roots(portable_root, local_root)
         _require_directories(local_root, _LOCAL_DIRECTORIES, "machine-local")
-        return cls(portable_root, local_state_home, vault_id, dict(owner), local_root)
+        vault = cls(portable_root, local_state_home, vault_id, dict(owner), local_root)
+        from mneme.core.policy import PolicyStore, parse_policy_index
+
+        index = parse_policy_index(policy_index, StorageClass.PORTABLE)
+        store = PolicyStore(vault)
+        for policy_id in index.policies:
+            store.load_active(policy_id, StorageClass.PORTABLE)
+        return vault
 
     @classmethod
     def initialize(cls, root: Path, state_home: Path, owner_id: str) -> Vault:
