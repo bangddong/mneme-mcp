@@ -10,12 +10,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Final, TypeAlias
 
 from mneme.core.errors import InvalidArtifact, MadiError
 
 
 POLICY_EVALUATOR_VERSION: Final = "madi.policy.v1"
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_OPAQUE_ATTESTATION_ID = re.compile(
+    r"^attest-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_APPROVED_RULE_ID = re.compile(
+    r"^rule-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_POLICY_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class PolicyError(MadiError):
@@ -83,6 +92,26 @@ def _require_text(value: object, *, label: str) -> str:
     return value
 
 
+def _require_sha256(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not _SHA256_HEX.fullmatch(value):
+        raise InvalidPolicy(f"{label} must be a lowercase SHA-256 hex digest")
+    return value
+
+
+def _require_approved_rule_id(value: object) -> str:
+    if not isinstance(value, str) or not _APPROVED_RULE_ID.fullmatch(value):
+        raise InvalidPolicy(
+            "approved rule id must be a generated rule-UUID identifier"
+        )
+    return value
+
+
+def _require_policy_token(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not _POLICY_TOKEN.fullmatch(value):
+        raise InvalidPolicy(f"{label} must be a safe policy token")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyRef:
     """An exact immutable policy-revision identity safe to include in a receipt."""
@@ -92,9 +121,9 @@ class PolicyRef:
     digest: str
 
     def __post_init__(self) -> None:
-        _require_text(self.policy_id, label="policy id")
-        _require_text(self.revision, label="policy revision")
-        _require_text(self.digest, label="policy digest")
+        _require_policy_token(self.policy_id, label="policy id")
+        _require_policy_token(self.revision, label="policy revision")
+        _require_sha256(self.digest, label="policy digest")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,8 +139,13 @@ class OpaquePolicyAttestation:
     digest: str
 
     def __post_init__(self) -> None:
-        _require_text(self.attestation_id, label="opaque attestation id")
-        _require_text(self.digest, label="opaque attestation digest")
+        if not isinstance(self.attestation_id, str) or not _OPAQUE_ATTESTATION_ID.fullmatch(
+            self.attestation_id
+        ):
+            raise InvalidPolicy(
+                "opaque attestation id must be a generated attest-UUID identifier"
+            )
+        _require_sha256(self.digest, label="opaque attestation digest")
 
 
 # Short alias for callers that do not need the policy-specific spelling.
@@ -128,19 +162,22 @@ class PolicyRule:
     ceiling: Portability
     digest: str
     opaque_attestation: OpaquePolicyAttestation | None = None
+    approved_rule_id: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.policy_id, label="policy id")
-        _require_text(self.revision, label="policy revision")
+        _require_policy_token(self.policy_id, label="policy id")
+        _require_policy_token(self.revision, label="policy revision")
         if not isinstance(self.ceiling, Portability):
             raise InvalidPolicy("policy ceiling must be a Portability")
-        _require_text(self.digest, label="policy digest")
+        _require_sha256(self.digest, label="policy digest")
         if self.opaque_attestation is not None and not isinstance(
             self.opaque_attestation, OpaquePolicyAttestation
         ):
             raise InvalidPolicy(
                 "policy opaque_attestation must be an OpaquePolicyAttestation or None"
             )
+        if self.approved_rule_id is not None:
+            _require_approved_rule_id(self.approved_rule_id)
 
     @property
     def ref(self) -> PolicyRef:
@@ -176,6 +213,7 @@ class PolicyEvaluation:
     refs: tuple[PolicyReceiptRef, ...]
     semantic_hash: str
     violations: tuple[PolicyViolation, ...] = ()
+    approved_rule_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.requested, Portability):
@@ -191,7 +229,7 @@ class PolicyEvaluation:
         ):
             raise InvalidPolicy("receipt evaluated_at must be an aware UTC datetime")
         _require_text(self.evaluator_version, label="receipt evaluator version")
-        _require_text(self.semantic_hash, label="receipt semantic hash")
+        _require_sha256(self.semantic_hash, label="receipt semantic hash")
         if not isinstance(self.refs, tuple) or not all(
             isinstance(ref, (PolicyRef, OpaquePolicyAttestation)) for ref in self.refs
         ):
@@ -202,6 +240,14 @@ class PolicyEvaluation:
             isinstance(violation, PolicyViolation) for violation in self.violations
         ):
             raise InvalidPolicy("receipt violations must be a tuple of PolicyViolation")
+        if not isinstance(self.approved_rule_ids, tuple):
+            raise InvalidPolicy("receipt approved rule ids must be a tuple")
+        if self.approved_rule_ids != tuple(sorted(set(self.approved_rule_ids))):
+            raise InvalidPolicy(
+                "receipt approved rule ids must be deterministically sorted and deduplicated"
+            )
+        for rule_id in self.approved_rule_ids:
+            _require_approved_rule_id(rule_id)
         expected_allowed = self.requested <= self.effective_ceiling
         if self.allowed is not expected_allowed:
             raise InvalidPolicy("receipt allowed must match the requested portability ceiling")
@@ -227,12 +273,34 @@ def _validate_inputs(inputs: object) -> tuple[PolicyRule, ...]:
         raise InvalidPolicy("policy inputs must be a tuple of PolicyRule values")
     if not all(isinstance(rule, PolicyRule) for rule in inputs):
         raise InvalidPolicy("policy inputs must contain only PolicyRule values")
-    conflicting_revisions: dict[tuple[str, str], str] = {}
+    rule_by_identity: dict[tuple[str, str], PolicyRule] = {}
+    opaque_provenance: dict[OpaquePolicyAttestation, tuple[str, str, str, Portability, str | None]] = {}
     for rule in inputs:
         key = (rule.policy_id, rule.revision)
-        previous_digest = conflicting_revisions.setdefault(key, rule.digest)
-        if previous_digest != rule.digest:
-            raise InvalidPolicy("the same immutable policy revision has conflicting digests")
+        previous = rule_by_identity.setdefault(key, rule)
+        if previous != rule:
+            if (previous.opaque_attestation is None) != (
+                rule.opaque_attestation is None
+            ):
+                raise InvalidPolicy(
+                    "the same policy identity cannot be supplied as opaque and raw provenance"
+                )
+            raise InvalidPolicy("the same policy identity has conflicting provenance")
+        if rule.opaque_attestation is not None:
+            provenance = (
+                rule.policy_id,
+                rule.revision,
+                rule.digest,
+                rule.ceiling,
+                rule.approved_rule_id,
+            )
+            previous_provenance = opaque_provenance.setdefault(
+                rule.opaque_attestation, provenance
+            )
+            if previous_provenance != provenance:
+                raise InvalidPolicy(
+                    "one opaque attestation cannot represent conflicting policy provenance"
+                )
     return inputs
 
 
@@ -250,7 +318,7 @@ def evaluate_portability(
     if not isinstance(requested, Portability):
         raise InvalidPolicy("requested portability must be a Portability")
     rules = _validate_inputs(inputs)
-    _require_text(semantic_hash, label="semantic hash")
+    _require_sha256(semantic_hash, label="semantic hash")
     if not rules and requested is not Portability.LOCAL_ONLY:
         violation = PolicyViolation(
             "unknown-policy",
@@ -262,6 +330,9 @@ def evaluate_portability(
         min((rule.ceiling for rule in rules), default=Portability.LOCAL_ONLY)
     )
     refs = _canonical_refs(tuple(rule.receipt_ref for rule in rules))
+    approved_rule_ids = tuple(
+        sorted({rule.approved_rule_id for rule in rules if rule.approved_rule_id})
+    )
     allowed = requested <= effective_ceiling
     violations: tuple[PolicyViolation, ...] = ()
     if not allowed:
@@ -280,6 +351,7 @@ def evaluate_portability(
         refs=refs,
         semantic_hash=semantic_hash,
         violations=violations,
+        approved_rule_ids=approved_rule_ids,
     )
 
 
