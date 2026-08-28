@@ -29,6 +29,9 @@ _MODES = frozenset({"single", "preferred", "parallel"})
 _CREDENTIAL_WORD = re.compile(
     r"(?i)(?:^|[?&#;:_-])(api[_-]?key|token|secret|password|passwd|credential|authorization)(?:$|[?&#;:=_-])"
 )
+_CONFIDENTIAL_MARKER = re.compile(
+    r"(?i)(?:^|[/:?&#;_.=-])(confidential|private|secret)(?:$|[/:?&#;_.=-])"
+)
 
 
 class RegistryConflict(MadiError):
@@ -141,6 +144,11 @@ class WorkstreamRegistry:
             raise InvalidArtifact("workstream policy_refs must be PolicyRef values")
         if len({ref.policy_id for ref in self.policy_refs}) != len(self.policy_refs):
             raise InvalidArtifact("workstream cannot contain duplicate policy ids")
+        object.__setattr__(
+            self,
+            "policy_refs",
+            tuple(sorted(self.policy_refs, key=lambda item: item.policy_id)),
+        )
 
     def with_status(self, status: str) -> WorkstreamRegistry:
         return replace(self, status=status)
@@ -176,6 +184,7 @@ class RegistryStore:
             mode=mode,
             policy_refs=policy_refs,
         )
+        self._validate_project_reference(registry.project)
         self._validate_workstream_policies(registry)
         self._vault.artifacts.write_new(
             ArtifactFamily.REGISTRY,
@@ -213,6 +222,7 @@ class RegistryStore:
     ) -> SourceRegistry:
         _validate_locator(locator, self.storage_class)
         registry = SourceRegistry(source_id, 0, kind, authority, project, locator)
+        self._validate_project_reference(registry.project)
         self._vault.artifacts.write_new(
             ArtifactFamily.REGISTRY,
             storage_class=self.storage_class,
@@ -237,11 +247,14 @@ class RegistryStore:
             storage_class=self.storage_class,
             relative_path=self._source_path(source_id),
         )
-        return self._parse_source(document.metadata, source_id)
+        registry = self._parse_source(document.metadata, source_id)
+        self._validate_project_reference(registry.project)
+        return registry
 
     def assign_project_policy(
         self, project_id: str, policy_ref: PolicyRef, *, expected_generation: int
     ) -> ProjectRegistry:
+        _validate_expected_generation(expected_generation)
         self._validate_assignable_policy(policy_ref)
         current = self.load_project(project_id)
         if expected_generation != current.generation:
@@ -262,6 +275,7 @@ class RegistryStore:
     def assign_source_policy(
         self, source_id: str, policy_ref: PolicyRef, *, expected_generation: int
     ) -> SourceRegistry:
+        _validate_expected_generation(expected_generation)
         self._validate_assignable_policy(policy_ref)
         current = self.load_source(source_id)
         if expected_generation != current.generation:
@@ -333,15 +347,20 @@ class RegistryStore:
             storage_class=self.storage_class,
             relative_path=self._workstream_path(workstream_id),
         )
-        return self._parse_workstream(document.metadata, workstream_id)
+        registry = self._parse_workstream(document.metadata, workstream_id)
+        self._validate_project_reference(registry.project)
+        self._validate_workstream_policies(registry)
+        return registry
 
     def update_workstream(
         self, registry: WorkstreamRegistry, *, expected_generation: int
     ) -> WorkstreamRegistry:
         if not isinstance(registry, WorkstreamRegistry):
             raise InvalidArtifact("workstream update requires a WorkstreamRegistry")
+        _validate_expected_generation(expected_generation)
         if expected_generation != registry.generation:
             raise RegistryConflict("workstream generation does not match CAS base")
+        self._validate_project_reference(registry.project)
         self._validate_workstream_policies(registry)
         updated = replace(registry, generation=expected_generation + 1)
         try:
@@ -372,6 +391,7 @@ class RegistryStore:
         return f"sources/{source_id}.yaml"
 
     def _project_document(self, registry: ProjectRegistry) -> ArtifactDocument:
+        _validate_locator(registry.locator, self.storage_class)
         return ArtifactDocument(
             metadata={
                 "schema": _PROJECT_SCHEMA,
@@ -385,6 +405,8 @@ class RegistryStore:
         )
 
     def _source_document(self, registry: SourceRegistry) -> ArtifactDocument:
+        _validate_locator(registry.locator, self.storage_class)
+        self._validate_project_reference(registry.project)
         return ArtifactDocument(
             metadata={
                 "schema": _SOURCE_SCHEMA,
@@ -400,6 +422,7 @@ class RegistryStore:
         )
 
     def _workstream_document(self, registry: WorkstreamRegistry) -> ArtifactDocument:
+        self._validate_project_reference(registry.project)
         metadata: dict[str, object] = {
             "schema": _WORKSTREAM_SCHEMA,
             "id": registry.id,
@@ -491,7 +514,7 @@ class RegistryStore:
             raise RegistryConflict(
                 "referenced session revision is invalid", code="invalid-head"
             ) from exc
-        if result is False:
+        if result is not True:
             raise RegistryConflict(
                 "referenced session revision is invalid", code="invalid-head"
             )
@@ -551,6 +574,22 @@ class RegistryStore:
         for policy_ref in registry.policy_refs:
             self._validate_assignable_policy(policy_ref)
 
+    def _validate_project_reference(self, project_id: str | None) -> None:
+        """Resolve project IDs directionally: local first, portable fallback only."""
+        if project_id is None:
+            return
+        validate_identifier(project_id, label="project id")
+        if self.storage_class is StorageClass.PORTABLE:
+            self.load_project(project_id)
+            return
+        try:
+            self.load_project(project_id)
+        except InvalidArtifact as local_error:
+            try:
+                RegistryStore(self._vault, StorageClass.PORTABLE).load_project(project_id)
+            except InvalidArtifact:
+                raise local_error
+
     @staticmethod
     def _parse_policy_ref(value: object) -> PolicyRef | None:
         if value is None:
@@ -559,14 +598,14 @@ class RegistryStore:
             raise InvalidArtifact("registry policy reference has an invalid schema")
         return PolicyRef(value.get("policy_id"), value.get("revision"), value.get("digest"))
 
-    @staticmethod
-    def _parse_project(metadata: object, project_id: str) -> ProjectRegistry:
+    def _parse_project(self, metadata: object, project_id: str) -> ProjectRegistry:
         if not isinstance(metadata, dict) or set(metadata) != {
             "schema", "id", "generation", "authority", "locator", "policy"
         }:
             raise InvalidArtifact("project registry has an invalid schema")
         if metadata.get("schema") != _PROJECT_SCHEMA or metadata.get("id") != project_id:
             raise InvalidArtifact("project registry identity does not match its path")
+        _validate_locator(metadata.get("locator"), self.storage_class)
         return ProjectRegistry(
             project_id,
             metadata.get("generation"),
@@ -575,14 +614,14 @@ class RegistryStore:
             RegistryStore._parse_policy_ref(metadata.get("policy")),
         )
 
-    @staticmethod
-    def _parse_source(metadata: object, source_id: str) -> SourceRegistry:
+    def _parse_source(self, metadata: object, source_id: str) -> SourceRegistry:
         if not isinstance(metadata, dict) or set(metadata) != {
             "schema", "id", "generation", "kind", "authority", "project", "locator", "policy"
         }:
             raise InvalidArtifact("source registry has an invalid schema")
         if metadata.get("schema") != _SOURCE_SCHEMA or metadata.get("id") != source_id:
             raise InvalidArtifact("source registry identity does not match its path")
+        _validate_locator(metadata.get("locator"), self.storage_class)
         return SourceRegistry(
             source_id,
             metadata.get("generation"),
@@ -597,6 +636,10 @@ class RegistryStore:
 def _validate_generation(value: object, *, label: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise InvalidArtifact(f"{label} generation must be a non-negative integer")
+
+
+def _validate_expected_generation(value: object) -> None:
+    _validate_generation(value, label="expected")
 
 
 def _validate_locator(value: str | None, storage_class: StorageClass) -> None:
@@ -620,3 +663,5 @@ def _validate_locator(value: str | None, storage_class: StorageClass) -> None:
         raise InvalidArtifact("portable registry locator cannot be a machine path")
     if parsed.username is not None or parsed.password is not None or _CREDENTIAL_WORD.search(value):
         raise InvalidArtifact("portable registry locator cannot contain credentials")
+    if _CONFIDENTIAL_MARKER.search(value):
+        raise InvalidArtifact("portable registry locator cannot disclose confidential markers")

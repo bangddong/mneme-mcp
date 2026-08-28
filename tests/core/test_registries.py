@@ -266,3 +266,163 @@ def test_head_retry_stops_after_three_cas_conflicts(vault, monkeypatch):
             "ws-1", HeadRef("session-a", "000001"), observed_base, lambda _head: True
         )
     assert attempts == 3
+
+
+def test_portable_subjects_reject_local_only_project_references(vault, tmp_path):
+    """Catches a portable source or workstream disclosing a local project ID."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.registries import RegistryStore
+
+    portable = RegistryStore(vault, StorageClass.PORTABLE)
+    local = RegistryStore(vault, StorageClass.LOCAL_ONLY)
+    local.register_project("confidential-project", locator=str((tmp_path / "repo").resolve()))
+
+    with pytest.raises(InvalidArtifact):
+        portable.register_source("portable-source", project="confidential-project")
+    with pytest.raises(InvalidArtifact):
+        portable.create_workstream(
+            "portable-workstream", project="confidential-project", mode="parallel"
+        )
+    assert not (vault.root / "sources" / "portable-source.yaml").exists()
+    assert not (vault.root / "workstreams" / "portable-workstream").exists()
+
+
+def test_project_reference_lookup_keeps_portable_and_local_directional(vault, tmp_path):
+    """Catches local project lookup leaking back into a portable subject."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    portable = RegistryStore(vault, StorageClass.PORTABLE)
+    local = RegistryStore(vault, StorageClass.LOCAL_ONLY)
+    portable.register_project("portable-project", locator="https://example.test/repo")
+    local.register_project("local-project", locator=str((tmp_path / "local").resolve()))
+    local.register_project("same-id", locator=str((tmp_path / "shadow").resolve()))
+    portable.register_project("same-id", locator="https://example.test/same")
+
+    assert portable.register_source("portable-source", project="portable-project").project == "portable-project"
+    assert portable.create_workstream(
+        "portable-ws", project="portable-project", mode="parallel"
+    ).project == "portable-project"
+    assert local.register_source("local-source", project="local-project").project == "local-project"
+    assert local.create_workstream("local-ws", project="portable-project", mode="parallel").project == "portable-project"
+    assert local.register_source("ambiguous-local", project="same-id").project == "same-id"
+
+
+@pytest.mark.parametrize("locator", ["C:/private/repo", "file:///tmp/repo", "https://example.test/private/repo"])
+def test_portable_registry_load_rejects_forged_unsafe_locator(vault, locator):
+    """Catches manual YAML edits bypassing portable locator checks at registration."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.registries import RegistryStore
+
+    store = RegistryStore(vault)
+    store.register_source("source-1", locator="docs/readme.md")
+    (vault.root / "sources" / "source-1.yaml").write_text(
+        "\n".join(
+            [
+                "schema: madi.source-registry.v1",
+                "id: source-1",
+                "generation: 0",
+                "kind: filesystem",
+                "authority: project",
+                "project: null",
+                f"locator: {locator}",
+                "policy: null",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidArtifact):
+        store.load_source("source-1")
+
+
+@pytest.mark.parametrize("result", [False, None, 0, "", []])
+def test_head_validator_requires_literal_true(vault, result):
+    """Catches truthy/falsy validator values being mistaken for immutable validation."""
+    from mneme.core.registries import HeadRef, RegistryConflict, RegistryStore
+
+    store = RegistryStore(vault)
+    base = store.create_workstream("ws-1", project=None, mode="parallel")
+    with pytest.raises(RegistryConflict):
+        store.add_active_head("ws-1", HeadRef("session-a", "000001"), base, lambda _head: result)
+
+
+def test_head_validator_exception_and_each_retry_fail_closed(vault, monkeypatch):
+    """Catches a retry reusing stale validation or accepting a validator exception."""
+    from mneme.core.registries import HeadRef, RegistryConflict, RegistryStore
+
+    store = RegistryStore(vault)
+    base = store.create_workstream("ws-1", project=None, mode="parallel")
+    with pytest.raises(RegistryConflict):
+        store.add_active_head(
+            "ws-1",
+            HeadRef("session-error", "000001"),
+            base,
+            lambda _head: (_ for _ in ()).throw(RuntimeError("missing revision")),
+        )
+
+    original_update = store.update_workstream
+    updates = 0
+    validations = 0
+
+    def conflict_once(registry, *, expected_generation):
+        nonlocal updates
+        updates += 1
+        if updates == 1:
+            raise RegistryConflict("injected CAS conflict")
+        return original_update(registry, expected_generation=expected_generation)
+
+    def valid(_head):
+        nonlocal validations
+        validations += 1
+        return True
+
+    monkeypatch.setattr(store, "update_workstream", conflict_once)
+    assert store.add_active_head("ws-1", HeadRef("session-a", "000001"), base, valid).generation == 1
+    assert validations == 2
+
+
+def test_workstream_canonicalizes_policy_refs_before_returning_observed_base(vault):
+    """Catches serialized policy ordering differing from the returned CAS base."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import HeadRef, RegistryStore
+
+    policies = PolicyStore(vault)
+    first = policies.create_revision("a-policy", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE)
+    second = policies.create_revision("b-policy", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE)
+    store = RegistryStore(vault)
+    base = store.create_workstream(
+        "ws-1", project=None, mode="parallel", policy_refs=(second, first)
+    )
+
+    assert base.policy_refs == (first, second)
+    assert store.add_active_head(
+        "ws-1", HeadRef("session-a", "000001"), base, lambda _head: True
+    ).generation == 1
+
+
+@pytest.mark.parametrize("expected_generation", [True, False, -1])
+def test_registry_cas_apis_reject_non_integer_or_negative_generation(vault, expected_generation):
+    """Catches Python bool equality allowing a stale generation zero CAS."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.registries import RegistryStore
+
+    store = RegistryStore(vault)
+    workstream = store.create_workstream("ws-1", project=None, mode="parallel")
+    project = store.register_project("project-1")
+    source = store.register_source("source-1")
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore
+
+    policy = PolicyStore(vault).create_revision(
+        "policy-1", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    with pytest.raises(InvalidArtifact):
+        store.update_workstream(workstream, expected_generation=expected_generation)
+    with pytest.raises(InvalidArtifact):
+        store.assign_project_policy(project.id, policy, expected_generation=expected_generation)
+    with pytest.raises(InvalidArtifact):
+        store.assign_source_policy(source.id, policy, expected_generation=expected_generation)
