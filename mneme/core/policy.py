@@ -331,6 +331,13 @@ class PolicyEvaluation:
             raise InvalidPolicy(
                 "receipt approved rules must be deterministically sorted and deduplicated"
             )
+        if any(
+            provenance.authorizer not in copied_refs
+            for provenance in copied_approved_rules
+        ):
+            raise InvalidPolicy(
+                "every approved rule authorizer must match a canonical receipt refs entry"
+            )
         object.__setattr__(self, "approved_rules", copied_approved_rules)
         expected_allowed = self.requested <= self.effective_ceiling
         if self.allowed is not expected_allowed:

@@ -299,6 +299,121 @@ def test_same_approved_rule_with_conflicting_authorizers_fails_closed():
         evaluate_portability(Portability.PERSONAL_VAULT, (first, second), HASH_D)
 
 
+def test_direct_receipt_keeps_copied_raw_approved_rule_authorizer_bound_to_refs():
+    from mneme.core.policy import (
+        ApprovedRuleProvenance,
+        PolicyEvaluation,
+        PolicyRef,
+        Portability,
+    )
+
+    caller_ref = PolicyRef("source-a", "7", HASH_A)
+    receipt = PolicyEvaluation(
+        Portability.PERSONAL_VAULT,
+        Portability.PERSONAL_VAULT,
+        True,
+        datetime.now(timezone.utc),
+        "madi.policy.v1",
+        (caller_ref,),
+        HASH_D,
+        approved_rules=(ApprovedRuleProvenance(DERIVATIVE_RULE, caller_ref),),
+    )
+    expected = asdict(receipt)
+
+    object.__setattr__(caller_ref, "policy_id", "source-b")
+
+    assert asdict(receipt) == expected
+    assert receipt.approved_rules[0].authorizer == receipt.refs[0]
+    assert receipt.approved_rules[0].authorizer is not caller_ref
+
+
+def test_direct_receipt_rejects_raw_approved_rule_authorizer_absent_from_refs():
+    from mneme.core.policy import (
+        ApprovedRuleProvenance,
+        InvalidPolicy,
+        PolicyEvaluation,
+        PolicyRef,
+        Portability,
+    )
+
+    with pytest.raises(InvalidPolicy, match="authorizer.*refs"):
+        PolicyEvaluation(
+            Portability.PERSONAL_VAULT,
+            Portability.PERSONAL_VAULT,
+            True,
+            datetime.now(timezone.utc),
+            "madi.policy.v1",
+            (PolicyRef("source-a", "7", HASH_A),),
+            HASH_D,
+            approved_rules=(
+                ApprovedRuleProvenance(
+                    DERIVATIVE_RULE, PolicyRef("source-b", "7", HASH_B)
+                ),
+            ),
+        )
+
+
+def test_direct_receipt_keeps_copied_opaque_approved_rule_authorizer_bound_to_refs():
+    from mneme.core.policy import (
+        ApprovedRuleProvenance,
+        OpaquePolicyAttestation,
+        PolicyEvaluation,
+        Portability,
+    )
+
+    caller_attestation = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
+    receipt = PolicyEvaluation(
+        Portability.PERSONAL_VAULT,
+        Portability.PERSONAL_VAULT,
+        True,
+        datetime.now(timezone.utc),
+        "madi.policy.v1",
+        (caller_attestation,),
+        HASH_D,
+        approved_rules=(
+            ApprovedRuleProvenance(DERIVATIVE_RULE, caller_attestation),
+        ),
+    )
+    expected = asdict(receipt)
+
+    object.__setattr__(caller_attestation, "digest", HASH_A)
+
+    assert asdict(receipt) == expected
+    assert receipt.approved_rules[0].authorizer == receipt.refs[0]
+    assert receipt.approved_rules[0].authorizer is not caller_attestation
+
+
+def test_direct_receipt_rejects_opaque_approved_rule_authorizer_absent_from_refs():
+    from mneme.core.policy import (
+        ApprovedRuleProvenance,
+        InvalidPolicy,
+        OpaquePolicyAttestation,
+        PolicyEvaluation,
+        Portability,
+    )
+
+    in_receipt = OpaquePolicyAttestation.create(
+        ATTESTATION_A, "7", Portability.PERSONAL_VAULT
+    )
+    absent = OpaquePolicyAttestation.create(
+        ATTESTATION_B, "7", Portability.PERSONAL_VAULT
+    )
+
+    with pytest.raises(InvalidPolicy, match="authorizer.*refs"):
+        PolicyEvaluation(
+            Portability.PERSONAL_VAULT,
+            Portability.PERSONAL_VAULT,
+            True,
+            datetime.now(timezone.utc),
+            "madi.policy.v1",
+            (in_receipt,),
+            HASH_D,
+            approved_rules=(ApprovedRuleProvenance(DERIVATIVE_RULE, absent),),
+        )
+
+
 @pytest.mark.parametrize("unsafe_revision", ["../7", "C:/policy", "https://policy", "revision 7"])
 def test_policy_ref_and_rule_reject_unsafe_policy_revision_tokens(unsafe_revision):
     from mneme.core.policy import InvalidPolicy, PolicyRef, PolicyRule, Portability
