@@ -336,23 +336,7 @@ class SessionStore:
                 PolicyStore(self._vault).load_rule(policy_ref)
 
     def _validate_request_references(self, request: CheckpointRequest) -> None:
-        if request.storage_class is not StorageClass.PORTABLE:
-            return
-        references = request.body.source_refs + tuple(
-            _provenance_artifact_reference(reference)
-            for relation in request.relations
-            for reference in relation.provenance_refs
-        )
-        if any(reference.storage_class is StorageClass.LOCAL_ONLY for reference in references):
-            raise PortabilityViolation("portable checkpoint contains local-only references")
-        if any(
-            isinstance(reference, ArtifactReference)
-            for relation in request.relations
-            for reference in relation.provenance_refs
-        ):
-            raise PortabilityViolation(
-                "portable checkpoint provenance requires explicit typed references"
-            )
+        _validate_historic_references(request)
 
     def _applicable_policy_rules(
         self, request: CheckpointRequest, observed: object
@@ -498,7 +482,9 @@ class SessionStore:
         # Decode applies the same one-way provenance boundary as admission.
         # This is structural only: it intentionally does not consult current
         # policy pointers, so historic receipts remain auditable.
-        self._validate_request_references(request)
+        request = validate_historic_session_revision(
+            request, ref, workstream_id=workstream_id, storage_class=self.storage_class
+        )
         self._validate_read_policy_binding(request)
         if metadata.get("semantic_hash") != receipt.semantic_hash:
             raise InvalidArtifact("session revision semantic hash is not receipt-bound")
@@ -530,6 +516,136 @@ def session_semantic_hash(body: SessionBody, relations: tuple[SessionRelation, .
     }
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_historic_session_revision(
+    request: object,
+    ref: object,
+    *,
+    workstream_id: object,
+    storage_class: object,
+) -> CheckpointRequest:
+    """Canonicalize and validate one historic session without reading live policy.
+
+    This verifies the immutable self-contained receipt/body binding and every
+    nested semantic value.  It deliberately does not resolve policy pointers or
+    load a policy store: historical admission is audited from its own receipt.
+    """
+
+    if not isinstance(request, CheckpointRequest):
+        raise InvalidArtifact("historic session requires a CheckpointRequest")
+    if not isinstance(ref, SessionRevisionRef):
+        raise InvalidArtifact("historic session requires a SessionRevisionRef")
+    validate_identifier(workstream_id, label="workstream id")
+    if not isinstance(storage_class, StorageClass):
+        raise InvalidArtifact("historic session requires a StorageClass")
+    canonical_ref = SessionRevisionRef(ref.session, ref.revision)
+    canonical_body = SessionBody(
+        request.body.adapter_id,
+        request.body.objective,
+        request.body.current_state,
+        tuple(request.body.verified_facts),
+        tuple(request.body.completed_work),
+        tuple(request.body.blockers),
+        tuple(request.body.next_actions),
+        tuple(
+            ArtifactReference(item.kind, item.storage_class, item.value)
+            for item in request.body.source_refs
+        ),
+    )
+    canonical_relations = tuple(
+        SessionRelation(
+            relation.kind,
+            relation.target,
+            relation.purpose,
+            relation.required_context,
+            relation.next_action,
+            tuple(_canonical_provenance(item) for item in relation.provenance_refs),
+        )
+        for relation in request.relations
+    )
+    canonical_parent = (
+        None
+        if request.expected_parent is None
+        else SessionRevisionRef(
+            request.expected_parent.session, request.expected_parent.revision
+        )
+    )
+    receipt = request.policy_evaluation
+    canonical_receipt = PolicyEvaluation(
+        receipt.requested,
+        receipt.effective_ceiling,
+        receipt.allowed,
+        receipt.evaluated_at,
+        receipt.evaluator_version,
+        tuple(receipt.refs),
+        receipt.semantic_hash,
+        tuple(PolicyViolation(item.code, item.message) for item in receipt.violations),
+        tuple(
+            ApprovedRuleProvenance(item.rule_id, item.authorizer)
+            for item in receipt.approved_rules
+        ),
+    )
+    timestamp = request.revision_timestamp
+    if timestamp is None or timestamp.utcoffset() != timezone.utc.utcoffset(None):
+        raise InvalidArtifact("historic session timestamp must be UTC")
+    canonical_timestamp = _canonical_timestamp(timestamp)
+    canonical = CheckpointRequest(
+        request.workstream_id,
+        request.session_id,
+        request.storage_class,
+        canonical_parent,
+        request.expected_registry_generation,
+        canonical_body,
+        canonical_relations,
+        canonical_receipt,
+        canonical_timestamp,
+    )
+    if (
+        canonical.workstream_id != workstream_id
+        or canonical.workstream_id != request.workstream_id
+        or canonical.session_id != canonical_ref.session
+        or canonical.storage_class is not storage_class
+    ):
+        raise InvalidArtifact("historic session identity does not match its reader contract")
+    _validate_historic_references(canonical)
+    if canonical.policy_evaluation.semantic_hash != session_semantic_hash(
+        canonical.body, canonical.relations
+    ):
+        raise InvalidArtifact("historic session receipt does not bind semantic content")
+    if canonical.policy_evaluation.requested is not _requested_portability(storage_class):
+        raise InvalidArtifact("historic session receipt portability does not match storage")
+    if not canonical.policy_evaluation.allowed:
+        raise InvalidArtifact("historic session receipt does not admit stored content")
+    return canonical
+
+
+def _canonical_provenance(
+    value: object,
+) -> ArtifactReference | SessionProvenanceRef:
+    if isinstance(value, ArtifactReference):
+        return ArtifactReference(value.kind, value.storage_class, value.value)
+    if isinstance(value, SessionProvenanceRef):
+        return SessionProvenanceRef(value.kind, value.storage_class, value.id)
+    raise InvalidArtifact("historic session provenance is invalid")
+
+
+def _validate_historic_references(request: CheckpointRequest) -> None:
+    if request.storage_class is not StorageClass.PORTABLE:
+        return
+    references = request.body.source_refs + tuple(
+        _provenance_artifact_reference(reference)
+        for relation in request.relations
+        for reference in relation.provenance_refs
+    )
+    if any(reference.storage_class is StorageClass.LOCAL_ONLY for reference in references):
+        raise PortabilityViolation("portable checkpoint contains local-only references")
+    if any(
+        isinstance(reference, ArtifactReference)
+        for relation in request.relations
+        for reference in relation.provenance_refs
+    ):
+        raise PortabilityViolation("portable checkpoint provenance requires explicit typed references")
 
 
 def _requested_portability(storage_class: StorageClass) -> Portability:

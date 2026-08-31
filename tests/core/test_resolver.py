@@ -3,16 +3,15 @@ from __future__ import annotations
 import pytest
 
 
-def _revision(head, *, workstream_id="ws-1", storage_class=None):
+def _revision(head, *, workstream_id="ws-1", storage_class=None, relations=()):
     from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyEvaluation, Portability
     from mneme.core.resolver import SessionRevision
-    from mneme.core.sessions import SessionBody
+    from mneme.core.sessions import CheckpointRequest, SessionBody, session_semantic_hash
+    from datetime import datetime, timezone
 
-    return SessionRevision(
-        head=head,
-        workstream_id=workstream_id,
-        storage_class=storage_class or StorageClass.PORTABLE,
-        body=SessionBody(
+    storage = storage_class or StorageClass.PORTABLE
+    body = SessionBody(
             adapter_id="codex",
             objective="Validated objective",
             current_state="Validated state",
@@ -21,8 +20,17 @@ def _revision(head, *, workstream_id="ws-1", storage_class=None):
             blockers=(),
             next_actions=("Continue",),
             source_refs=(),
-        ),
     )
+    receipt = PolicyEvaluation(
+        Portability.LOCAL_ONLY if storage is StorageClass.LOCAL_ONLY else Portability.PERSONAL_VAULT,
+        Portability.LOCAL_ONLY if storage is StorageClass.LOCAL_ONLY else Portability.PERSONAL_VAULT,
+        True, datetime(2026, 1, 1, tzinfo=timezone.utc), "test", (), session_semantic_hash(body, relations),
+    )
+    request = CheckpointRequest(
+        workstream_id, head.session, storage, None, 0, body, relations, receipt,
+        datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    return SessionRevision(head, request)
 
 
 @pytest.fixture
@@ -165,3 +173,31 @@ def test_required_reader_exception_is_invalid_but_malformed_optional_inputs_degr
         registry, lambda _head: (_ for _ in ()).throw(FileNotFoundError("revision missing"))
     ).state.value == "invalid"
     assert resolve_workstream(registry, lambda head: _revision(head), optional_inputs=object()).state.value == "degraded"
+
+
+@pytest.mark.parametrize("mutation", ["body", "relation_provenance", "head", "receipt"])
+def test_nested_session_mutation_is_rejected_before_rendering(registry_factory, mutation):
+    """Catches a frozen outer reader result hiding mutable historic session fields."""
+    from mneme.core.resolver import resolve_workstream
+
+    registry = registry_factory("single", ["a"], None)
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.sessions import SessionProvenanceRef, SessionRelation
+
+    relations = (
+        SessionRelation(
+            "handoff", "agent-b", "continue", "context", "resume",
+            (SessionProvenanceRef("source", StorageClass.PORTABLE, "source-1"),),
+        ),
+    )
+    revision = _revision(registry.active_heads[0], relations=relations)
+    if mutation == "body":
+        object.__setattr__(revision.request.body, "objective", "forged local payload")
+    elif mutation == "relation_provenance":
+        object.__setattr__(revision.request.relations[0].provenance_refs[0], "id", "forged-source")
+    elif mutation == "head":
+        object.__setattr__(revision.head, "revision", "000002")
+    else:
+        object.__setattr__(revision.request.policy_evaluation, "semantic_hash", "0" * 64)
+
+    assert resolve_workstream(registry, lambda _head: revision).state.value == "invalid"

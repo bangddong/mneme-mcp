@@ -10,8 +10,7 @@ from typing import Any
 from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact
 from mneme.core.registries import HeadRef, WorkstreamRegistry
-from mneme.core.sessions import SessionBody
-from mneme.core.validation.vault import validate_identifier
+from mneme.core.sessions import CheckpointRequest, SessionBody, SessionRevisionRef, validate_historic_session_revision
 
 
 class ResolutionState(str, Enum):
@@ -38,18 +37,32 @@ class SessionRevision:
     """
 
     head: HeadRef
-    workstream_id: str
-    storage_class: StorageClass
-    body: SessionBody
+    request: CheckpointRequest
 
     def __post_init__(self) -> None:
         if not isinstance(self.head, HeadRef):
             raise InvalidArtifact("resolved revision requires a HeadRef")
-        validate_identifier(self.workstream_id, label="workstream id")
-        if not isinstance(self.storage_class, StorageClass):
-            raise InvalidArtifact("resolved revision requires a StorageClass")
-        if not isinstance(self.body, SessionBody):
-            raise InvalidArtifact("resolved revision requires a validated SessionBody")
+        canonical_head = HeadRef(self.head.session, self.head.revision)
+        canonical_request = validate_historic_session_revision(
+            self.request,
+            SessionRevisionRef(canonical_head.session, canonical_head.revision),
+            workstream_id=self.request.workstream_id,
+            storage_class=self.request.storage_class,
+        )
+        object.__setattr__(self, "head", canonical_head)
+        object.__setattr__(self, "request", canonical_request)
+
+    @property
+    def workstream_id(self) -> str:
+        return self.request.workstream_id
+
+    @property
+    def storage_class(self) -> StorageClass:
+        return self.request.storage_class
+
+    @property
+    def body(self) -> SessionBody:
+        return self.request.body
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,9 +186,12 @@ def _optional_unavailable(value: object) -> bool:
 
 
 def _optional_inputs_degraded(optional_inputs: object) -> bool:
-    if isinstance(optional_inputs, (str, bytes)) or not isinstance(optional_inputs, Sequence):
+    try:
+        if isinstance(optional_inputs, (str, bytes)) or not isinstance(optional_inputs, Sequence):
+            return True
+        return any(_optional_unavailable(item) for item in optional_inputs)
+    except Exception:
         return True
-    return any(_optional_unavailable(item) for item in optional_inputs)
 
 
 def _valid_revision(
@@ -187,13 +203,8 @@ def _valid_revision(
     if not isinstance(revision, SessionRevision):
         return False
     try:
-        SessionRevision(
-            revision.head,
-            revision.workstream_id,
-            revision.storage_class,
-            revision.body,
-        )
-    except (InvalidArtifact, TypeError):
+        SessionRevision(revision.head, revision.request)
+    except Exception:
         return False
     return (
         revision.head == head

@@ -2,14 +2,21 @@ from __future__ import annotations
 
 def _revision(head, *, workstream_id="ws-1", storage_class=None, objective="portable continuity"):
     from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyEvaluation, Portability
     from mneme.core.resolver import SessionRevision
-    from mneme.core.sessions import SessionBody
+    from mneme.core.sessions import CheckpointRequest, SessionBody, session_semantic_hash
+    from datetime import datetime, timezone
 
+    storage = storage_class or StorageClass.PORTABLE
+    body = SessionBody("codex", objective, "working", (), (), (), ("continue",), ())
+    receipt = PolicyEvaluation(
+        Portability.LOCAL_ONLY if storage is StorageClass.LOCAL_ONLY else Portability.PERSONAL_VAULT,
+        Portability.LOCAL_ONLY if storage is StorageClass.LOCAL_ONLY else Portability.PERSONAL_VAULT,
+        True, datetime(2026, 1, 1, tzinfo=timezone.utc), "test", (), session_semantic_hash(body, ()),
+    )
     return SessionRevision(
-        head=head,
-        workstream_id=workstream_id,
-        storage_class=storage_class or StorageClass.PORTABLE,
-        body=SessionBody("codex", objective, "working", (), (), (), ("continue",), ()),
+        head,
+        CheckpointRequest(workstream_id, head.session, storage, None, 0, body, (), receipt, datetime(2026, 1, 1, tzinfo=timezone.utc)),
     )
 
 
@@ -185,3 +192,80 @@ def test_optional_overlay_reader_exception_falls_back_to_portable():
     assert view.overlay_status.value == "invalid"
     assert view.effective_status.value == "degraded"
     assert "portable continuity" in view.text
+
+
+from collections.abc import Sequence
+import pytest
+
+
+class _ExplodingGetItemInputs(Sequence[object]):
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, _index):
+        raise RuntimeError("optional reader failed")
+
+
+class _ExplodingIterInputs(Sequence[object]):
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, _index):
+        return True
+
+    def __iter__(self):
+        raise RuntimeError("optional reader failed")
+
+
+class _ExplodingLenInputs(Sequence[object]):
+    def __len__(self):
+        raise RuntimeError("optional reader failed")
+
+    def __getitem__(self, _index):
+        return True
+
+    def __iter__(self):
+        return iter(range(len(self)))
+
+
+@pytest.mark.parametrize("sequence_type", [_ExplodingGetItemInputs, _ExplodingIterInputs, _ExplodingLenInputs])
+def test_exploding_portable_optional_sequence_degrades_without_crashing(sequence_type):
+    """Catches an optional Sequence inspection exception escaping CURRENT rendering."""
+    from mneme.core.context import ContextReaders, render_current
+
+    view = render_current(
+        ContextReaders(
+            lambda _id: _portable_registry(),
+            lambda _id, head: _revision(head),
+            portable_optional_inputs=lambda _id: sequence_type(),
+        ),
+        "ws-1", "portable",
+    )
+
+    assert view.status.value == "degraded"
+
+
+@pytest.mark.parametrize("sequence_type", [_ExplodingGetItemInputs, _ExplodingIterInputs, _ExplodingLenInputs])
+def test_exploding_overlay_optional_sequence_degrades_without_partial_overlay_render(sequence_type):
+    """Catches a local optional Sequence exception crashing effective-local CURRENT."""
+    from mneme.core.context import ContextReaders, LocalOverlay, render_current
+
+    overlay = LocalOverlay("ws-1", _local_registry())
+    object.__setattr__(overlay, "optional_inputs", sequence_type())
+    view = render_current(
+        ContextReaders(
+            lambda _id: _portable_registry(),
+            lambda _id, head: _revision(head),
+            load_overlay=lambda _id: overlay,
+            load_overlay_revision=lambda _id, head: _revision(
+                head,
+                workstream_id="local-ws",
+                storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY,
+                objective="confidential foreground",
+            ),
+        ),
+        "ws-1", "effective-local",
+    )
+
+    assert view.effective_status.value == "degraded"
+    assert "confidential foreground" not in view.text

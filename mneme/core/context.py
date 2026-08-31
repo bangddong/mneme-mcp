@@ -134,12 +134,17 @@ def _resolve_overlay(readers: ContextReaders, workstream_id: str) -> ResolvedWor
         return _invalid_projection()
     if readers.load_overlay_revision is None:
         return _invalid_projection()
-    return resolve_workstream(
-        overlay.registry,
-        lambda head: readers.load_overlay_revision(overlay.registry.id, head),
-        optional_inputs=overlay.optional_inputs,
-        expected_storage_class=StorageClass.LOCAL_ONLY,
-    )
+    if not _optional_inputs_safe(overlay.optional_inputs):
+        return _degraded_projection()
+    try:
+        return resolve_workstream(
+            overlay.registry,
+            lambda head: readers.load_overlay_revision(overlay.registry.id, head),
+            optional_inputs=overlay.optional_inputs,
+            expected_storage_class=StorageClass.LOCAL_ONLY,
+        )
+    except Exception:
+        return _invalid_projection()
 
 
 def _read_optional_inputs(readers: ContextReaders, workstream_id: str) -> Sequence[object]:
@@ -152,6 +157,17 @@ def _read_optional_inputs(readers: ContextReaders, workstream_id: str) -> Sequen
     if isinstance(optional, (str, bytes)) or not isinstance(optional, Sequence):
         return (OptionalInputUnavailable("optional input is malformed"),)
     return optional
+
+
+def _optional_inputs_safe(value: object) -> bool:
+    try:
+        return (
+            not isinstance(value, (str, bytes))
+            and isinstance(value, Sequence)
+            and all(item is True for item in value)
+        )
+    except Exception:
+        return False
 
 
 def _effective_state(portable: ResolutionState, overlay: ResolutionState) -> ResolutionState:
@@ -170,6 +186,10 @@ def _invalid_projection() -> ResolvedWorkstream:
     return ResolvedWorkstream(ResolutionState.INVALID, None, (), (), None, ("unreadable",))
 
 
+def _degraded_projection() -> ResolvedWorkstream:
+    return ResolvedWorkstream(ResolutionState.DEGRADED, None, (), (), None, ("optional input unavailable",))
+
+
 def _render_effective(
     portable: ResolvedWorkstream,
     overlay: ResolvedWorkstream | None,
@@ -184,7 +204,7 @@ def _render_effective(
         "",
         _render_layer("Portable base", portable),
     ]
-    if overlay is not None and overlay.state is not ResolutionState.INVALID:
+    if overlay is not None and overlay.state in {ResolutionState.RESOLVED, ResolutionState.DIVERGENT}:
         lines.extend(("", _render_layer("Local foreground", overlay)))
     return "\n".join(lines) + "\n"
 
