@@ -17,7 +17,7 @@ from mneme.core.artifacts import (
     StorageClass,
 )
 from mneme.core.errors import ConcurrentWrite, InvalidArtifact, MadiError
-from mneme.core.policy import PolicyRef, PolicyStore
+from mneme.core.policy import PolicyRef, PolicyStore, admission_mutation
 from mneme.core.validation.vault import validate_identifier
 
 
@@ -168,6 +168,7 @@ class RegistryStore:
         self._vault = vault
         self.storage_class = storage_class
 
+    @admission_mutation
     def create_workstream(
         self,
         workstream_id: str,
@@ -194,6 +195,7 @@ class RegistryStore:
         )
         return registry
 
+    @admission_mutation
     def register_project(
         self,
         project_id: str,
@@ -211,6 +213,7 @@ class RegistryStore:
         )
         return registry
 
+    @admission_mutation
     def register_source(
         self,
         source_id: str,
@@ -251,6 +254,7 @@ class RegistryStore:
         self._validate_project_reference(registry.project)
         return registry
 
+    @admission_mutation
     def assign_project_policy(
         self, project_id: str, policy_ref: PolicyRef, *, expected_generation: int
     ) -> ProjectRegistry:
@@ -272,6 +276,7 @@ class RegistryStore:
             raise RegistryConflict("project generation is stale") from exc
         return updated
 
+    @admission_mutation
     def assign_source_policy(
         self, source_id: str, policy_ref: PolicyRef, *, expected_generation: int
     ) -> SourceRegistry:
@@ -352,6 +357,7 @@ class RegistryStore:
         self._validate_workstream_policies(registry)
         return registry
 
+    @admission_mutation
     def update_workstream(
         self, registry: WorkstreamRegistry, *, expected_generation: int
     ) -> WorkstreamRegistry:

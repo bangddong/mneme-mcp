@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from threading import Barrier, local, Thread
+from threading import Barrier, Event, local, Thread
 
 import pytest
 
@@ -269,6 +269,160 @@ def test_write_accepts_receipt_covering_all_applicable_source_policy_inputs(
     )
 
     assert SessionStore(vault).create_revision(request).revision == "000001"
+
+
+def test_write_derives_restrictive_typed_source_relation_provenance(vault, valid_checkpoint):
+    """Catches relation provenance bypassing a referenced source's policy ceiling."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import RegistryStore
+    from mneme.core.sessions import SessionProvenanceRef, SessionRelation, SessionStore
+
+    policy = PolicyStore(vault).create_revision(
+        "relation-source-ceiling", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    source = RegistryStore(vault).register_source("source-relation")
+    RegistryStore(vault).assign_source_policy(source.id, policy, expected_generation=0)
+    relation = SessionRelation(
+        "handoff", "agent-b", "continue", "checkpoint", "resume",
+        (SessionProvenanceRef("source", StorageClass.PORTABLE, source.id),),
+    )
+
+    with pytest.raises(InvalidArtifact, match="policy receipt"):
+        SessionStore(vault).create_revision(valid_checkpoint(relations=(relation,)))
+
+    assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000001.md").exists()
+
+
+def test_portable_checkpoint_rejects_untyped_relation_provenance(vault, valid_checkpoint):
+    """Catches Core guessing whether an untyped portable provenance ID is a source."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.sessions import SessionRelation, SessionStore
+
+    relation = SessionRelation(
+        "handoff", "agent-b", "continue", "checkpoint", "resume",
+        (ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, "ambiguous"),),
+    )
+
+    with pytest.raises(PortabilityViolation, match="typed"):
+        SessionStore(vault).create_revision(valid_checkpoint(relations=(relation,)))
+
+
+def test_typed_non_source_relation_provenance_does_not_require_source_registry(
+    vault, valid_checkpoint
+):
+    """Catches a typed non-source provenance relation being guessed as a source."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.sessions import SessionProvenanceRef, SessionRelation, SessionStore
+
+    relation = SessionRelation(
+        "handoff", "agent-b", "continue", "checkpoint", "resume",
+        (SessionProvenanceRef("memory", StorageClass.PORTABLE, "memory-1"),),
+    )
+
+    assert SessionStore(vault).create_revision(valid_checkpoint(relations=(relation,))).revision == "000001"
+
+
+def test_checkpoint_publication_holds_gate_against_default_policy_tightening(
+    vault, valid_checkpoint, monkeypatch
+):
+    """Catches a default-policy activation linearizing between admission and write."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore
+    from mneme.core.sessions import SessionStore
+
+    policies = PolicyStore(vault)
+    tightening = policies.create_revision(
+        "vault-default", "2", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    started, finished = Event(), Event()
+    workers = []
+
+    def activate():
+        started.set()
+        policies.activate(tightening, expected_generation=1)
+        finished.set()
+
+    store = SessionStore(vault)
+    original = store._document
+
+    def publish_after_check(*args):
+        if workers:
+            return original(*args)
+        writer = Thread(target=activate)
+        workers.append(writer)
+        writer.start()
+        assert started.wait(1)
+        assert not finished.wait(0.1)
+        return original(*args)
+
+    monkeypatch.setattr(store, "_document", publish_after_check)
+    ref = store.create_revision(valid_checkpoint())
+    workers[0].join(timeout=5)
+
+    assert ref.revision == "000001"
+    assert finished.is_set()
+    assert policies.load_active("vault-default", StorageClass.PORTABLE) == tightening
+
+
+@pytest.mark.parametrize("mutation", ["source", "project", "workstream"])
+def test_applicability_registry_mutations_share_policy_admission_gate(vault, mutation):
+    """Catches an assignment or workstream change bypassing checkpoint admission lock."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore, policy_admission_gate
+    from mneme.core.registries import RegistryStore
+
+    policies = PolicyStore(vault)
+    policy = policies.create_revision(
+        f"{mutation}-policy", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    registries = RegistryStore(vault)
+    if mutation == "source":
+        source = registries.register_source("source-gated")
+        action = lambda: registries.assign_source_policy(source.id, policy, expected_generation=0)
+    elif mutation == "project":
+        project = registries.register_project("project-gated")
+        action = lambda: registries.assign_project_policy(project.id, policy, expected_generation=0)
+    else:
+        workstream = registries.create_workstream("ws-gated", project=None, mode="parallel")
+        action = lambda: registries.update_workstream(
+            workstream.with_policy_refs((policy,)), expected_generation=0
+        )
+    finished = Event()
+
+    def mutate():
+        action()
+        finished.set()
+
+    with policy_admission_gate(vault):
+        worker = Thread(target=mutate)
+        worker.start()
+        assert not finished.wait(0.1)
+    worker.join(timeout=5)
+
+    assert finished.is_set()
+
+
+def test_policy_admission_gate_releases_after_checkpoint_validation_exception(
+    vault, valid_checkpoint
+):
+    """Catches a failed admission leaving later canonical mutations deadlocked."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.policy import PolicyStore
+    from mneme.core.sessions import SessionStore
+
+    with pytest.raises(InvalidArtifact):
+        SessionStore(vault).create_revision(
+            replace(valid_checkpoint(), body=replace(valid_checkpoint().body, objective="mismatch"))
+        )
+
+    created = PolicyStore(vault).create_revision(
+        "post-failure", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    assert created.revision == "1"
 
 
 def test_revision_timestamp_is_canonical_utc_and_decoded(vault, valid_checkpoint):

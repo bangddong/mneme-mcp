@@ -31,6 +31,7 @@ from mneme.core.policy import (
     PolicyStore,
     Portability,
     evaluate_portability,
+    policy_admission_gate,
 )
 from mneme.core.registries import HeadRef, RegistryConflict, RegistryStore
 from mneme.core.validation.vault import validate_identifier
@@ -81,6 +82,24 @@ class SessionBody:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionProvenanceRef:
+    """Typed relation provenance; only ``source`` participates in policy input."""
+
+    kind: str
+    storage_class: StorageClass
+    id: str
+
+    def __post_init__(self) -> None:
+        validate_identifier(self.kind, label="provenance kind")
+        if not isinstance(self.storage_class, StorageClass):
+            raise InvalidArtifact("provenance reference requires a StorageClass")
+        validate_identifier(self.id, label="provenance id")
+
+    def as_artifact_reference(self) -> ArtifactReference:
+        return ArtifactReference(ReferenceKind.ID, self.storage_class, self.id)
+
+
+@dataclass(frozen=True, slots=True)
 class SessionRelation:
     """An append-only handoff/continuation relation recorded at one boundary."""
 
@@ -89,7 +108,7 @@ class SessionRelation:
     purpose: str
     required_context: str
     next_action: str
-    provenance_refs: tuple[ArtifactReference, ...] = ()
+    provenance_refs: tuple[ArtifactReference | SessionProvenanceRef, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind not in {"handoff", "continues_from"}:
@@ -101,7 +120,13 @@ class SessionRelation:
             ("relation next action", self.next_action),
         ):
             _require_text(value, label)
-        _require_references(self.provenance_refs, "relation provenance refs")
+        if not isinstance(self.provenance_refs, tuple) or not all(
+            isinstance(item, (ArtifactReference, SessionProvenanceRef))
+            for item in self.provenance_refs
+        ):
+            raise InvalidArtifact(
+                "relation provenance refs must be typed provenance or ArtifactReference values"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,26 +193,30 @@ class SessionStore:
             raise InvalidArtifact("create_revision requires a CheckpointRequest")
         if request.storage_class is not self.storage_class:
             raise InvalidArtifact("checkpoint storage class does not match SessionStore")
-        self._validate_request_references(request)
-        observed = self.registries.load_workstream(request.workstream_id)
-        if observed.generation != request.expected_registry_generation:
-            raise RegistryConflict("workstream generation is stale")
-        self._validate_write_policy_binding(request, observed)
-        request = replace(
-            request,
-            revision_timestamp=_canonical_timestamp(
-                request.revision_timestamp if request.revision_timestamp is not None else self._clock()
-            ),
-        )
-        revision = self._next_revision(request)
-        ref = SessionRevisionRef(request.session_id, revision)
-        document = self._document(request, ref)
-        self._vault.artifacts.write_new(
-            ArtifactFamily.SESSION,
-            storage_class=self.storage_class,
-            relative_path=self._revision_path(request.workstream_id, ref),
-            document=document,
-        )
+        # Lock order is admission gate then any ArtifactStore path lock.  Do not
+        # call registry mutation APIs here: head advancement intentionally runs
+        # after release so a later conflict leaves a doctor-visible orphan.
+        with policy_admission_gate(self._vault):
+            self._validate_request_references(request)
+            observed = self.registries.load_workstream(request.workstream_id)
+            if observed.generation != request.expected_registry_generation:
+                raise RegistryConflict("workstream generation is stale")
+            self._validate_write_policy_binding(request, observed)
+            request = replace(
+                request,
+                revision_timestamp=_canonical_timestamp(
+                    request.revision_timestamp if request.revision_timestamp is not None else self._clock()
+                ),
+            )
+            revision = self._next_revision(request)
+            ref = SessionRevisionRef(request.session_id, revision)
+            document = self._document(request, ref)
+            self._vault.artifacts.write_new(
+                ArtifactFamily.SESSION,
+                storage_class=self.storage_class,
+                relative_path=self._revision_path(request.workstream_id, ref),
+                document=document,
+            )
         self._advance_head(request, ref, observed)
         return ref
 
@@ -310,12 +339,20 @@ class SessionStore:
         if request.storage_class is not StorageClass.PORTABLE:
             return
         references = request.body.source_refs + tuple(
-            reference
+            _provenance_artifact_reference(reference)
             for relation in request.relations
             for reference in relation.provenance_refs
         )
         if any(reference.storage_class is StorageClass.LOCAL_ONLY for reference in references):
             raise PortabilityViolation("portable checkpoint contains local-only references")
+        if any(
+            isinstance(reference, ArtifactReference)
+            for relation in request.relations
+            for reference in relation.provenance_refs
+        ):
+            raise PortabilityViolation(
+                "portable checkpoint provenance requires explicit typed references"
+            )
 
     def _applicable_policy_rules(
         self, request: CheckpointRequest, observed: object
@@ -351,6 +388,10 @@ class SessionStore:
                 if not isinstance(reference.value, str):
                     raise InvalidArtifact("source registry id must be text")
                 source_ids.append(reference.value)
+        for relation in request.relations:
+            for provenance in relation.provenance_refs:
+                if isinstance(provenance, SessionProvenanceRef) and provenance.kind == "source":
+                    source_ids.append(provenance.id)
         return tuple(dict.fromkeys(source_ids))
 
     def _load_source(self, source_id: str):
@@ -412,7 +453,9 @@ class SessionStore:
         }
         metadata_refs = _policy_references(request.policy_evaluation, self.storage_class)
         body_refs = request.body.source_refs + tuple(
-            reference for relation in request.relations for reference in relation.provenance_refs
+            _provenance_artifact_reference(reference)
+            for relation in request.relations
+            for reference in relation.provenance_refs
         )
         return ArtifactDocument(
             metadata=metadata,
@@ -572,7 +615,41 @@ def _parse_references(value: object, label: str) -> tuple[ArtifactReference, ...
 def _serialize_relation(relation: SessionRelation) -> dict[str, Any]:
     return {"kind": relation.kind, "target": relation.target, "purpose": relation.purpose,
             "required_context": relation.required_context, "next_action": relation.next_action,
-            "provenance_refs": [_serialize_reference(item) for item in relation.provenance_refs]}
+            "provenance_refs": [_serialize_provenance(item) for item in relation.provenance_refs]}
+
+
+def _provenance_artifact_reference(
+    value: ArtifactReference | SessionProvenanceRef,
+) -> ArtifactReference:
+    return value if isinstance(value, ArtifactReference) else value.as_artifact_reference()
+
+
+def _serialize_provenance(
+    value: ArtifactReference | SessionProvenanceRef,
+) -> dict[str, Any]:
+    if isinstance(value, ArtifactReference):
+        return _serialize_reference(value)
+    return {
+        "type": "typed",
+        "kind": value.kind,
+        "storage_class": value.storage_class.value,
+        "id": value.id,
+    }
+
+
+def _parse_provenance(
+    value: object,
+) -> ArtifactReference | SessionProvenanceRef:
+    if isinstance(value, dict) and value.get("type") == "typed":
+        if set(value) != {"type", "kind", "storage_class", "id"}:
+            raise InvalidArtifact("typed provenance has an invalid schema")
+        try:
+            return SessionProvenanceRef(
+                value["kind"], StorageClass(value["storage_class"]), value["id"]
+            )
+        except ValueError as exc:
+            raise InvalidArtifact("typed provenance has invalid values") from exc
+    return _parse_reference(value)
 
 
 def _parse_relations(value: object) -> tuple[SessionRelation, ...]:
@@ -582,7 +659,10 @@ def _parse_relations(value: object) -> tuple[SessionRelation, ...]:
     for item in value:
         if not isinstance(item, dict) or set(item) != {"kind", "target", "purpose", "required_context", "next_action", "provenance_refs"}:
             raise InvalidArtifact("session relation has an invalid schema")
-        parsed.append(SessionRelation(item["kind"], item["target"], item["purpose"], item["required_context"], item["next_action"], _parse_references(item["provenance_refs"], "relation provenance refs")))
+        provenance = item["provenance_refs"]
+        if not isinstance(provenance, list):
+            raise InvalidArtifact("session relation provenance refs must be a list")
+        parsed.append(SessionRelation(item["kind"], item["target"], item["purpose"], item["required_context"], item["next_action"], tuple(_parse_provenance(value) for value in provenance)))
     return tuple(parsed)
 
 

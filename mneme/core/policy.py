@@ -8,12 +8,15 @@ rules and returns a new immutable receipt for every decision.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
 import math
+from pathlib import Path
 import re
+import threading
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
@@ -26,6 +29,7 @@ from mneme.core.artifacts import (
     StorageClass,
 )
 from mneme.core.errors import ArtifactExists, InvalidArtifact, MadiError
+from mneme.core.fs import exclusive_file_lock
 
 if TYPE_CHECKING:
     from mneme.core.vault import Vault
@@ -45,6 +49,32 @@ _POLICY_INDEX_SCHEMA: Final = "madi.policy-index.v1"
 _DEFAULT_POLICY_ID: Final = "vault-default"
 _DEFAULT_POLICY_REVISION: Final = "1"
 _DEFAULT_POLICY_RULE: Final = {"ceiling": "personal-vault"}
+_admission_locks_guard = threading.Lock()
+_admission_locks: dict[Path, threading.Lock] = {}
+
+
+@contextmanager
+def policy_admission_gate(vault: Vault):
+    """Serialize applicability mutations before per-artifact CAS locks.
+
+    Every caller acquires this machine-local gate before an artifact-specific
+    lock.  Session publication uses the same order, so no policy assignment can
+    linearize between its canonical admission snapshot and immutable write.
+    """
+    path = vault.local_root / "locks" / "policy-admission.lock"
+    with _admission_locks_guard:
+        process_lock = _admission_locks.setdefault(path.resolve(strict=False), threading.Lock())
+    with process_lock:
+        with exclusive_file_lock(path):
+            yield
+
+
+def admission_mutation(method):
+    """Wrap a public canonical mutation in the policy-admission gate."""
+    def guarded(self, *args, **kwargs):
+        with policy_admission_gate(self._vault):
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 class PolicyError(MadiError):
@@ -220,6 +250,7 @@ class PolicyStore:
     def __init__(self, vault: Vault):
         self._vault = vault
 
+    @admission_mutation
     def create_revision(
         self,
         policy_id: str,
@@ -243,6 +274,7 @@ class PolicyStore:
         )
         return PolicyRef(policy_id, revision, sha256(encoded.encode("utf-8")).hexdigest())
 
+    @admission_mutation
     def activate(self, policy_ref: PolicyRef, expected_generation: int) -> PolicyIndex:
         """CAS-advance the index that owns an immutable policy revision."""
         if not isinstance(policy_ref, PolicyRef):
