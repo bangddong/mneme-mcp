@@ -495,6 +495,10 @@ class SessionStore:
             workstream_id, ref.session, self.storage_class, _parse_parent(metadata.get("parent")),
             0, body, relations, receipt, _parse_timestamp(metadata.get("timestamp")),
         )
+        # Decode applies the same one-way provenance boundary as admission.
+        # This is structural only: it intentionally does not consult current
+        # policy pointers, so historic receipts remain auditable.
+        self._validate_request_references(request)
         self._validate_read_policy_binding(request)
         if metadata.get("semantic_hash") != receipt.semantic_hash:
             raise InvalidArtifact("session revision semantic hash is not receipt-bound")

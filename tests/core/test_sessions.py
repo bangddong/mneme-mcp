@@ -16,7 +16,7 @@ def vault(tmp_path):
 
 @pytest.fixture
 def valid_checkpoint(vault):
-    from mneme.core.artifacts import StorageClass
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
     from mneme.core.policy import PolicyRule, PolicyStore, Portability, evaluate_portability
     from mneme.core.registries import RegistryStore
     from mneme.core.sessions import CheckpointRequest, SessionBody, session_semantic_hash
@@ -322,7 +322,52 @@ def test_typed_non_source_relation_provenance_does_not_require_source_registry(
         (SessionProvenanceRef("memory", StorageClass.PORTABLE, "memory-1"),),
     )
 
-    assert SessionStore(vault).create_revision(valid_checkpoint(relations=(relation,))).revision == "000001"
+    store = SessionStore(vault)
+    ref = store.create_revision(valid_checkpoint(relations=(relation,)))
+
+    assert store.read_revision(ref, workstream_id="ws-1").relations == (relation,)
+
+
+def test_portable_decode_rejects_forged_untyped_relation_provenance(
+    vault, valid_checkpoint
+):
+    """Catches a forged portable revision bypassing write-only provenance checks."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.errors import PortabilityViolation
+    from mneme.core.fs import dump_frontmatter, read_frontmatter
+    from mneme.core.sessions import (
+        SessionProvenanceRef,
+        SessionRelation,
+        SessionStore,
+        session_semantic_hash,
+    )
+
+    typed = SessionRelation(
+        "handoff", "agent-b", "continue", "checkpoint", "resume",
+        (SessionProvenanceRef("memory", StorageClass.PORTABLE, "memory-1"),),
+    )
+    store = SessionStore(vault)
+    ref = store.create_revision(valid_checkpoint(relations=(typed,)))
+    forged = SessionRelation(
+        "handoff", "agent-b", "continue", "checkpoint", "resume",
+        (ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, "memory-1"),),
+    )
+    forged_hash = session_semantic_hash(valid_checkpoint().body, (forged,))
+    path = vault.root / "workstreams/ws-1/sessions/ses-1/000001.md"
+    metadata, body_text = read_frontmatter(path)
+    metadata["relations"][0]["provenance_refs"] = [{
+        "kind": "id", "storage_class": "portable", "value": "memory-1"
+    }]
+    metadata["semantic_hash"] = forged_hash
+    metadata["policy_receipt"]["semantic_hash"] = forged_hash
+    body_text = body_text.replace(
+        '"id": "memory-1", "kind": "memory", "storage_class": "portable", "type": "typed"',
+        '"kind": "id", "storage_class": "portable", "value": "memory-1"',
+    )
+    path.write_text(dump_frontmatter(metadata, body_text), encoding="utf-8")
+
+    with pytest.raises(PortabilityViolation, match="typed"):
+        store.read_revision(ref, workstream_id="ws-1")
 
 
 def test_checkpoint_publication_holds_gate_against_default_policy_tightening(
@@ -656,6 +701,7 @@ def test_local_checkpoint_uses_same_codec_and_self_contained_decoder(vault):
         __import__("mneme.core.artifacts", fromlist=["ArtifactFamily"]).ArtifactFamily.SESSION,
         location=location,
     ).metadata["schema"] == "madi.session-revision.v1"
+    assert store.read_revision(ref, workstream_id="ws-local").revision_timestamp is not None
     location.path.write_text("---\nschema: madi.session-revision.v1\n---\ntampered\n", encoding="utf-8")
     with pytest.raises(InvalidArtifact):
         store.read_revision(ref, workstream_id="ws-local")
