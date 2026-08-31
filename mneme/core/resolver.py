@@ -7,8 +7,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact
 from mneme.core.registries import HeadRef, WorkstreamRegistry
+from mneme.core.sessions import SessionBody
+from mneme.core.validation.vault import validate_identifier
 
 
 class ResolutionState(str, Enum):
@@ -22,6 +25,31 @@ class ResolutionState(str, Enum):
 
 class OptionalInputUnavailable(Exception):
     """An optional mount, index, or equivalent read input is unavailable."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionRevision:
+    """A resolver-safe result from a validating Session reader.
+
+    The reader boundary is responsible for decoding and validating immutable
+    storage.  This value repeats the requested identity at the projection
+    boundary so a result from another head, workstream, or storage class cannot
+    be substituted into CURRENT.
+    """
+
+    head: HeadRef
+    workstream_id: str
+    storage_class: StorageClass
+    body: SessionBody
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.head, HeadRef):
+            raise InvalidArtifact("resolved revision requires a HeadRef")
+        validate_identifier(self.workstream_id, label="workstream id")
+        if not isinstance(self.storage_class, StorageClass):
+            raise InvalidArtifact("resolved revision requires a StorageClass")
+        if not isinstance(self.body, SessionBody):
+            raise InvalidArtifact("resolved revision requires a validated SessionBody")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +78,7 @@ def resolve_workstream(
     load_revision: Callable[[HeadRef], object],
     *,
     optional_inputs: Sequence[object] = (),
+    expected_storage_class: StorageClass = StorageClass.PORTABLE,
 ) -> ResolvedWorkstream:
     """Resolve only heads explicitly declared in ``registry``.
 
@@ -59,7 +88,7 @@ def resolve_workstream(
     searches a session directory, reads a timestamp, or mutates canonical state.
     """
 
-    if not callable(load_revision):
+    if not callable(load_revision) or not isinstance(expected_storage_class, StorageClass):
         return _invalid(None, (), "revision reader is invalid")
     validation = _validate_registry(registry)
     if validation is not None:
@@ -77,8 +106,8 @@ def resolve_workstream(
             revision = load_revision(head)
         except Exception as exc:  # Reader validation includes malformed/tampered revisions.
             return _invalid(registry, heads, f"active revision is unreadable: {type(exc).__name__}")
-        if revision is None:
-            return _invalid(registry, heads, "active revision is missing")
+        if not _valid_revision(revision, head, registry.id, expected_storage_class):
+            return _invalid(registry, heads, "active revision is invalid")
         loaded.append((head, revision))
 
     state = (
@@ -86,7 +115,7 @@ def resolve_workstream(
         if registry.mode == "parallel" and len(heads) > 1
         else ResolutionState.RESOLVED
     )
-    if any(_optional_unavailable(item) for item in optional_inputs):
+    if _optional_inputs_degraded(optional_inputs):
         state = ResolutionState.DEGRADED
     selected = registry.preferred_head if registry.mode == "preferred" else (
         heads[0] if len(heads) == 1 else None
@@ -140,7 +169,37 @@ def _validate_registry(registry: object) -> str | None:
 
 
 def _optional_unavailable(value: object) -> bool:
-    return isinstance(value, OptionalInputUnavailable) or value is False
+    return isinstance(value, OptionalInputUnavailable) or value is not True
+
+
+def _optional_inputs_degraded(optional_inputs: object) -> bool:
+    if isinstance(optional_inputs, (str, bytes)) or not isinstance(optional_inputs, Sequence):
+        return True
+    return any(_optional_unavailable(item) for item in optional_inputs)
+
+
+def _valid_revision(
+    revision: object,
+    head: HeadRef,
+    workstream_id: str,
+    storage_class: StorageClass,
+) -> bool:
+    if not isinstance(revision, SessionRevision):
+        return False
+    try:
+        SessionRevision(
+            revision.head,
+            revision.workstream_id,
+            revision.storage_class,
+            revision.body,
+        )
+    except (InvalidArtifact, TypeError):
+        return False
+    return (
+        revision.head == head
+        and revision.workstream_id == workstream_id
+        and revision.storage_class is storage_class
+    )
 
 
 def _invalid(

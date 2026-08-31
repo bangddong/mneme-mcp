@@ -11,8 +11,10 @@ from mneme.core.resolver import (
     OptionalInputUnavailable,
     ResolutionState,
     ResolvedWorkstream,
+    SessionRevision,
     resolve_workstream,
 )
+from mneme.core.artifacts import StorageClass
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,11 +107,15 @@ def render_current(
 def _resolve_portable(readers: ContextReaders, workstream_id: str) -> ResolvedWorkstream:
     try:
         registry = readers.load_portable_workstream(workstream_id)
-        optional = tuple(readers.portable_optional_inputs(workstream_id)) if readers.portable_optional_inputs else ()
+    except Exception:
+        return _invalid_projection()
+    optional = _read_optional_inputs(readers, workstream_id)
+    try:
         return resolve_workstream(
             registry,
             lambda head: readers.load_portable_revision(workstream_id, head),
             optional_inputs=optional,
+            expected_storage_class=StorageClass.PORTABLE,
         )
     except Exception:
         return _invalid_projection()
@@ -130,9 +136,22 @@ def _resolve_overlay(readers: ContextReaders, workstream_id: str) -> ResolvedWor
         return _invalid_projection()
     return resolve_workstream(
         overlay.registry,
-        lambda head: readers.load_overlay_revision(workstream_id, head),
+        lambda head: readers.load_overlay_revision(overlay.registry.id, head),
         optional_inputs=overlay.optional_inputs,
+        expected_storage_class=StorageClass.LOCAL_ONLY,
     )
+
+
+def _read_optional_inputs(readers: ContextReaders, workstream_id: str) -> Sequence[object]:
+    if readers.portable_optional_inputs is None:
+        return ()
+    try:
+        optional = readers.portable_optional_inputs(workstream_id)
+    except Exception:
+        return (OptionalInputUnavailable("optional input unavailable"),)
+    if isinstance(optional, (str, bytes)) or not isinstance(optional, Sequence):
+        return (OptionalInputUnavailable("optional input is malformed"),)
+    return optional
 
 
 def _effective_state(portable: ResolutionState, overlay: ResolutionState) -> ResolutionState:
@@ -185,15 +204,7 @@ def _render_layer(label: str, resolved: ResolvedWorkstream) -> str:
 
 
 def _revision_text(revision: object) -> str:
-    if isinstance(revision, str):
-        return revision
-    text = getattr(revision, "text", None)
-    if isinstance(text, str):
-        return text
-    body = getattr(revision, "body", None)
-    if body is not None:
-        objective = getattr(body, "objective", None)
-        current_state = getattr(body, "current_state", None)
-        if isinstance(objective, str) and isinstance(current_state, str):
-            return f"Objective: {objective}\n\nCurrent state: {current_state}"
-    return "Revision content is available."
+    if not isinstance(revision, SessionRevision):
+        return "Validated revision content is unavailable."
+    body = revision.body
+    return f"Objective: {body.objective}\n\nCurrent state: {body.current_state}"

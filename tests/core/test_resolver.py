@@ -1,8 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
+
+
+def _revision(head, *, workstream_id="ws-1", storage_class=None):
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.resolver import SessionRevision
+    from mneme.core.sessions import SessionBody
+
+    return SessionRevision(
+        head=head,
+        workstream_id=workstream_id,
+        storage_class=storage_class or StorageClass.PORTABLE,
+        body=SessionBody(
+            adapter_id="codex",
+            objective="Validated objective",
+            current_state="Validated state",
+            verified_facts=("Validated fact",),
+            completed_work=(),
+            blockers=(),
+            next_actions=("Continue",),
+            source_refs=(),
+        ),
+    )
 
 
 @pytest.fixture
@@ -39,7 +59,7 @@ def test_resolution_states(registry_factory, mode, heads, preferred, expected):
     from mneme.core.resolver import resolve_workstream
 
     registry = registry_factory(mode, heads, preferred)
-    loaded = {head: object() for head in registry.active_heads}
+    loaded = {head: _revision(head) for head in registry.active_heads}
 
     assert resolve_workstream(registry, loaded.get).state.value == expected
 
@@ -48,9 +68,7 @@ def test_closed_empty_workstream_is_a_resolved_empty_projection(registry_factory
     """Catches a closed registry with no active heads being rejected as corruption."""
     from mneme.core.resolver import resolve_workstream
 
-    resolved = resolve_workstream(
-        registry_factory("single", [], None, status="closed"), lambda _head: None
-    )
+    resolved = resolve_workstream(registry_factory("single", [], None, status="closed"), lambda _head: None)
 
     assert resolved.state.value == "resolved"
     assert resolved.heads == ()
@@ -72,7 +90,7 @@ def test_unavailable_optional_input_degrades_a_valid_resolution(registry_factory
 
     registry = registry_factory("single", ["a"], None)
     resolved = resolve_workstream(
-        registry, lambda _head: object(), optional_inputs=(OptionalInputUnavailable("mount unavailable"),)
+        registry, lambda head: _revision(head), optional_inputs=(OptionalInputUnavailable("mount unavailable"),)
     )
 
     assert resolved.state.value == "degraded"
@@ -88,7 +106,7 @@ def test_explicit_heads_are_sorted_and_unlisted_revisions_are_never_loaded(regis
 
     def load(head):
         calls.append(head)
-        return object()
+        return _revision(head)
 
     resolved = resolve_workstream(registry, load)
 
@@ -104,7 +122,7 @@ def test_tampered_registry_or_revision_is_invalid(registry_factory):
     valid = registry_factory("single", ["a"], None)
     object.__setattr__(valid, "active_heads", (valid.active_heads[0], valid.active_heads[0]))
 
-    assert resolve_workstream(valid, lambda _head: object()).state.value == "invalid"
+    assert resolve_workstream(valid, lambda head: _revision(head)).state.value == "invalid"
     intact = registry_factory("single", ["a"], None)
     assert resolve_workstream(
         intact, lambda _head: (_ for _ in ()).throw(InvalidArtifact("forged revision"))
@@ -118,4 +136,32 @@ def test_tampered_registry_identity_or_generation_is_invalid(registry_factory):
     registry = registry_factory("single", ["a"], None)
     object.__setattr__(registry, "generation", -1)
 
-    assert resolve_workstream(registry, lambda _head: object()).state.value == "invalid"
+    assert resolve_workstream(registry, lambda head: _revision(head)).state.value == "invalid"
+
+
+@pytest.mark.parametrize(
+    ("returned", "expected"),
+    [
+        (lambda head: object(), "invalid"),
+        (lambda head: _revision(head, workstream_id="other-workstream"), "invalid"),
+        (lambda head: _revision(head, storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY), "invalid"),
+        (lambda head: _revision(__import__("mneme.core.registries", fromlist=["HeadRef"]).HeadRef("other-session", head.revision)), "invalid"),
+        (lambda head: _revision(head), "resolved"),
+    ],
+)
+def test_revision_reader_requires_a_typed_exact_portable_session(registry_factory, returned, expected):
+    """Catches a foreign, local, or arbitrary reader value entering canonical CURRENT."""
+    from mneme.core.resolver import resolve_workstream
+
+    assert resolve_workstream(registry_factory("single", ["a"], None), returned).state.value == expected
+
+
+def test_required_reader_exception_is_invalid_but_malformed_optional_inputs_degrade(registry_factory):
+    """Catches treating required canonical loss like an optional mount failure."""
+    from mneme.core.resolver import resolve_workstream
+
+    registry = registry_factory("single", ["a"], None)
+    assert resolve_workstream(
+        registry, lambda _head: (_ for _ in ()).throw(FileNotFoundError("revision missing"))
+    ).state.value == "invalid"
+    assert resolve_workstream(registry, lambda head: _revision(head), optional_inputs=object()).state.value == "degraded"
