@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -18,16 +19,18 @@ from mneme.core.artifacts import (
     ReferenceManifest,
     StorageClass,
 )
-from mneme.core.errors import InvalidArtifact
+from mneme.core.errors import InvalidArtifact, PortabilityViolation
 from mneme.core.policy import (
     ApprovedRuleProvenance,
     OpaquePolicyAttestation,
     PolicyEvaluation,
     PolicyReceiptRef,
     PolicyRef,
+    PolicyRule,
     PolicyViolation,
     PolicyStore,
     Portability,
+    evaluate_portability,
 )
 from mneme.core.registries import HeadRef, RegistryConflict, RegistryStore
 from mneme.core.validation.vault import validate_identifier
@@ -35,6 +38,7 @@ from mneme.core.validation.vault import validate_identifier
 
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
+_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 @dataclass(frozen=True, slots=True)
 class SessionRevisionRef:
     session: str
@@ -110,6 +114,7 @@ class CheckpointRequest:
     body: SessionBody
     relations: tuple[SessionRelation, ...]
     policy_evaluation: PolicyEvaluation
+    revision_timestamp: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_identifier(self.workstream_id, label="workstream id")
@@ -135,27 +140,45 @@ class CheckpointRequest:
             raise InvalidArtifact("checkpoint relations must be a tuple of SessionRelation values")
         if not isinstance(self.policy_evaluation, PolicyEvaluation):
             raise InvalidArtifact("checkpoint policy evaluation must be a PolicyEvaluation")
+        if self.revision_timestamp is not None:
+            _canonical_timestamp(self.revision_timestamp)
 
 
 class SessionStore:
     """Persist an immutable revision before attempting the registry head update."""
 
-    def __init__(self, vault: object, storage_class: StorageClass = StorageClass.PORTABLE):
+    def __init__(
+        self,
+        vault: object,
+        storage_class: StorageClass = StorageClass.PORTABLE,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ):
         if not isinstance(storage_class, StorageClass):
             raise InvalidArtifact("session store requires an explicit StorageClass")
         self._vault = vault
         self.storage_class = storage_class
         self.registries = RegistryStore(vault, storage_class=storage_class)
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        if not callable(self._clock):
+            raise InvalidArtifact("session clock must be callable")
 
     def create_revision(self, request: CheckpointRequest) -> SessionRevisionRef:
         if not isinstance(request, CheckpointRequest):
             raise InvalidArtifact("create_revision requires a CheckpointRequest")
         if request.storage_class is not self.storage_class:
             raise InvalidArtifact("checkpoint storage class does not match SessionStore")
-        self._validate_policy_binding(request)
+        self._validate_request_references(request)
         observed = self.registries.load_workstream(request.workstream_id)
         if observed.generation != request.expected_registry_generation:
             raise RegistryConflict("workstream generation is stale")
+        self._validate_write_policy_binding(request, observed)
+        request = replace(
+            request,
+            revision_timestamp=_canonical_timestamp(
+                request.revision_timestamp if request.revision_timestamp is not None else self._clock()
+            ),
+        )
         revision = self._next_revision(request)
         ref = SessionRevisionRef(request.session_id, revision)
         document = self._document(request, ref)
@@ -250,27 +273,109 @@ class SessionStore:
             raise InvalidArtifact("expected parent does not match current session lineage")
         return f"{numbers[-1] + 1:06d}"
 
-    def _validate_policy_binding(self, request: CheckpointRequest) -> None:
+    def _validate_write_policy_binding(self, request: CheckpointRequest, observed: object) -> None:
+        self._validate_receipt_semantics(request)
+        from mneme.core.registries import WorkstreamRegistry
+
+        if not isinstance(observed, WorkstreamRegistry):
+            raise InvalidArtifact("checkpoint observed workstream is invalid")
+        derived = evaluate_portability(
+            _requested_portability(request.storage_class),
+            self._applicable_policy_rules(request, observed),
+            session_semantic_hash(request.body, request.relations),
+        )
+        receipt = request.policy_evaluation
+        if not _same_policy_semantics(receipt, derived):
+            raise InvalidArtifact("policy receipt does not match current applicable policy inputs")
+        if not derived.allowed:
+            raise InvalidArtifact("checkpoint policy receipt does not allow this write")
+
+    def _validate_receipt_semantics(self, request: CheckpointRequest) -> None:
         receipt = request.policy_evaluation
         expected = session_semantic_hash(request.body, request.relations)
         if receipt.semantic_hash != expected:
             raise InvalidArtifact("policy receipt semantic hash does not bind checkpoint content")
+        if receipt.requested is not _requested_portability(request.storage_class):
+            raise InvalidArtifact("policy receipt portability does not match storage class")
         if not receipt.allowed:
             raise InvalidArtifact("checkpoint policy receipt does not allow this write")
-        requested_portability = (
-            Portability.LOCAL_ONLY
-            if request.storage_class is StorageClass.LOCAL_ONLY
-            else Portability.PERSONAL_VAULT
+
+    def _validate_read_policy_binding(self, request: CheckpointRequest) -> None:
+        self._validate_receipt_semantics(request)
+        for policy_ref in request.policy_evaluation.refs:
+            if isinstance(policy_ref, PolicyRef):
+                PolicyStore(self._vault).load_rule(policy_ref)
+
+    def _validate_request_references(self, request: CheckpointRequest) -> None:
+        if request.storage_class is not StorageClass.PORTABLE:
+            return
+        references = request.body.source_refs + tuple(
+            reference
+            for relation in request.relations
+            for reference in relation.provenance_refs
         )
-        if receipt.requested is not requested_portability:
-            raise InvalidArtifact("policy receipt portability does not match storage class")
-        if request.storage_class is StorageClass.PORTABLE and receipt.effective_ceiling < Portability.PERSONAL_VAULT:
-            raise InvalidArtifact("portable checkpoint exceeds the current policy ceiling")
-        for policy_ref in receipt.refs:
-            if isinstance(policy_ref, PolicyRef) and PolicyStore(self._vault).load_active(
-                policy_ref.policy_id, self.storage_class
-            ) != policy_ref:
-                raise InvalidArtifact("policy receipt does not name the current policy revision")
+        if any(reference.storage_class is StorageClass.LOCAL_ONLY for reference in references):
+            raise PortabilityViolation("portable checkpoint contains local-only references")
+
+    def _applicable_policy_rules(
+        self, request: CheckpointRequest, observed: object
+    ) -> tuple[PolicyRule, ...]:
+        from mneme.core.registries import WorkstreamRegistry
+
+        if not isinstance(observed, WorkstreamRegistry):
+            raise InvalidArtifact("checkpoint observed workstream is invalid")
+        policies = PolicyStore(self._vault)
+        refs: list[PolicyRef] = [
+            policies.load_active("vault-default", StorageClass.PORTABLE)
+        ]
+        refs.extend(observed.policy_refs)
+        project_ids: set[str] = set()
+        if observed.project is not None:
+            project_ids.add(observed.project)
+        for source_id in self._source_ids(request):
+            source = self._load_source(source_id)
+            if source.policy_ref is not None:
+                refs.append(source.policy_ref)
+            if source.project is not None:
+                project_ids.add(source.project)
+        for project_id in sorted(project_ids):
+            project = self._load_project(project_id)
+            if project.policy_ref is not None:
+                refs.append(project.policy_ref)
+        return tuple(policies.load_rule(policy_ref) for policy_ref in refs)
+
+    def _source_ids(self, request: CheckpointRequest) -> tuple[str, ...]:
+        source_ids: list[str] = []
+        for reference in request.body.source_refs:
+            if reference.kind is ReferenceKind.ID:
+                if not isinstance(reference.value, str):
+                    raise InvalidArtifact("source registry id must be text")
+                source_ids.append(reference.value)
+        return tuple(dict.fromkeys(source_ids))
+
+    def _load_source(self, source_id: str):
+        store = RegistryStore(self._vault, self.storage_class)
+        try:
+            return store.load_source(source_id)
+        except InvalidArtifact as local_error:
+            if self.storage_class is not StorageClass.LOCAL_ONLY:
+                raise
+            try:
+                return RegistryStore(self._vault, StorageClass.PORTABLE).load_source(source_id)
+            except InvalidArtifact:
+                raise local_error
+
+    def _load_project(self, project_id: str):
+        store = RegistryStore(self._vault, self.storage_class)
+        try:
+            return store.load_project(project_id)
+        except InvalidArtifact as local_error:
+            if self.storage_class is not StorageClass.LOCAL_ONLY:
+                raise
+            try:
+                return RegistryStore(self._vault, StorageClass.PORTABLE).load_project(project_id)
+            except InvalidArtifact:
+                raise local_error
 
     @staticmethod
     def _revision_path(workstream_id: str, ref: SessionRevisionRef) -> str:
@@ -291,6 +396,7 @@ class SessionStore:
             "workstream_id": request.workstream_id,
             "session_id": request.session_id,
             "revision": ref.revision,
+            "timestamp": _serialize_timestamp(request.revision_timestamp),
             "adapter_id": request.body.adapter_id,
             "parent": _serialize_parent(request.expected_parent),
             "objective": request.body.objective,
@@ -319,7 +425,7 @@ class SessionStore:
     ) -> CheckpointRequest:
         metadata = document.metadata
         if not isinstance(metadata, dict) or set(metadata) != {
-            "schema", "workstream_id", "session_id", "revision", "adapter_id", "parent",
+            "schema", "workstream_id", "session_id", "revision", "timestamp", "adapter_id", "parent",
             "objective", "current_state", "verified_facts", "completed_work", "blockers",
             "next_actions", "source_refs", "relations", "semantic_hash", "policy_receipt",
         }:
@@ -344,9 +450,9 @@ class SessionStore:
         receipt = _parse_receipt(metadata.get("policy_receipt"))
         request = CheckpointRequest(
             workstream_id, ref.session, self.storage_class, _parse_parent(metadata.get("parent")),
-            0, body, relations, receipt,
+            0, body, relations, receipt, _parse_timestamp(metadata.get("timestamp")),
         )
-        self._validate_policy_binding(request)
+        self._validate_read_policy_binding(request)
         if metadata.get("semantic_hash") != receipt.semantic_hash:
             raise InvalidArtifact("session revision semantic hash is not receipt-bound")
         if document.body != _render_body(body, relations):
@@ -377,6 +483,55 @@ def session_semantic_hash(body: SessionBody, relations: tuple[SessionRelation, .
     }
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _requested_portability(storage_class: StorageClass) -> Portability:
+    return (
+        Portability.LOCAL_ONLY
+        if storage_class is StorageClass.LOCAL_ONLY
+        else Portability.PERSONAL_VAULT
+    )
+
+
+def _same_policy_semantics(
+    supplied: PolicyEvaluation, derived: PolicyEvaluation
+) -> bool:
+    """Compare deterministic admission semantics, excluding evaluation wall time."""
+    return (
+        supplied.requested is derived.requested
+        and supplied.effective_ceiling is derived.effective_ceiling
+        and supplied.allowed is derived.allowed
+        and supplied.evaluator_version == derived.evaluator_version
+        and supplied.refs == derived.refs
+        and supplied.semantic_hash == derived.semantic_hash
+        and supplied.violations == derived.violations
+        and supplied.approved_rules == derived.approved_rules
+    )
+
+
+def _canonical_timestamp(value: object) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise InvalidArtifact("session revision timestamp must be an aware datetime")
+    try:
+        normalized = value.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise InvalidArtifact("session revision timestamp is invalid") from exc
+    return normalized
+
+
+def _serialize_timestamp(value: object) -> str:
+    timestamp = _canonical_timestamp(value)
+    return timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _parse_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or not _TIMESTAMP.fullmatch(value):
+        raise InvalidArtifact("session revision timestamp must be canonical RFC3339 UTC")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as exc:
+        raise InvalidArtifact("session revision timestamp is invalid") from exc
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 def _require_text(value: object, label: str) -> str:

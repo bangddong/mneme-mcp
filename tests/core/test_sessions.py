@@ -1,6 +1,7 @@
 """Immutable, self-contained Session checkpoint contracts."""
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from threading import Barrier, local, Thread
 
 import pytest
@@ -148,6 +149,199 @@ def test_policy_receipt_must_bind_exact_semantic_body_before_writing(vault, vali
     assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000001.md").exists()
 
 
+def test_write_derives_restrictive_workstream_policy_not_present_in_caller_receipt(
+    vault, valid_checkpoint
+):
+    """Catches a caller omitting the workstream's restrictive policy input."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import RegistryStore
+    from mneme.core.sessions import SessionStore
+
+    policy = PolicyStore(vault).create_revision(
+        "workstream-ceiling", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    registries = RegistryStore(vault)
+    workstream = registries.load_workstream("ws-1")
+    registries.update_workstream(
+        workstream.with_policy_refs((policy,)), expected_generation=workstream.generation
+    )
+
+    with pytest.raises(InvalidArtifact, match="policy receipt"):
+        SessionStore(vault).create_revision(valid_checkpoint(expected_registry_generation=1))
+
+    assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000001.md").exists()
+
+
+def test_write_derives_restrictive_project_policy_not_present_in_caller_receipt(
+    vault, valid_checkpoint
+):
+    """Catches a caller omitting the associated project's restrictive policy input."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import RegistryStore
+    from mneme.core.sessions import SessionStore
+
+    policies = PolicyStore(vault)
+    policy = policies.create_revision(
+        "project-ceiling", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    registries = RegistryStore(vault)
+    project = registries.register_project("project-1")
+    registries.assign_project_policy(project.id, policy, expected_generation=0)
+    workstream = registries.load_workstream("ws-1")
+    registries.update_workstream(
+        replace(workstream, project=project.id), expected_generation=workstream.generation
+    )
+
+    with pytest.raises(InvalidArtifact, match="policy receipt"):
+        SessionStore(vault).create_revision(valid_checkpoint(expected_registry_generation=1))
+
+    assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000001.md").exists()
+
+
+def test_write_derives_restrictive_source_policy_not_present_in_caller_receipt(
+    vault, valid_checkpoint
+):
+    """Catches a portable source reference bypassing its local-only ceiling."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import RegistryStore
+    from mneme.core.sessions import SessionStore
+
+    policies = PolicyStore(vault)
+    policy = policies.create_revision(
+        "source-ceiling", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    registries = RegistryStore(vault)
+    source = registries.register_source("source-1")
+    registries.assign_source_policy(source.id, policy, expected_generation=0)
+    request = valid_checkpoint(
+        body=replace(
+            valid_checkpoint().body,
+            source_refs=(
+                ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, source.id),
+            ),
+        )
+    )
+
+    with pytest.raises(InvalidArtifact, match="policy receipt"):
+        SessionStore(vault).create_revision(request)
+
+    assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000001.md").exists()
+
+
+def test_write_accepts_receipt_covering_all_applicable_source_policy_inputs(
+    vault, valid_checkpoint
+):
+    """Catches rejecting a complete receipt that names each canonical policy input."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.policy import PolicyRule, PolicyStore, Portability, evaluate_portability
+    from mneme.core.registries import RegistryStore
+    from mneme.core.sessions import SessionStore, session_semantic_hash
+
+    policies = PolicyStore(vault)
+    source_policy = policies.create_revision(
+        "source-permitted", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    source = RegistryStore(vault).register_source("source-1")
+    RegistryStore(vault).assign_source_policy(source.id, source_policy, expected_generation=0)
+    body = replace(
+        valid_checkpoint().body,
+        source_refs=(
+            ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, source.id),
+        ),
+    )
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+    request = replace(
+        valid_checkpoint(body=body),
+        policy_evaluation=evaluate_portability(
+            Portability.PERSONAL_VAULT,
+            (
+                PolicyRule(default.policy_id, default.revision, Portability.PERSONAL_VAULT, default.digest),
+                PolicyRule(source_policy.policy_id, source_policy.revision, Portability.PERSONAL_VAULT, source_policy.digest),
+            ),
+            session_semantic_hash(body, ()),
+        ),
+    )
+
+    assert SessionStore(vault).create_revision(request).revision == "000001"
+
+
+def test_revision_timestamp_is_canonical_utc_and_decoded(vault, valid_checkpoint):
+    """Catches a checkpoint omitting its D3 UTC boundary timestamp."""
+    from mneme.core.sessions import SessionStore
+
+    timestamp = datetime(2026, 8, 31, 12, 34, 56, 123456, tzinfo=timezone.utc)
+    store = SessionStore(vault, clock=lambda: timestamp)
+    ref = store.create_revision(valid_checkpoint())
+    metadata = vault.reader.read(
+        __import__("mneme.core.artifacts", fromlist=["ArtifactFamily"]).ArtifactFamily.SESSION,
+        storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.PORTABLE,
+        relative_path="workstreams/ws-1/sessions/ses-1/000001.md",
+    ).metadata
+
+    assert metadata["timestamp"] == "2026-08-31T12:34:56.123456Z"
+    assert store.read_revision(ref, workstream_id="ws-1").revision_timestamp == timestamp
+
+
+def test_tampered_revision_timestamp_is_rejected(vault, valid_checkpoint):
+    """Catches a non-canonical timestamp accepted by the self-contained decoder."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.sessions import SessionStore
+
+    store = SessionStore(vault)
+    ref = store.create_revision(valid_checkpoint())
+    path = vault.root / "workstreams/ws-1/sessions/ses-1/000001.md"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("timestamp:", "timestamp: not-a-time #"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidArtifact, match="timestamp"):
+        store.read_revision(ref, workstream_id="ws-1")
+
+
+def test_historic_revision_reads_after_policy_active_pointer_advances(vault, valid_checkpoint):
+    """Catches historic audit reads requiring the old policy to remain active."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore
+    from mneme.core.sessions import SessionStore
+
+    store = SessionStore(vault)
+    ref = store.create_revision(valid_checkpoint())
+    policies = PolicyStore(vault)
+    replacement = policies.create_revision(
+        "vault-default", "2", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    policies.activate(replacement, expected_generation=1)
+
+    assert store.read_revision(ref, workstream_id="ws-1").policy_evaluation.refs[0].revision == "1"
+
+
+@pytest.mark.parametrize("failure", ["missing", "tampered"])
+def test_historic_read_rejects_missing_or_tampered_immutable_policy_revision(
+    vault, valid_checkpoint, failure
+):
+    """Catches audit reads trusting a receipt whose immutable policy is unavailable."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.sessions import SessionStore
+
+    store = SessionStore(vault)
+    ref = store.create_revision(valid_checkpoint())
+    policy = vault.root / ".madi/policies/vault-default/1.yaml"
+    if failure == "missing":
+        policy.unlink()
+    else:
+        policy.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(InvalidArtifact):
+        store.read_revision(ref, workstream_id="ws-1")
+
+
 def test_revision_parent_must_match_contiguous_existing_lineage(vault, valid_checkpoint):
     """Catches a writer skipping a predecessor or silently healing a revision gap."""
     from mneme.core.errors import InvalidArtifact
@@ -275,7 +469,7 @@ def test_local_checkpoint_uses_same_codec_and_self_contained_decoder(vault):
     """Catches local revisions bypassing the Session codec or accepting tampered files."""
     from mneme.core.artifacts import StorageClass
     from mneme.core.errors import InvalidArtifact
-    from mneme.core.policy import Portability, evaluate_portability
+    from mneme.core.policy import PolicyRule, PolicyStore, Portability, evaluate_portability
     from mneme.core.registries import RegistryStore
     from mneme.core.sessions import CheckpointRequest, SessionBody, SessionStore, session_semantic_hash
 
@@ -287,9 +481,14 @@ def test_local_checkpoint_uses_same_codec_and_self_contained_decoder(vault):
         verified_facts=("local evidence retained",), completed_work=(), blockers=(),
         next_actions=("resume",), source_refs=(),
     )
+    default = PolicyStore(vault).load_active("vault-default", StorageClass.PORTABLE)
     request = CheckpointRequest(
         "ws-local", "ses-local", StorageClass.LOCAL_ONLY, None, 0, body, (),
-        evaluate_portability(Portability.LOCAL_ONLY, (), session_semantic_hash(body, ())),
+        evaluate_portability(
+            Portability.LOCAL_ONLY,
+            (PolicyRule(default.policy_id, default.revision, Portability.PERSONAL_VAULT, default.digest),),
+            session_semantic_hash(body, ()),
+        ),
     )
     store = SessionStore(vault, storage_class=StorageClass.LOCAL_ONLY)
     ref = store.create_revision(request)

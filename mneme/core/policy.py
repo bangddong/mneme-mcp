@@ -279,6 +279,37 @@ class PolicyStore:
             raise InvalidArtifact("active policy index digest does not match its revision")
         return actual
 
+    def load_rule(self, policy_ref: PolicyRef) -> PolicyRule:
+        """Load one exact immutable rule without consulting an active pointer."""
+        if not isinstance(policy_ref, PolicyRef):
+            raise InvalidPolicy("policy rule load requires a PolicyRef")
+        storage_class = self._storage_class_for_ref(policy_ref)
+        actual = self._load_revision(
+            policy_ref.policy_id, policy_ref.revision, storage_class
+        )
+        if actual != policy_ref:
+            raise InvalidArtifact("policy revision digest does not match its reference")
+        document = self._vault.reader.read(
+            ArtifactFamily.REGISTRY,
+            storage_class=storage_class,
+            relative_path=self._revision_path(policy_ref.policy_id, policy_ref.revision),
+        )
+        rule = document.metadata.get("rule")
+        if not isinstance(rule, Mapping):
+            raise InvalidArtifact("policy revision rule must be a mapping")
+        try:
+            ceiling = Portability(rule.get("ceiling"))
+        except (TypeError, ValueError) as exc:
+            raise InvalidArtifact("policy revision must declare a valid ceiling") from exc
+        approved_rule_id = rule.get("approved_rule_id")
+        return PolicyRule(
+            actual.policy_id,
+            actual.revision,
+            ceiling,
+            actual.digest,
+            approved_rule_id=approved_rule_id,
+        )
+
     def bootstrap_default(self) -> PolicyRef:
         """Ensure the exact default policy exists and is active via public lifecycle APIs."""
         document = self._revision_document(
