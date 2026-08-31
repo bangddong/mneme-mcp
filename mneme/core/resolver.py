@@ -119,9 +119,12 @@ def resolve_workstream(
             revision = load_revision(head)
         except Exception as exc:  # Reader validation includes malformed/tampered revisions.
             return _invalid(registry, heads, f"active revision is unreadable: {type(exc).__name__}")
-        if not _valid_revision(revision, head, registry.id, expected_storage_class):
+        canonical_revision = _canonical_revision(
+            revision, head, registry.id, expected_storage_class
+        )
+        if canonical_revision is None:
             return _invalid(registry, heads, "active revision is invalid")
-        loaded.append((head, revision))
+        loaded.append((head, canonical_revision))
 
     state = (
         ResolutionState.DIVERGENT
@@ -194,23 +197,25 @@ def _optional_inputs_degraded(optional_inputs: object) -> bool:
         return True
 
 
-def _valid_revision(
+def _canonical_revision(
     revision: object,
     head: HeadRef,
     workstream_id: str,
     storage_class: StorageClass,
-) -> bool:
+) -> SessionRevision | None:
     if not isinstance(revision, SessionRevision):
-        return False
+        return None
     try:
-        SessionRevision(revision.head, revision.request)
+        canonical = SessionRevision(revision.head, revision.request)
     except Exception:
-        return False
-    return (
-        revision.head == head
-        and revision.workstream_id == workstream_id
-        and revision.storage_class is storage_class
-    )
+        return None
+    if (
+        canonical.head != head
+        or canonical.workstream_id != workstream_id
+        or canonical.storage_class is not storage_class
+    ):
+        return None
+    return canonical
 
 
 def _invalid(

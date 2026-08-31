@@ -201,3 +201,43 @@ def test_nested_session_mutation_is_rejected_before_rendering(registry_factory, 
         object.__setattr__(revision.request.policy_evaluation, "semantic_hash", "0" * 64)
 
     assert resolve_workstream(registry, lambda _head: revision).state.value == "invalid"
+
+
+def test_resolver_owns_a_canonical_snapshot_not_the_mutable_reader_result(registry_factory):
+    """Catches CURRENT retaining a caller object after historic validation copied it."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.resolver import resolve_workstream
+    from mneme.core.sessions import SessionProvenanceRef, SessionRelation, session_semantic_hash
+
+    registry = registry_factory("single", ["a"], None)
+    relation = SessionRelation(
+        "handoff", "agent-b", "continue", "context", "resume",
+        (SessionProvenanceRef("source", StorageClass.PORTABLE, "source-1"),),
+    )
+    reader_result = _revision(registry.active_heads[0], relations=(relation,))
+    object.__setattr__(reader_result.request.body, "objective", "pre-resolution objective")
+    object.__setattr__(reader_result.request.relations[0], "target", "pre-resolution target")
+    object.__setattr__(
+        reader_result.request.policy_evaluation,
+        "semantic_hash",
+        session_semantic_hash(reader_result.request.body, reader_result.request.relations),
+    )
+
+    resolved = resolve_workstream(registry, lambda _head: reader_result)
+    snapshot = resolved.selected_revision
+
+    assert resolved.state.value == "resolved"
+    assert snapshot is not reader_result
+    assert snapshot.body.objective == "pre-resolution objective"
+    assert snapshot.request.relations[0].target == "pre-resolution target"
+
+    object.__setattr__(reader_result.request.body, "objective", "post-resolution payload")
+    object.__setattr__(reader_result.request.relations[0], "target", "post-resolution target")
+    object.__setattr__(
+        reader_result.request.policy_evaluation,
+        "semantic_hash",
+        session_semantic_hash(reader_result.request.body, reader_result.request.relations),
+    )
+
+    assert snapshot.body.objective == "pre-resolution objective"
+    assert snapshot.request.relations[0].target == "pre-resolution target"

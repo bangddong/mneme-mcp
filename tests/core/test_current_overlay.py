@@ -269,3 +269,27 @@ def test_exploding_overlay_optional_sequence_degrades_without_partial_overlay_re
 
     assert view.effective_status.value == "degraded"
     assert "confidential foreground" not in view.text
+
+
+def test_context_view_does_not_change_when_reader_result_is_mutated_after_rendering():
+    """Catches a generated view retaining mutable reader-owned SessionRevision state."""
+    from mneme.core.context import ContextReaders, render_current
+    from mneme.core.sessions import session_semantic_hash
+
+    head = _portable_registry().active_heads[0]
+    reader_result = _revision(head, objective="stable before render")
+    view = render_current(
+        ContextReaders(lambda _id: _portable_registry(), lambda _id, _head: reader_result),
+        "ws-1", "portable",
+    )
+
+    object.__setattr__(reader_result.request.body, "objective", "mutable after render")
+    object.__setattr__(
+        reader_result.request.policy_evaluation,
+        "semantic_hash",
+        session_semantic_hash(reader_result.request.body, reader_result.request.relations),
+    )
+
+    assert "stable before render" in view.text
+    assert "mutable after render" not in view.text
+    assert view.portable.selected_revision.body.objective == "stable before render"
