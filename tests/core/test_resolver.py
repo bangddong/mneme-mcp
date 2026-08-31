@@ -147,6 +147,19 @@ def test_tampered_registry_identity_or_generation_is_invalid(registry_factory):
     assert resolve_workstream(registry, lambda head: _revision(head)).state.value == "invalid"
 
 
+def test_invalid_registry_projection_does_not_retain_the_caller_object(registry_factory):
+    """Catches an invalid projection exposing a mutable uncanonicalized registry."""
+    from mneme.core.resolver import resolve_workstream
+
+    registry = registry_factory("single", ["a"], None)
+    object.__setattr__(registry, "generation", -1)
+
+    resolved = resolve_workstream(registry, lambda head: _revision(head))
+
+    assert resolved.state.value == "invalid"
+    assert resolved.registry is None
+
+
 @pytest.mark.parametrize(
     ("returned", "expected"),
     [
@@ -241,3 +254,81 @@ def test_resolver_owns_a_canonical_snapshot_not_the_mutable_reader_result(regist
 
     assert snapshot.body.objective == "pre-resolution objective"
     assert snapshot.request.relations[0].target == "pre-resolution target"
+
+
+def test_resolver_owns_registry_heads_selection_and_policy_refs_after_resolution():
+    """Catches caller registry aliases changing any resolved projection field."""
+    from mneme.core.policy import PolicyRef
+    from mneme.core.registries import HeadRef, WorkstreamRegistry
+    from mneme.core.resolver import resolve_workstream
+
+    first = HeadRef("session-a", "000001")
+    second = HeadRef("session-b", "000001")
+    preferred = HeadRef("session-b", "000001")
+    policy = PolicyRef("policy-1", "000001", "a" * 64)
+    registry = WorkstreamRegistry(
+        "ws-1", 7, "project-1", "active", "preferred",
+        (first, second), preferred, (policy,),
+    )
+
+    resolved = resolve_workstream(registry, _revision)
+
+    assert resolved.state.value == "resolved"
+    assert resolved.registry is not registry
+    assert resolved.registry.active_heads[0] is resolved.heads[0]
+    assert resolved.registry.active_heads[1] is resolved.heads[1]
+    assert resolved.registry.preferred_head is resolved.selected_head
+    assert resolved.revisions[0][0] is resolved.heads[0]
+    assert resolved.revisions[1][0] is resolved.heads[1]
+    assert resolved.selected_head is resolved.heads[1]
+    assert resolved.registry.policy_refs[0] is not policy
+
+    object.__setattr__(registry, "id", "mutated-workstream")
+    object.__setattr__(registry, "active_heads", ())
+    object.__setattr__(registry, "preferred_head", None)
+    object.__setattr__(registry, "policy_refs", ())
+    object.__setattr__(first, "revision", "000002")
+    object.__setattr__(second, "revision", "000002")
+    object.__setattr__(preferred, "revision", "000002")
+    object.__setattr__(policy, "revision", "000002")
+    object.__setattr__(policy, "digest", "b" * 64)
+
+    assert resolved.registry.id == "ws-1"
+    assert [(head.session, head.revision) for head in resolved.registry.active_heads] == [
+        ("session-a", "000001"),
+        ("session-b", "000001"),
+    ]
+    assert [(head.session, head.revision) for head in resolved.heads] == [
+        ("session-a", "000001"),
+        ("session-b", "000001"),
+    ]
+    assert [(head.session, head.revision) for head, _revision_value in resolved.revisions] == [
+        ("session-a", "000001"),
+        ("session-b", "000001"),
+    ]
+    assert (resolved.selected_head.session, resolved.selected_head.revision) == (
+        "session-b", "000001"
+    )
+    assert resolved.selected_revision.head == resolved.selected_head
+    assert resolved.registry.policy_refs[0] == PolicyRef(
+        "policy-1", "000001", "a" * 64
+    )
+
+
+def test_coherent_pre_resolution_registry_mutation_is_canonicalized():
+    """Catches valid tampered values bypassing validation or remaining caller-owned."""
+    from mneme.core.registries import HeadRef, WorkstreamRegistry
+    from mneme.core.resolver import resolve_workstream
+
+    caller_head = HeadRef("session-a", "000001")
+    registry = WorkstreamRegistry(
+        "ws-1", 0, None, "active", "single", (caller_head,)
+    )
+    object.__setattr__(caller_head, "revision", "000002")
+
+    resolved = resolve_workstream(registry, _revision)
+
+    assert resolved.state.value == "resolved"
+    assert resolved.heads[0] == HeadRef("session-a", "000002")
+    assert resolved.heads[0] is not caller_head
+    assert resolved.registry.active_heads[0] is resolved.heads[0]

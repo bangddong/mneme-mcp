@@ -9,7 +9,11 @@ from typing import Any
 
 from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact
-from mneme.core.registries import HeadRef, WorkstreamRegistry
+from mneme.core.registries import (
+    HeadRef,
+    WorkstreamRegistry,
+    canonicalize_workstream_registry,
+)
 from mneme.core.sessions import CheckpointRequest, SessionBody, SessionRevisionRef, validate_historic_session_revision
 
 
@@ -103,10 +107,14 @@ def resolve_workstream(
 
     if not callable(load_revision) or not isinstance(expected_storage_class, StorageClass):
         return _invalid(None, (), "revision reader is invalid")
-    validation = _validate_registry(registry)
+    try:
+        canonical_registry = canonicalize_workstream_registry(registry)
+    except InvalidArtifact:
+        return _invalid(None, (), "workstream registry is invalid")
+    validation = _validate_registry(canonical_registry)
     if validation is not None:
-        return _invalid(registry if isinstance(registry, WorkstreamRegistry) else None, (), validation)
-    assert isinstance(registry, WorkstreamRegistry)
+        return _invalid(None, (), validation)
+    registry = canonical_registry
     heads = tuple(sorted(registry.active_heads, key=lambda item: (item.session, item.revision)))
 
     # Paused and closed workstreams deliberately have a resolved empty view.
@@ -116,7 +124,7 @@ def resolve_workstream(
     loaded: list[tuple[HeadRef, object]] = []
     for head in heads:
         try:
-            revision = load_revision(head)
+            revision = load_revision(HeadRef(head.session, head.revision))
         except Exception as exc:  # Reader validation includes malformed/tampered revisions.
             return _invalid(registry, heads, f"active revision is unreadable: {type(exc).__name__}")
         canonical_revision = _canonical_revision(
@@ -133,8 +141,10 @@ def resolve_workstream(
     )
     if _optional_inputs_degraded(optional_inputs):
         state = ResolutionState.DEGRADED
-    selected = registry.preferred_head if registry.mode == "preferred" else (
-        heads[0] if len(heads) == 1 else None
+    selected = (
+        next(head for head in heads if head == registry.preferred_head)
+        if registry.mode == "preferred"
+        else (heads[0] if len(heads) == 1 else None)
     )
     return ResolvedWorkstream(state, registry, heads, tuple(loaded), selected)
 

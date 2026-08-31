@@ -293,3 +293,28 @@ def test_context_view_does_not_change_when_reader_result_is_mutated_after_render
     assert "stable before render" in view.text
     assert "mutable after render" not in view.text
     assert view.portable.selected_revision.body.objective == "stable before render"
+
+
+def test_context_view_does_not_retain_the_reader_owned_registry_or_heads():
+    """Catches post-render registry mutation changing ContextView projections."""
+    from mneme.core.context import ContextReaders, render_current
+    from mneme.core.registries import HeadRef, WorkstreamRegistry
+
+    caller_head = HeadRef("portable", "000001")
+    registry = WorkstreamRegistry(
+        "ws-1", 0, None, "active", "single", (caller_head,)
+    )
+    view = render_current(
+        ContextReaders(lambda _id: registry, lambda _id, head: _revision(head)),
+        "ws-1", "portable",
+    )
+
+    object.__setattr__(caller_head, "revision", "000002")
+    object.__setattr__(registry, "active_heads", (caller_head,))
+
+    assert view.portable.registry is not registry
+    assert view.portable.registry.active_heads[0].revision == "000001"
+    assert view.portable.heads[0].revision == "000001"
+    assert view.portable.revisions[0][0].revision == "000001"
+    assert view.portable.selected_head.revision == "000001"
+    assert view.portable.selected_revision.head.revision == "000001"

@@ -157,6 +157,61 @@ class WorkstreamRegistry:
         return replace(self, policy_refs=policy_refs)
 
 
+def canonicalize_workstream_registry(value: object) -> WorkstreamRegistry:
+    """Return a validated, fully owned snapshot of a decoded workstream registry.
+
+    Frozen dataclasses can still be altered through ``object.__setattr__``.  Read
+    projections therefore re-run the model validators and reconstruct every
+    nested reference before retaining a registry supplied by another boundary.
+    """
+
+    if not isinstance(value, WorkstreamRegistry):
+        raise InvalidArtifact("workstream registry is invalid")
+    try:
+        if not isinstance(value.active_heads, tuple) or not all(
+            isinstance(head, HeadRef) for head in value.active_heads
+        ):
+            raise InvalidArtifact("workstream active_heads must be HeadRef values")
+        if value.preferred_head is not None and not isinstance(
+            value.preferred_head, HeadRef
+        ):
+            raise InvalidArtifact("workstream preferred_head must be a HeadRef or None")
+        if not isinstance(value.policy_refs, tuple) or not all(
+            isinstance(policy_ref, PolicyRef) for policy_ref in value.policy_refs
+        ):
+            raise InvalidArtifact("workstream policy_refs must be PolicyRef values")
+
+        heads = tuple(
+            HeadRef(head.session, head.revision) for head in value.active_heads
+        )
+        preferred = None
+        if value.preferred_head is not None:
+            preferred_value = HeadRef(
+                value.preferred_head.session, value.preferred_head.revision
+            )
+            preferred = next(
+                (head for head in heads if head == preferred_value), preferred_value
+            )
+        policy_refs = tuple(
+            PolicyRef(ref.policy_id, ref.revision, ref.digest)
+            for ref in value.policy_refs
+        )
+        return WorkstreamRegistry(
+            value.id,
+            value.generation,
+            value.project,
+            value.status,
+            value.mode,
+            heads,
+            preferred,
+            policy_refs,
+        )
+    except InvalidArtifact:
+        raise
+    except Exception as exc:
+        raise InvalidArtifact("workstream registry is invalid") from exc
+
+
 class RegistryStore:
     """Registry writer which routes every document through one storage class."""
 
