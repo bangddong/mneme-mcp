@@ -15,6 +15,7 @@ from mneme.core.artifacts import (
     ArtifactDocument,
     ArtifactFamily,
     ArtifactReference,
+    ReferenceKind,
     ReferenceManifest,
     StorageClass,
 )
@@ -35,6 +36,7 @@ from mneme.core.policy import (
     policy_admission_gate,
 )
 from mneme.core.resolver import ResolutionState, ResolvedWorkstream
+from mneme.core.registries import RegistryStore
 from mneme.core.validation.vault import validate_identifier
 
 
@@ -131,6 +133,7 @@ class MemoryRecord:
     generation: int
     semantic_hash: str
     policy_receipt: PolicyEvaluation
+    acceptance_baseline: str | None = None
     receipt_history: tuple[PolicyEvaluation, ...] = ()
     retired_at: datetime | None = None
     retirement_reason: str | None = None
@@ -158,6 +161,13 @@ class MemoryRecord:
         _digest(self.semantic_hash, "memory semantic hash")
         if not isinstance(self.policy_receipt, PolicyEvaluation):
             raise InvalidArtifact("memory policy receipt is invalid")
+        if self.status is MemoryStatus.CANDIDATE:
+            if self.acceptance_baseline is not None:
+                raise InvalidArtifact("candidate memory cannot have an acceptance baseline")
+        else:
+            _digest(self.acceptance_baseline, "memory acceptance baseline")
+            if self.acceptance_baseline != self.semantic_hash:
+                raise InvalidArtifact("accepted semantic fields differ from the immutable acceptance baseline")
         if not isinstance(self.receipt_history, tuple) or not all(isinstance(item, PolicyEvaluation) for item in self.receipt_history):
             raise InvalidArtifact("memory receipt history is invalid")
         if self.retired_at is None:
@@ -174,13 +184,20 @@ class MemoryRecord:
 
 @dataclass(frozen=True, slots=True)
 class MemoryReaders:
-    """Read-only source for PROFILE generation; it has no persistence hook."""
+    """Storage-bound reader seam for PROFILE generation; it has no write hook."""
 
-    load_records: Callable[[], tuple[MemoryRecord, ...]]
+    store: MemoryStore
 
     def __post_init__(self) -> None:
-        if not callable(self.load_records):
-            raise TypeError("PROFILE requires a memory reader callable")
+        if not isinstance(self.store, MemoryStore):
+            raise TypeError("PROFILE requires a storage-bound MemoryStore reader")
+
+    @property
+    def storage_class(self) -> StorageClass:
+        return self.store.storage_class
+
+    def load_records(self) -> tuple[MemoryRecord, ...]:
+        return self.store.iter_records()
 
 
 class MemoryStore:
@@ -202,7 +219,7 @@ class MemoryStore:
     ) -> MemoryRecord:
         record = self._record(
             memory_id or f"mem-{uuid4().hex}", kind, MemoryStatus.CANDIDATE, scope, authority, portability,
-            body, rationale, provenance, supersedes, 0, receipt, (), None, None,
+            body, rationale, provenance, supersedes, 0, receipt, None, (), None, None,
         )
         with policy_admission_gate(self.vault):
             self._validate_admission(record, receipt)
@@ -222,7 +239,7 @@ class MemoryStore:
             updated = self._record(current.id, current.kind, current.status, scope or current.scope,
                 authority or current.authority, portability or current.portability, body if body is not None else current.body,
                 rationale if rationale is not None else current.rationale, provenance if provenance is not None else current.provenance,
-                current.supersedes, expected_generation + 1, receipt, current.receipt_history + (current.policy_receipt,), None, None)
+                current.supersedes, expected_generation + 1, receipt, None, current.receipt_history + (current.policy_receipt,), None, None)
             self._validate_admission(updated, receipt)
             self._write_cas(updated, expected_generation)
         return updated
@@ -234,7 +251,8 @@ class MemoryStore:
             if current.status is not MemoryStatus.CANDIDATE:
                 raise InvalidArtifact("only candidate memories can be promoted")
             accepted = replace(current, status=MemoryStatus.ACCEPTED, generation=expected_generation + 1,
-                               policy_receipt=receipt, receipt_history=current.receipt_history + (current.policy_receipt,))
+                               policy_receipt=receipt, acceptance_baseline=current.semantic_hash,
+                               receipt_history=current.receipt_history + (current.policy_receipt,))
             self._validate_admission(accepted, receipt)
             self._write_cas(accepted, expected_generation)
         return accepted
@@ -250,11 +268,13 @@ class MemoryStore:
             prior = self.read(memory_id)
             if prior.status is not MemoryStatus.ACCEPTED or prior.generation != expected_generation:
                 raise InvalidArtifact("supersession requires the exact accepted memory generation")
+            if self._derived_successor(prior.id) is not None:
+                raise InvalidArtifact("accepted memory already has a reserved successor")
             successor = self._record(
                 f"mem-{uuid4().hex}", prior.kind, MemoryStatus.CANDIDATE, scope or prior.scope,
                 authority or prior.authority, portability or prior.portability, body,
                 prior.rationale if rationale is None else rationale,
-                prior.provenance if provenance is None else provenance, prior.id, 0, receipt, (), None, None,
+                prior.provenance if provenance is None else provenance, prior.id, 0, receipt, None, (), None, None,
             )
             self._validate_admission(successor, receipt)
             self.vault.artifacts.write_new(
@@ -319,7 +339,7 @@ class MemoryStore:
     def _record(self, memory_id: str, kind: MemoryKind | str, status: MemoryStatus, scope: MemoryScope | Mapping[str, object],
                 authority: MemoryAuthority | str, portability: Portability | str, body: str, rationale: str,
                 provenance: tuple[ArtifactReference, ...], supersedes: str | None, generation: int,
-                receipt: PolicyEvaluation, history: tuple[PolicyEvaluation, ...], retired_at: datetime | None,
+                receipt: PolicyEvaluation, acceptance_baseline: str | None, history: tuple[PolicyEvaluation, ...], retired_at: datetime | None,
                 retirement_reason: str | None) -> MemoryRecord:
         try:
             parsed_kind = kind if isinstance(kind, MemoryKind) else MemoryKind(kind)
@@ -333,7 +353,7 @@ class MemoryStore:
                                         portability=parsed_portability, body=body, rationale=rationale, provenance=provenance,
                                         supersedes=supersedes)
         return MemoryRecord(memory_id, parsed_kind, status, parsed_scope, parsed_authority, parsed_portability, body,
-                            rationale, provenance, supersedes, generation, semantic, receipt, history, retired_at, retirement_reason)
+                            rationale, provenance, supersedes, generation, semantic, receipt, acceptance_baseline, history, retired_at, retirement_reason)
 
     def _validate_admission(self, record: MemoryRecord, receipt: PolicyEvaluation) -> None:
         if self.storage_class is StorageClass.PORTABLE and any(
@@ -349,12 +369,43 @@ class MemoryStore:
             raise InvalidArtifact("memory portability must match its storage class")
         if self.storage_class is StorageClass.PORTABLE:
             policies = PolicyStore(self.vault)
-            default = policies.load_active("vault-default", StorageClass.PORTABLE)
-            derived = evaluate_portability(requested, (policies.load_rule(default),), record.semantic_hash)
+            derived = evaluate_portability(
+                requested, self._applicable_policy_rules(record), record.semantic_hash
+            )
             if not _same_policy_semantics(receipt, derived) or not derived.allowed:
                 raise InvalidArtifact("memory policy receipt does not match current applicable policy")
         elif not receipt.allowed:
             raise InvalidArtifact("local memory policy receipt does not allow this write")
+
+    def _applicable_policy_rules(self, record: MemoryRecord) -> tuple[PolicyRule, ...]:
+        """Admission-only policy inheritance seam; Task 19 owns later re-evaluation."""
+        policies = PolicyStore(self.vault)
+        registries = RegistryStore(self.vault, self.storage_class)
+        refs = [policies.load_active("vault-default", StorageClass.PORTABLE)]
+        project_ids: set[str] = set()
+        if record.scope.project_id is not None:
+            project_ids.add(record.scope.project_id)
+        if record.scope.workstream_id is not None:
+            workstream = registries.load_workstream(record.scope.workstream_id)
+            refs.extend(workstream.policy_refs)
+            if workstream.project is not None:
+                project_ids.add(workstream.project)
+        for reference in record.provenance:
+            if reference.kind is not ReferenceKind.ID or not isinstance(reference.value, str):
+                continue
+            try:
+                source = registries.load_source(reference.value)
+            except InvalidArtifact:
+                continue
+            if source.policy_ref is not None:
+                refs.append(source.policy_ref)
+            if source.project is not None:
+                project_ids.add(source.project)
+        for project_id in sorted(project_ids):
+            project = registries.load_project(project_id)
+            if project.policy_ref is not None:
+                refs.append(project.policy_ref)
+        return tuple(policies.load_rule(reference) for reference in refs)
 
     def _write_cas(self, record: MemoryRecord, expected_generation: int) -> None:
         self.vault.artifacts.write_cas(ArtifactFamily.MEMORY, storage_class=self.storage_class,
@@ -367,6 +418,7 @@ class MemoryStore:
             "rationale": record.rationale, "provenance": [_reference_dict(item) for item in record.provenance],
             "supersedes": record.supersedes, "generation": record.generation, "semantic_hash": record.semantic_hash,
             "policy_receipt": _receipt_dict(record.policy_receipt),
+            "acceptance_baseline": record.acceptance_baseline,
             "receipt_history": [_receipt_dict(item) for item in record.receipt_history],
             "retired_at": None if record.retired_at is None else _timestamp_text(record.retired_at),
             "retirement_reason": record.retirement_reason,
@@ -375,13 +427,13 @@ class MemoryStore:
 
     def _parse(self, document: ArtifactDocument, memory_id: str) -> MemoryRecord:
         metadata = dict(document.metadata)
-        keys = {"schema", "id", "kind", "status", "scope", "authority", "portability", "rationale", "provenance", "supersedes", "generation", "semantic_hash", "policy_receipt", "receipt_history", "retired_at", "retirement_reason"}
+        keys = {"schema", "id", "kind", "status", "scope", "authority", "portability", "rationale", "provenance", "supersedes", "generation", "semantic_hash", "policy_receipt", "acceptance_baseline", "receipt_history", "retired_at", "retirement_reason"}
         if set(metadata) != keys or metadata.get("schema") != _SCHEMA or metadata.get("id") != memory_id or not isinstance(document.body, str):
             raise InvalidArtifact("memory record has an invalid schema")
         try:
             record = self._record(memory_id, metadata["kind"], MemoryStatus(metadata["status"]), metadata["scope"], metadata["authority"], metadata["portability"],
                 document.body, metadata["rationale"], _references(metadata["provenance"]), metadata["supersedes"], metadata["generation"],
-                _parse_receipt(metadata["policy_receipt"]), tuple(_parse_receipt(item) for item in _list(metadata["receipt_history"], "receipt history")),
+                _parse_receipt(metadata["policy_receipt"]), metadata["acceptance_baseline"], tuple(_parse_receipt(item) for item in _list(metadata["receipt_history"], "receipt history")),
                 None if metadata["retired_at"] is None else _parse_timestamp(metadata["retired_at"]), metadata["retirement_reason"])
         except (TypeError, ValueError) as exc:
             raise InvalidArtifact("memory record has invalid values") from exc
@@ -428,19 +480,41 @@ def memory_semantic_hash(*, body: str, id: str = "", kind: MemoryKind | str = Me
     return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def render_profile(readers: MemoryReaders, scope: MemoryScope | Mapping[str, object]) -> ContextView:
+def render_profile(
+    readers: MemoryReaders,
+    scope: MemoryScope | Mapping[str, object],
+    *,
+    storage_class: StorageClass = StorageClass.PORTABLE,
+) -> ContextView:
     """Generate, but never persist, a deterministic PROFILE projection."""
     if not isinstance(readers, MemoryReaders):
         raise TypeError("render_profile requires MemoryReaders")
+    if not isinstance(storage_class, StorageClass):
+        raise TypeError("PROFILE requires an explicit StorageClass")
+    if readers.storage_class is not storage_class:
+        raise PortabilityViolation(
+            f"{storage_class.value} PROFILE cannot read {readers.storage_class.value} memory records"
+        )
     selected_scope = MemoryScope.parse(scope)
-    records = tuple(record for record in readers.load_records() if isinstance(record, MemoryRecord)
-                    and record.scope == selected_scope and record.kind is MemoryKind.PREFERENCE
-                    and record.status is MemoryStatus.ACCEPTED)
+    all_records = readers.load_records()
+    by_id = {record.id: record for record in all_records}
+    records = tuple(
+        record for record in all_records if record.scope == selected_scope
+        and record.kind is MemoryKind.PREFERENCE and record.status is MemoryStatus.ACCEPTED
+        and not _has_accepted_successor(record, by_id)
+    )
     records = tuple(sorted(records, key=lambda item: item.id))
-    lines = ["# PROFILE", "", f"scope: {selected_scope.type.value}"]
+    lines = ["# PROFILE", "", f"storage_class: {storage_class.value}", f"scope: {selected_scope.type.value}"]
     if records:
         lines.extend(("", "## Active accepted preferences"))
-        lines.extend(f"- {record.id}: {record.body.rstrip()}" for record in records)
+        for record in records:
+            lines.extend((
+                f"### {record.id}",
+                record.body.rstrip(),
+                f"provenance: {_profile_provenance(record.provenance)}",
+                f"policy_receipt: {_profile_receipt(record.policy_receipt)}",
+                "",
+            ))
     else:
         lines.extend(("", "No active accepted preferences."))
     if len({record.body for record in records}) > 1:
@@ -448,7 +522,37 @@ def render_profile(readers: MemoryReaders, scope: MemoryScope | Mapping[str, obj
         lines.extend(f"- {record.id}" for record in records)
     text = "\n".join(lines) + "\n"
     resolved = ResolvedWorkstream(ResolutionState.RESOLVED, None, (), (), None, ())
-    return ContextView("profile", "portable", text, resolved, None, ResolutionState.RESOLVED, None, ResolutionState.RESOLVED)
+    mode = "portable" if storage_class is StorageClass.PORTABLE else "effective-local"
+    return ContextView("profile", mode, text, resolved, None, ResolutionState.RESOLVED, None, ResolutionState.RESOLVED)
+
+
+def _has_accepted_successor(record: MemoryRecord, by_id: Mapping[str, MemoryRecord]) -> bool:
+    if record.superseded_by is None:
+        return False
+    successor = by_id.get(record.superseded_by)
+    return successor is not None and successor.status is MemoryStatus.ACCEPTED
+
+
+def _profile_provenance(provenance: tuple[ArtifactReference, ...]) -> str:
+    if not provenance:
+        return "none"
+    return ", ".join(
+        f"{item.kind.value}:{item.storage_class.value}:{item.value}" for item in provenance
+    )
+
+
+def _profile_receipt(receipt: PolicyEvaluation) -> str:
+    refs = ",".join(_profile_receipt_ref(item) for item in receipt.refs) or "none"
+    return (
+        f"requested={receipt.requested.value}; effective_ceiling={receipt.effective_ceiling.value}; "
+        f"semantic_hash={receipt.semantic_hash}; refs={refs}"
+    )
+
+
+def _profile_receipt_ref(ref: PolicyReceiptRef) -> str:
+    if isinstance(ref, PolicyRef):
+        return f"policy:{ref.policy_id}@{ref.revision}:{ref.digest}"
+    return f"opaque:{ref.attestation_id}@{ref.revision}:{ref.digest}"
 
 
 def _text(value: object, label: str) -> str:
@@ -503,10 +607,13 @@ def _references(value: object) -> tuple[ArtifactReference, ...]:
         raise InvalidArtifact("memory provenance must be a list")
     from mneme.core.artifacts import ReferenceKind
     try:
-        return tuple(ArtifactReference(ReferenceKind(item["kind"]), StorageClass(item["storage_class"]), item["value"])
+        parsed = tuple(ArtifactReference(ReferenceKind(item["kind"]), StorageClass(item["storage_class"]), item["value"])
                      for item in value if isinstance(item, dict) and set(item) == {"kind", "storage_class", "value"})
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidArtifact("memory provenance is invalid") from exc
+    if len(parsed) != len(value):
+        raise InvalidArtifact("memory provenance contains an invalid entry")
+    return parsed
 
 
 def _receipt_dict(receipt: PolicyEvaluation) -> dict[str, Any]:
@@ -528,8 +635,12 @@ def _parse_receipt(value: object) -> PolicyEvaluation:
         raise InvalidArtifact("memory policy receipt has an invalid schema")
     try:
         refs = tuple(_parse_receipt_ref(item) for item in _list(value["refs"], "receipt refs"))
-        violations = tuple(PolicyViolation(item["code"], item["message"]) for item in _list(value["violations"], "receipt violations") if isinstance(item, Mapping) and set(item) == {"code", "message"})
-        approved = tuple(ApprovedRuleProvenance(item["rule_id"], _parse_receipt_ref(item["authorizer"])) for item in _list(value["approved_rules"], "approved rules") if isinstance(item, Mapping) and set(item) == {"rule_id", "authorizer"})
+        raw_violations = _list(value["violations"], "receipt violations")
+        violations = tuple(PolicyViolation(item["code"], item["message"]) for item in raw_violations if isinstance(item, Mapping) and set(item) == {"code", "message"})
+        raw_approved = _list(value["approved_rules"], "approved rules")
+        approved = tuple(ApprovedRuleProvenance(item["rule_id"], _parse_receipt_ref(item["authorizer"])) for item in raw_approved if isinstance(item, Mapping) and set(item) == {"rule_id", "authorizer"})
+        if len(violations) != len(raw_violations) or len(approved) != len(raw_approved):
+            raise InvalidArtifact("memory policy receipt contains an invalid nested entry")
         return PolicyEvaluation(Portability(value["requested"]), Portability(value["effective_ceiling"]), value["allowed"], datetime.fromisoformat(value["evaluated_at"]), value["evaluator_version"], refs, value["semantic_hash"], violations, approved)
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidArtifact("memory policy receipt has invalid values") from exc
