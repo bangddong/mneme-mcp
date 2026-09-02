@@ -163,27 +163,22 @@ def test_candidate_edit_conflict_race_has_one_winner(memory_store, receipt):
     assert results.count("conflict") == 1
 
 
-def test_accepted_lifecycle_rejects_a_recomputed_raw_semantic_overwrite(memory_store, receipt):
-    """Accepted semantics are bound to their in-tree promotion baseline, not Git."""
-    from mneme.core.fs import dump_frontmatter, read_frontmatter
-    from mneme.core.memories import memory_semantic_hash
+def test_retired_candidate_is_not_ever_accepted_and_cannot_start_a_successor_lineage(memory_store, receipt):
     from mneme.core.errors import InvalidArtifact
 
     candidate = memory_store.submit_candidate(
         "knowledge", {"type": "personal-global"}, "personal", "personal-vault",
-        "Original accepted fact.", receipt("Original accepted fact."),
+        "Candidate only.", receipt("Candidate only."),
     )
-    accepted = memory_store.promote(candidate.id, 0, receipt(candidate.body))
-    path = memory_store.vault.root / f"memory/{accepted.id}.md"
-    metadata, _ = read_frontmatter(path)
-    replacement = "Raw replacement with a recomputed receipt."
-    digest = memory_semantic_hash(body=replacement)
-    metadata["semantic_hash"] = digest
-    metadata["policy_receipt"]["semantic_hash"] = digest
-    path.write_text(dump_frontmatter(metadata, replacement), encoding="utf-8")
+    retired = memory_store.retire(candidate.id, 0, "not accepted")
+    assert retired.accepted_semantic_hash is None
 
-    with pytest.raises(InvalidArtifact, match="acceptance baseline|immutable"):
-        memory_store.retire(accepted.id, 1, "attempt lifecycle mutation")
+    with pytest.raises(InvalidArtifact, match="ever-accepted"):
+        memory_store.supersede(
+            retired.id, 1, body="Invalid replacement.", receipt=receipt(
+                "Invalid replacement.", supersedes=retired.id
+            ),
+        )
 
 
 def test_concurrent_supersedes_reserve_one_successor(memory_store, receipt):

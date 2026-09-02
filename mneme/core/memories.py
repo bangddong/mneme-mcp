@@ -133,7 +133,7 @@ class MemoryRecord:
     generation: int
     semantic_hash: str
     policy_receipt: PolicyEvaluation
-    acceptance_baseline: str | None = None
+    accepted_semantic_hash: str | None = None
     receipt_history: tuple[PolicyEvaluation, ...] = ()
     retired_at: datetime | None = None
     retirement_reason: str | None = None
@@ -162,12 +162,14 @@ class MemoryRecord:
         if not isinstance(self.policy_receipt, PolicyEvaluation):
             raise InvalidArtifact("memory policy receipt is invalid")
         if self.status is MemoryStatus.CANDIDATE:
-            if self.acceptance_baseline is not None:
-                raise InvalidArtifact("candidate memory cannot have an acceptance baseline")
-        else:
-            _digest(self.acceptance_baseline, "memory acceptance baseline")
-            if self.acceptance_baseline != self.semantic_hash:
-                raise InvalidArtifact("accepted semantic fields differ from the immutable acceptance baseline")
+            if self.accepted_semantic_hash is not None:
+                raise InvalidArtifact("candidate memory cannot have an accepted semantic marker")
+        elif self.accepted_semantic_hash is not None:
+            _digest(self.accepted_semantic_hash, "accepted memory semantic marker")
+            if self.accepted_semantic_hash != self.semantic_hash:
+                raise InvalidArtifact("accepted semantic marker must match semantic content")
+        elif self.status is MemoryStatus.ACCEPTED:
+            raise InvalidArtifact("accepted memory requires an accepted semantic marker")
         if not isinstance(self.receipt_history, tuple) or not all(isinstance(item, PolicyEvaluation) for item in self.receipt_history):
             raise InvalidArtifact("memory receipt history is invalid")
         if self.retired_at is None:
@@ -251,7 +253,7 @@ class MemoryStore:
             if current.status is not MemoryStatus.CANDIDATE:
                 raise InvalidArtifact("only candidate memories can be promoted")
             accepted = replace(current, status=MemoryStatus.ACCEPTED, generation=expected_generation + 1,
-                               policy_receipt=receipt, acceptance_baseline=current.semantic_hash,
+                               policy_receipt=receipt, accepted_semantic_hash=current.semantic_hash,
                                receipt_history=current.receipt_history + (current.policy_receipt,))
             self._validate_admission(accepted, receipt)
             self._write_cas(accepted, expected_generation)
@@ -266,8 +268,8 @@ class MemoryStore:
         _generation(expected_generation)
         with policy_admission_gate(self.vault):
             prior = self.read(memory_id)
-            if prior.status is not MemoryStatus.ACCEPTED or prior.generation != expected_generation:
-                raise InvalidArtifact("supersession requires the exact accepted memory generation")
+            if prior.accepted_semantic_hash is None or prior.generation != expected_generation:
+                raise InvalidArtifact("supersession requires the exact ever-accepted memory generation")
             if self._derived_successor(prior.id) is not None:
                 raise InvalidArtifact("accepted memory already has a reserved successor")
             successor = self._record(
@@ -339,7 +341,7 @@ class MemoryStore:
     def _record(self, memory_id: str, kind: MemoryKind | str, status: MemoryStatus, scope: MemoryScope | Mapping[str, object],
                 authority: MemoryAuthority | str, portability: Portability | str, body: str, rationale: str,
                 provenance: tuple[ArtifactReference, ...], supersedes: str | None, generation: int,
-                receipt: PolicyEvaluation, acceptance_baseline: str | None, history: tuple[PolicyEvaluation, ...], retired_at: datetime | None,
+                receipt: PolicyEvaluation, accepted_semantic_hash: str | None, history: tuple[PolicyEvaluation, ...], retired_at: datetime | None,
                 retirement_reason: str | None) -> MemoryRecord:
         try:
             parsed_kind = kind if isinstance(kind, MemoryKind) else MemoryKind(kind)
@@ -353,7 +355,7 @@ class MemoryStore:
                                         portability=parsed_portability, body=body, rationale=rationale, provenance=provenance,
                                         supersedes=supersedes)
         return MemoryRecord(memory_id, parsed_kind, status, parsed_scope, parsed_authority, parsed_portability, body,
-                            rationale, provenance, supersedes, generation, semantic, receipt, acceptance_baseline, history, retired_at, retirement_reason)
+                            rationale, provenance, supersedes, generation, semantic, receipt, accepted_semantic_hash, history, retired_at, retirement_reason)
 
     def _validate_admission(self, record: MemoryRecord, receipt: PolicyEvaluation) -> None:
         if self.storage_class is StorageClass.PORTABLE and any(
@@ -418,7 +420,7 @@ class MemoryStore:
             "rationale": record.rationale, "provenance": [_reference_dict(item) for item in record.provenance],
             "supersedes": record.supersedes, "generation": record.generation, "semantic_hash": record.semantic_hash,
             "policy_receipt": _receipt_dict(record.policy_receipt),
-            "acceptance_baseline": record.acceptance_baseline,
+            "accepted_semantic_hash": record.accepted_semantic_hash,
             "receipt_history": [_receipt_dict(item) for item in record.receipt_history],
             "retired_at": None if record.retired_at is None else _timestamp_text(record.retired_at),
             "retirement_reason": record.retirement_reason,
@@ -427,13 +429,13 @@ class MemoryStore:
 
     def _parse(self, document: ArtifactDocument, memory_id: str) -> MemoryRecord:
         metadata = dict(document.metadata)
-        keys = {"schema", "id", "kind", "status", "scope", "authority", "portability", "rationale", "provenance", "supersedes", "generation", "semantic_hash", "policy_receipt", "acceptance_baseline", "receipt_history", "retired_at", "retirement_reason"}
+        keys = {"schema", "id", "kind", "status", "scope", "authority", "portability", "rationale", "provenance", "supersedes", "generation", "semantic_hash", "policy_receipt", "accepted_semantic_hash", "receipt_history", "retired_at", "retirement_reason"}
         if set(metadata) != keys or metadata.get("schema") != _SCHEMA or metadata.get("id") != memory_id or not isinstance(document.body, str):
             raise InvalidArtifact("memory record has an invalid schema")
         try:
             record = self._record(memory_id, metadata["kind"], MemoryStatus(metadata["status"]), metadata["scope"], metadata["authority"], metadata["portability"],
                 document.body, metadata["rationale"], _references(metadata["provenance"]), metadata["supersedes"], metadata["generation"],
-                _parse_receipt(metadata["policy_receipt"]), metadata["acceptance_baseline"], tuple(_parse_receipt(item) for item in _list(metadata["receipt_history"], "receipt history")),
+                _parse_receipt(metadata["policy_receipt"]), metadata["accepted_semantic_hash"], tuple(_parse_receipt(item) for item in _list(metadata["receipt_history"], "receipt history")),
                 None if metadata["retired_at"] is None else _parse_timestamp(metadata["retired_at"]), metadata["retirement_reason"])
         except (TypeError, ValueError) as exc:
             raise InvalidArtifact("memory record has invalid values") from exc
@@ -501,7 +503,7 @@ def render_profile(
     records = tuple(
         record for record in all_records if record.scope == selected_scope
         and record.kind is MemoryKind.PREFERENCE and record.status is MemoryStatus.ACCEPTED
-        and not _has_accepted_successor(record, by_id)
+        and not _has_successor(record, by_id)
     )
     records = tuple(sorted(records, key=lambda item: item.id))
     lines = ["# PROFILE", "", f"storage_class: {storage_class.value}", f"scope: {selected_scope.type.value}"]
@@ -526,11 +528,10 @@ def render_profile(
     return ContextView("profile", mode, text, resolved, None, ResolutionState.RESOLVED, None, ResolutionState.RESOLVED)
 
 
-def _has_accepted_successor(record: MemoryRecord, by_id: Mapping[str, MemoryRecord]) -> bool:
+def _has_successor(record: MemoryRecord, by_id: Mapping[str, MemoryRecord]) -> bool:
     if record.superseded_by is None:
         return False
-    successor = by_id.get(record.superseded_by)
-    return successor is not None and successor.status is MemoryStatus.ACCEPTED
+    return record.superseded_by in by_id
 
 
 def _profile_provenance(provenance: tuple[ArtifactReference, ...]) -> str:

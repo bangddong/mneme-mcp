@@ -91,3 +91,34 @@ def test_profile_excludes_accepted_superseded_preferences_and_shows_audit_metada
     assert successor.id in view.text
     assert "provenance: none" in view.text
     assert "policy_receipt:" in view.text
+
+
+def test_retired_accepted_successor_keeps_predecessor_superseded_and_can_be_replaced(vault):
+    from mneme.core.memories import MemoryReaders, MemoryStore, render_profile
+
+    store = MemoryStore(vault)
+    original = store.submit_candidate("preference", {"type": "personal-global"}, "personal", "personal-vault", "Original.", _receipt(vault, "Original.", kind="preference"))
+    original = store.promote(original.id, 0, _receipt(vault, original.body, kind="preference"))
+    successor = store.supersede(
+        original.id, 1, body="Accepted successor.",
+        receipt=_receipt(vault, "Accepted successor.", kind="preference", supersedes=original.id),
+    )
+    successor = store.promote(successor.id, 0, _receipt(vault, successor.body, kind="preference", supersedes=original.id))
+    retired = store.retire(successor.id, 1, "obsolete successor")
+
+    retired_view = render_profile(MemoryReaders(store), {"type": "personal-global"})
+    assert original.id not in retired_view.text
+    assert successor.id not in retired_view.text
+    assert retired.accepted_semantic_hash == retired.semantic_hash
+
+    replacement = store.supersede(
+        retired.id, 2, body="Later replacement.",
+        receipt=_receipt(vault, "Later replacement.", kind="preference", supersedes=retired.id),
+    )
+    replacement = store.promote(replacement.id, 0, _receipt(vault, replacement.body, kind="preference", supersedes=retired.id))
+    final_view = render_profile(MemoryReaders(store), {"type": "personal-global"})
+
+    assert replacement.id in final_view.text
+    assert original.id not in final_view.text and successor.id not in final_view.text
+    assert store.read(original.id).superseded_by == successor.id
+    assert store.read(successor.id).superseded_by == replacement.id
