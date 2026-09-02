@@ -531,7 +531,8 @@ def render_profile(
 def _has_successor(record: MemoryRecord, by_id: Mapping[str, MemoryRecord]) -> bool:
     if record.superseded_by is None:
         return False
-    return record.superseded_by in by_id
+    successor = by_id.get(record.superseded_by)
+    return successor is not None and successor.accepted_semantic_hash is not None
 
 
 def _profile_provenance(provenance: tuple[ArtifactReference, ...]) -> str:

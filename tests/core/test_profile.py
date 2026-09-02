@@ -122,3 +122,23 @@ def test_retired_accepted_successor_keeps_predecessor_superseded_and_can_be_repl
     assert original.id not in final_view.text and successor.id not in final_view.text
     assert store.read(original.id).superseded_by == successor.id
     assert store.read(successor.id).superseded_by == replacement.id
+
+
+@pytest.mark.parametrize("retire_successor", [False, True])
+def test_candidate_successor_does_not_displace_an_active_preference(vault, retire_successor):
+    from mneme.core.memories import MemoryReaders, MemoryStore, render_profile
+
+    store = MemoryStore(vault)
+    original = store.submit_candidate("preference", {"type": "personal-global"}, "personal", "personal-vault", "Still active.", _receipt(vault, "Still active.", kind="preference"))
+    original = store.promote(original.id, 0, _receipt(vault, original.body, kind="preference"))
+    candidate = store.supersede(
+        original.id, 1, body="Candidate successor only.",
+        receipt=_receipt(vault, "Candidate successor only.", kind="preference", supersedes=original.id),
+    )
+    if retire_successor:
+        candidate = store.retire(candidate.id, 0, "never accepted")
+        assert candidate.accepted_semantic_hash is None
+
+    view = render_profile(MemoryReaders(store), {"type": "personal-global"})
+    assert original.id in view.text
+    assert candidate.id not in view.text
