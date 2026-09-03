@@ -6,19 +6,43 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import re
 import sqlite3
 import tempfile
+import threading
 from typing import Iterable, Mapping
 
+from mneme.core.errors import InvalidArtifact
 from mneme.core.fs import exclusive_file_lock
-from mneme.core.memories import MemoryStore
+from mneme.core.memories import MemoryAuthority, MemoryScope, MemoryStore
 from mneme.core.registries import RegistryStore
 from mneme.core.sessions import SessionRevisionRef, SessionStore
 from mneme.core.sources.filesystem import FileSystemSource
 from mneme.core.sources.registry import SourceBinding
+from mneme.core.validation.vault import validate_identifier
 
 from .korean import expand_query, expand_token
+
+
+_INDEX_LOCKS_GUARD = threading.Lock()
+_INDEX_LOCKS: dict[Path, threading.Lock] = {}
+_CONTENT_HASH = re.compile(r"^[0-9a-f]{64}$")
+_REGISTRY_CATEGORIES = frozenset(
+    {"project-registry", "source-registry", "workstream-registry"}
+)
+_CATEGORIES = _REGISTRY_CATEGORIES | {"memory", "session", "source"}
+_CACHE_ERRORS = (
+    OSError,
+    sqlite3.Error,
+    TypeError,
+    ValueError,
+    AttributeError,
+    KeyError,
+    IndexError,
+    OverflowError,
+    InvalidArtifact,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,12 +73,31 @@ class RecallHit:
     scope: dict[str, object] | None = None
 
 
+def _unavailable_report() -> IndexReport:
+    return IndexReport(
+        0, 0, "degraded", ("generated index is unavailable",), usable=False
+    )
+
+
+def _corrupt_report(exc: BaseException) -> IndexReport:
+    return IndexReport(
+        0,
+        0,
+        "degraded",
+        (f"generated index is corrupt: {type(exc).__name__}",),
+        usable=False,
+    )
+
+
 class GeneratedIndex:
     """A local SQLite cache which can be discarded and rebuilt at any time."""
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.lock_path = self.db_path.with_name(f".{self.db_path.name}.lock")
+        normalized = self.lock_path.resolve(strict=False)
+        with _INDEX_LOCKS_GUARD:
+            self._process_lock = _INDEX_LOCKS.setdefault(normalized, threading.Lock())
 
     def rebuild(self, vault: object, bound_sources: Iterable[SourceBinding]) -> IndexReport:
         """Replace this generated database from Vault files and available mounts."""
@@ -122,45 +165,52 @@ class GeneratedIndex:
 
     def inspect(self) -> IndexReport:
         """Return validated operational index state without granting policy authority."""
-        if not self.db_path.is_file():
-            return IndexReport(
-                0, 0, "degraded", ("generated index is unavailable",), usable=False
-            )
         try:
-            with exclusive_file_lock(self.lock_path):
-                conn = sqlite3.connect(self.db_path)
-                try:
-                    return self._inspect_connection(conn)
-                finally:
-                    conn.close()
-        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
-            return IndexReport(
-                0,
-                0,
-                "degraded",
-                (f"generated index is corrupt: {type(exc).__name__}",),
-                usable=False,
-            )
+            with self._process_lock:
+                with exclusive_file_lock(self.lock_path):
+                    if not self.db_path.is_file():
+                        return _unavailable_report()
+                    conn = sqlite3.connect(self.db_path)
+                    try:
+                        return self._inspect_connection(conn)
+                    finally:
+                        conn.close()
+        except _CACHE_ERRORS as exc:
+            return _corrupt_report(exc)
 
     def search(self, query: str, limit: int, scope: object = None) -> list[RecallHit]:
-        if limit <= 0 or not isinstance(query, str) or not query.strip() or not self.db_path.is_file():
-            return []
+        """Return candidates only; callers needing status use ``search_snapshot``."""
+        _report, hits = self.search_snapshot(query, limit, scope)
+        return hits
+
+    def search_snapshot(
+        self, query: str, limit: int, scope: object = None
+    ) -> tuple[IndexReport, list[RecallHit]]:
+        """Inspect and read candidates from one serialized index snapshot."""
         try:
-            with exclusive_file_lock(self.lock_path):
-                conn = sqlite3.connect(self.db_path)
-                try:
-                    report = self._inspect_connection(conn)
-                    if report.status == "invalid":
-                        return []
-                    conn.row_factory = sqlite3.Row
-                    rows = self._search_rows(
-                        conn, query, -1 if scope is not None else limit
-                    )
-                    return self._decode_hits(rows, query, limit, scope)
-                finally:
-                    conn.close()
-        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
-            return []
+            with self._process_lock:
+                with exclusive_file_lock(self.lock_path):
+                    if not self.db_path.is_file():
+                        return _unavailable_report(), []
+                    conn = sqlite3.connect(self.db_path)
+                    try:
+                        report = self._inspect_connection(conn)
+                        if (
+                            report.status == "invalid"
+                            or limit <= 0
+                            or not isinstance(query, str)
+                            or not query.strip()
+                        ):
+                            return report, []
+                        conn.row_factory = sqlite3.Row
+                        rows = self._search_rows(
+                            conn, query, -1 if scope is not None else limit
+                        )
+                        return report, self._decode_hits(rows, query, limit, scope)
+                    finally:
+                        conn.close()
+        except _CACHE_ERRORS as exc:
+            return _corrupt_report(exc), []
 
     @staticmethod
     def _decode_hits(rows: object, query: str, limit: int, scope: object) -> list[RecallHit]:
@@ -255,22 +305,23 @@ class GeneratedIndex:
 
     def _publish(self, temporary: Path) -> None:
         """Publish under the API lock, using SQLite backup for an open target."""
-        with exclusive_file_lock(self.lock_path):
-            if self.db_path.is_file():
-                source = target = None
-                try:
-                    source = sqlite3.connect(temporary)
-                    target = sqlite3.connect(self.db_path)
-                    source.backup(target)
-                    return
-                except sqlite3.DatabaseError:
-                    pass
-                finally:
-                    if target is not None:
-                        target.close()
-                    if source is not None:
-                        source.close()
-            os.replace(temporary, self.db_path)
+        with self._process_lock:
+            with exclusive_file_lock(self.lock_path):
+                if self.db_path.is_file():
+                    source = target = None
+                    try:
+                        source = sqlite3.connect(temporary)
+                        target = sqlite3.connect(self.db_path)
+                        source.backup(target)
+                        return
+                    except sqlite3.DatabaseError:
+                        pass
+                    finally:
+                        if target is not None:
+                            target.close()
+                        if source is not None:
+                            source.close()
+                os.replace(temporary, self.db_path)
 
     @staticmethod
     def _inspect_connection(conn: sqlite3.Connection) -> IndexReport:
@@ -298,10 +349,7 @@ class GeneratedIndex:
             isinstance(item, str) for item in diagnostics_value
         ):
             raise ValueError("generated index diagnostics are invalid")
-        for (encoded_scope,) in conn.execute("SELECT scope FROM recall_meta"):
-            decoded_scope = json.loads(encoded_scope)
-            if decoded_scope is not None and not isinstance(decoded_scope, dict):
-                raise ValueError("generated scope metadata is invalid")
+        GeneratedIndex._validate_candidate_rows(conn)
         if row[1] == "invalid" and (
             rows != 0
             or conn.execute("SELECT EXISTS(SELECT 1 FROM recall_meta)").fetchone()[0]
@@ -309,6 +357,37 @@ class GeneratedIndex:
         ):
             raise sqlite3.DatabaseError("invalid generated index contains candidate rows")
         return IndexReport(rows, source_rows, row[1], tuple(diagnostics_value))
+
+    @staticmethod
+    def _validate_candidate_rows(conn: sqlite3.Connection) -> None:
+        columns = (
+            "key, category, artifact_id, revision, source_id, path, authority, "
+            "portability, policy_status, content_hash, scope, excerpt_base"
+        )
+        metadata: dict[str, tuple[object, ...]] = {}
+        for row in conn.execute(f"SELECT {columns} FROM recall_meta"):
+            key = _required_text(row[0], "candidate key")
+            if key in metadata:
+                raise sqlite3.DatabaseError("generated candidate key is duplicated")
+            _validate_metadata_row(row)
+            metadata[key] = row
+
+        content_by_key: dict[str, str] = {}
+        for key_value, content_value in conn.execute("SELECT key, content FROM recall_fts"):
+            key = _required_text(key_value, "FTS key")
+            content = _required_text(content_value, "FTS content")
+            if key in content_by_key:
+                raise sqlite3.DatabaseError("generated FTS key is duplicated")
+            content_by_key[key] = content
+
+        if metadata.keys() != content_by_key.keys():
+            raise sqlite3.DatabaseError("generated candidate tables do not match")
+        for key, row in metadata.items():
+            content = content_by_key[key]
+            if row[9] != sha256(content.encode("utf-8")).hexdigest():
+                raise sqlite3.DatabaseError("generated candidate content hash is invalid")
+            if row[11] > (2**63 - 1) - len(content):
+                raise sqlite3.DatabaseError("generated candidate excerpt range is invalid")
 
     @staticmethod
     def _search_rows(conn: sqlite3.Connection, query: str, limit: int):
@@ -327,6 +406,140 @@ class GeneratedIndex:
                 return conn.execute(sql, (literal, limit)).fetchall()
             except sqlite3.OperationalError:
                 return []
+
+
+def _validate_metadata_row(row: tuple[object, ...]) -> None:
+    (
+        key_value,
+        category_value,
+        artifact_id_value,
+        revision,
+        source_id,
+        path,
+        authority_value,
+        portability_value,
+        policy_status_value,
+        content_hash_value,
+        encoded_scope,
+        excerpt_base,
+    ) = row
+    key = _required_text(key_value, "candidate key")
+    category = _required_text(category_value, "candidate category")
+    artifact_id = _required_identifier(artifact_id_value, "candidate artifact id")
+    authority = _required_identifier(authority_value, "candidate authority")
+    portability = _required_text(portability_value, "candidate portability")
+    policy_status = _required_text(policy_status_value, "candidate policy status")
+    content_hash = _required_text(content_hash_value, "candidate content hash")
+    if category not in _CATEGORIES:
+        raise ValueError("generated candidate category is invalid")
+    if not _CONTENT_HASH.fullmatch(content_hash):
+        raise ValueError("generated candidate content hash is invalid")
+    if (
+        not isinstance(excerpt_base, int)
+        or isinstance(excerpt_base, bool)
+        or excerpt_base < 0
+    ):
+        raise ValueError("generated candidate excerpt base is invalid")
+    if not isinstance(encoded_scope, str):
+        raise TypeError("generated candidate scope is not text")
+    scope = json.loads(encoded_scope)
+    if scope is not None and not isinstance(scope, dict):
+        raise ValueError("generated candidate scope is invalid")
+    if encoded_scope != json.dumps(scope, sort_keys=True):
+        raise ValueError("generated candidate scope is not canonical JSON")
+
+    if category == "source":
+        source = _required_identifier(source_id, "candidate source id")
+        source_path = _required_source_path(path)
+        key_prefix = f"source:{artifact_id}:{source_path}:"
+        chunk_number = key.removeprefix(key_prefix)
+        if (
+            revision is not None
+            or artifact_id != source
+            or portability != "local-only"
+            or policy_status != "available"
+            or not key.startswith(key_prefix)
+            or not chunk_number.isdigit()
+            or str(int(chunk_number)) != chunk_number
+        ):
+            raise ValueError("generated source candidate is inconsistent")
+        if scope is not None:
+            if set(scope) != {"project_id"}:
+                raise ValueError("generated source scope is invalid")
+            _required_identifier(scope["project_id"], "candidate project id")
+        return
+
+    if source_id is not None or path is not None:
+        raise ValueError("generated Vault candidate names a mounted source")
+    if category == "memory":
+        if (
+            revision is not None
+            or key != f"memory:{artifact_id}"
+            or authority not in {item.value for item in MemoryAuthority}
+            or portability not in {"local-only", "personal-vault", "shareable"}
+            or policy_status != "recorded"
+            or excerpt_base != 0
+        ):
+            raise ValueError("generated Memory candidate is inconsistent")
+        MemoryScope.parse(scope)
+        return
+
+    if category == "session":
+        session_revision = _required_identifier(revision, "candidate Session revision")
+        if not isinstance(scope, dict) or set(scope) != {"workstream_id"}:
+            raise ValueError("generated Session scope is invalid")
+        workstream_id = _required_identifier(
+            scope["workstream_id"], "candidate workstream id"
+        )
+        if (
+            key != f"session:{workstream_id}:{artifact_id}:{session_revision}"
+            or authority != "personal"
+            or portability not in {"portable", "local-only"}
+            or policy_status != "recorded"
+            or excerpt_base != 0
+        ):
+            raise ValueError("generated Session candidate is inconsistent")
+        return
+
+    if (
+        revision is not None
+        or scope is not None
+        or key != f"{category}:{artifact_id}"
+        or portability != "personal-vault"
+        or policy_status != "available"
+        or excerpt_base != 0
+    ):
+        raise ValueError("generated Registry candidate is inconsistent")
+
+
+def _required_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TypeError(f"generated {label} must be non-empty text")
+    return value
+
+
+def _required_identifier(value: object, label: str) -> str:
+    text = _required_text(value, label)
+    validate_identifier(text, label=label)
+    return text
+
+
+def _required_source_path(value: object) -> str:
+    path = _required_text(value, "candidate source path")
+    posix = PurePosixPath(path)
+    windows = PureWindowsPath(path)
+    if (
+        "\\" in path
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or ".." in posix.parts
+        or posix.suffix.lower() != ".md"
+        or posix.as_posix() != path
+    ):
+        raise ValueError("generated candidate source path is unsafe")
+    return path
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,6 @@
 import sys
 import sqlite3
+from hashlib import sha256
 
 import pytest
 
@@ -113,7 +114,7 @@ def test_core_recall_withholds_tampered_memory_provenance(vault_with_memory):
             """
             UPDATE recall_meta
             SET authority = 'external-reference', portability = 'local-only',
-                scope = '{"type":"workstream","workstream_id":"forged"}'
+                scope = '{"type": "workstream", "workstream_id": "forged"}'
             WHERE category = 'memory'
             """
         )
@@ -157,22 +158,22 @@ def test_withheld_candidate_does_not_consume_the_authorized_result_limit(
         connection.execute(
             "INSERT INTO recall_meta VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                "a-forged",
-                "unknown",
+                "memory:forged",
+                "memory",
                 "forged",
                 None,
                 None,
                 None,
                 "personal",
                 "personal-vault",
-                "allowed",
-                "0" * 64,
-                "null",
+                "recorded",
+                sha256(b"checkpoint").hexdigest(),
+                '{"type": "personal-global"}',
                 0,
             ),
         )
         connection.execute(
-            "INSERT INTO recall_fts VALUES (?, ?)", ("a-forged", "checkpoint")
+            "INSERT INTO recall_fts VALUES (?, ?)", ("memory:forged", "checkpoint")
         )
 
     result = service.recall("checkpoint", 1)
@@ -190,10 +191,16 @@ def test_core_recall_withholds_excerpt_not_present_in_canonical_content(
 
     service = CoreService(vault_with_memory)
     service.reindex()
+    forged = "forged checkpoint disclosure"
     with sqlite3.connect(service.index.db_path) as connection:
         connection.execute(
-            "UPDATE recall_fts SET content = 'forged checkpoint disclosure' "
-            "WHERE key IN (SELECT key FROM recall_meta WHERE category = 'memory')"
+            "UPDATE recall_fts SET content = ? "
+            "WHERE key IN (SELECT key FROM recall_meta WHERE category = 'memory')",
+            (forged,),
+        )
+        connection.execute(
+            "UPDATE recall_meta SET content_hash = ? WHERE category = 'memory'",
+            (sha256(forged.encode("utf-8")).hexdigest(),),
         )
 
     result = service.recall("checkpoint", 10)
@@ -293,3 +300,84 @@ def test_malformed_cached_scope_is_rebuilt_without_escaping_json_error(
     assert result.status == "resolved"
     assert len(result.hits) == 1
     assert result.hits[0].scope == {"type": "personal-global"}
+
+
+def test_malformed_cached_excerpt_base_is_rebuilt_before_candidates(
+    vault_with_memory,
+):
+    """Catches a non-integer offset becoming an indistinguishable empty result."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    with sqlite3.connect(service.index.db_path) as connection:
+        connection.execute("UPDATE recall_meta SET excerpt_base = 'bad'")
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "resolved"
+    assert len(result.hits) == 1
+    assert result.hits[0].category == "memory"
+
+
+def test_malformed_cached_fts_content_is_rebuilt_without_decoder_exception(
+    vault_with_memory,
+):
+    """Catches a non-text FTS value escaping candidate decoding as AttributeError."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    with sqlite3.connect(service.index.db_path) as connection:
+        connection.execute("UPDATE recall_fts SET content = 42")
+
+    result = service.recall("42", 10)
+    with sqlite3.connect(service.index.db_path) as connection:
+        stored_type, content = connection.execute(
+            "SELECT typeof(content), content FROM recall_fts"
+        ).fetchone()
+
+    assert result.status == "resolved"
+    assert result.hits == ()
+    assert stored_type == "text"
+    assert "Checkpoint recall" in content
+
+
+def test_malformed_cached_identifier_is_rebuilt_without_domain_exception(
+    vault_with_memory,
+):
+    """Catches generated-row domain validation escaping the cache boundary."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    with sqlite3.connect(service.index.db_path) as connection:
+        connection.execute("UPDATE recall_meta SET artifact_id = 'bad/id'")
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "resolved"
+    assert len(result.hits) == 1
+    assert result.hits[0].category == "memory"
+
+
+def test_sqlite_candidate_error_is_a_structured_degradation(vault_with_memory):
+    """Catches a non-DatabaseError SQLite failure escaping the recall boundary."""
+    from mneme.core.search.index import GeneratedIndex
+    from mneme.core.service import CoreService
+
+    class FailingIndex(GeneratedIndex):
+        def _search_rows(self, connection, query, limit):
+            raise sqlite3.InterfaceError("malformed generated row")
+
+    index = FailingIndex(vault_with_memory.local_root / "index" / "state.db")
+    service = CoreService(vault_with_memory, index)
+    service.reindex()
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "degraded"
+    assert result.hits == ()
+    assert result.diagnostics == (
+        "generated index is corrupt: InterfaceError",
+    )

@@ -49,24 +49,43 @@ class CoreService:
         return IndexReport(report.rows, report.source_rows, status, all_diagnostics)
 
     def recall(self, query: str, limit: int, scope: object = None) -> RecallResult:
-        report = self.index.inspect()
-        if not report.usable:
-            try:
-                report = self.reindex()
-            except Exception as exc:
-                return RecallResult(
-                    (),
-                    "degraded",
-                    (f"generated index rebuild failed: {type(exc).__name__}",),
-                )
-        if report.status == "invalid":
-            return RecallResult((), "invalid", report.diagnostics)
         hits: list[RecallHit] = []
         diagnostics = list(self._bound_sources()[1])
         candidate_limit = limit
         processed = 0
-        while candidate_limit > 0:
-            candidates = self.index.search(query, candidate_limit, scope)
+        rebuilt = False
+        while True:
+            report, candidates = self.index.search_snapshot(
+                query, candidate_limit, scope
+            )
+            if not report.usable:
+                if rebuilt:
+                    return RecallResult(
+                        (),
+                        "degraded",
+                        tuple(sorted(set(diagnostics + list(report.diagnostics)))),
+                    )
+                try:
+                    rebuilt_report = self.reindex()
+                except Exception as exc:
+                    return RecallResult(
+                        (),
+                        "degraded",
+                        (f"generated index rebuild failed: {type(exc).__name__}",),
+                    )
+                if rebuilt_report.status == "invalid":
+                    return RecallResult(
+                        (), "invalid", rebuilt_report.diagnostics
+                    )
+                rebuilt = True
+                processed = 0
+                candidate_limit = limit
+                continue
+            if report.status == "invalid":
+                return RecallResult((), "invalid", report.diagnostics)
+            diagnostics.extend(report.diagnostics)
+            if candidate_limit <= 0:
+                break
             for candidate in candidates[processed:]:
                 try:
                     if self._authorize(candidate):

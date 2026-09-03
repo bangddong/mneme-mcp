@@ -1,6 +1,7 @@
 import pytest
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 
 @pytest.fixture
@@ -211,3 +212,127 @@ def test_concurrent_rebuilds_use_independent_staging_databases(vault, monkeypatc
     assert len(stage_paths) == 2
     assert len(set(stage_paths)) == 2
     assert first.search("concurrency", 10)
+
+
+def test_separate_index_instances_serialize_before_the_windows_file_lock(
+    vault, monkeypatch
+):
+    """Catches same-process overlap reaching Windows' bounded file-lock retry."""
+    from mneme.core.registries import RegistryStore
+    from mneme.core.search import index as index_module
+    from mneme.core.search.index import GeneratedIndex
+
+    RegistryStore(vault).register_project("project-process-lock")
+    db_path = vault.local_root / "index" / "state.db"
+    entered = threading.Event()
+    release = threading.Event()
+    publishing = threading.Event()
+    active_guard = threading.Lock()
+    active = False
+
+    class BlockingReader(GeneratedIndex):
+        def _search_rows(self, connection, query, limit):
+            entered.set()
+            if not release.wait(timeout=5):
+                raise AssertionError("test did not release the index reader")
+            return GeneratedIndex._search_rows(connection, query, limit)
+
+    class SignallingWriter(GeneratedIndex):
+        def _publish(self, temporary):
+            publishing.set()
+            return super()._publish(temporary)
+
+    reader_index = BlockingReader(db_path)
+    writer_index = SignallingWriter(db_path)
+    reader_index.rebuild(vault, ())
+
+    @contextmanager
+    def windows_style_file_lock(_path):
+        nonlocal active
+        with active_guard:
+            if active:
+                raise OSError("simulated Windows EDEADLK")
+            active = True
+        try:
+            yield
+        finally:
+            with active_guard:
+                active = False
+
+    monkeypatch.setattr(index_module, "exclusive_file_lock", windows_style_file_lock)
+    errors = []
+
+    def search():
+        try:
+            reader_index.search("process-lock", 10)
+        except Exception as exc:
+            errors.append(exc)
+
+    def rebuild():
+        try:
+            writer_index.rebuild(vault, ())
+        except Exception as exc:
+            errors.append(exc)
+
+    reader = threading.Thread(target=search)
+    writer = threading.Thread(target=rebuild)
+    reader.start()
+    assert entered.wait(timeout=5)
+    writer.start()
+    assert publishing.wait(timeout=5)
+    release.set()
+    reader.join(timeout=5)
+    writer.join(timeout=5)
+
+    assert not reader.is_alive() and not writer.is_alive()
+    assert errors == []
+    assert writer_index.search("process-lock", 10)
+
+
+def test_recall_observes_invalid_rebuild_between_setup_and_candidate_snapshot(vault):
+    """Catches separate inspect/search locks reporting resolved after invalid publish."""
+    from mneme.core.search.index import GeneratedIndex
+    from mneme.core.service import CoreService
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausingService(CoreService):
+        pause = False
+
+        def _bound_sources(self):
+            result = super()._bound_sources()
+            if self.pause:
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError("test did not release recall setup")
+            return result
+
+    service = PausingService(vault)
+    assert service.reindex().status == "resolved"
+    (vault.root / "memory" / "broken.md").write_text(
+        "---\nschema: invalid\n---\nbroken\n", encoding="utf-8"
+    )
+    service.pause = True
+    results = []
+    errors = []
+
+    def recall():
+        try:
+            results.append(service.recall("anything", 10))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=recall)
+    worker.start()
+    assert entered.wait(timeout=5)
+    separate = GeneratedIndex(service.index.db_path)
+    assert separate.rebuild(vault, ()).status == "invalid"
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0].status == "invalid"
+    assert results[0].hits == ()
