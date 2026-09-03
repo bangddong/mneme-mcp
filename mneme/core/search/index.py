@@ -32,6 +32,62 @@ _REGISTRY_CATEGORIES = frozenset(
     {"project-registry", "source-registry", "workstream-registry"}
 )
 _CATEGORIES = _REGISTRY_CATEGORIES | {"memory", "session", "source"}
+_SCHEMA_OBJECTS = frozenset(
+    {
+        "index_state",
+        "recall_fts",
+        "recall_fts_config",
+        "recall_fts_content",
+        "recall_fts_data",
+        "recall_fts_docsize",
+        "recall_fts_idx",
+        "recall_meta",
+        "sqlite_autoindex_recall_meta_1",
+    }
+)
+_FTS_DECLARATION = (
+    "CREATE VIRTUAL TABLE recall_fts USING "
+    "fts5(key UNINDEXED, content, tokenize='unicode61')"
+)
+_TABLE_DECLARATIONS = {
+    "recall_meta": (
+        "CREATE TABLE recall_meta ( key TEXT PRIMARY KEY, category TEXT NOT NULL, "
+        "artifact_id TEXT NOT NULL, revision TEXT, source_id TEXT, path TEXT, "
+        "authority TEXT NOT NULL, portability TEXT NOT NULL, policy_status TEXT "
+        "NOT NULL, content_hash TEXT NOT NULL, scope TEXT NOT NULL, excerpt_base "
+        "INTEGER NOT NULL )"
+    ),
+    "index_state": (
+        "CREATE TABLE index_state ( singleton INTEGER PRIMARY KEY CHECK "
+        "(singleton = 1), schema_version INTEGER NOT NULL, status TEXT NOT NULL, "
+        "rows INTEGER NOT NULL, source_rows INTEGER NOT NULL, diagnostics TEXT "
+        "NOT NULL )"
+    ),
+}
+_TABLE_COLUMNS = {
+    "recall_meta": (
+        (0, "key", "TEXT", 0, None, 1),
+        (1, "category", "TEXT", 1, None, 0),
+        (2, "artifact_id", "TEXT", 1, None, 0),
+        (3, "revision", "TEXT", 0, None, 0),
+        (4, "source_id", "TEXT", 0, None, 0),
+        (5, "path", "TEXT", 0, None, 0),
+        (6, "authority", "TEXT", 1, None, 0),
+        (7, "portability", "TEXT", 1, None, 0),
+        (8, "policy_status", "TEXT", 1, None, 0),
+        (9, "content_hash", "TEXT", 1, None, 0),
+        (10, "scope", "TEXT", 1, None, 0),
+        (11, "excerpt_base", "INTEGER", 1, None, 0),
+    ),
+    "index_state": (
+        (0, "singleton", "INTEGER", 0, None, 1),
+        (1, "schema_version", "INTEGER", 1, None, 0),
+        (2, "status", "TEXT", 1, None, 0),
+        (3, "rows", "INTEGER", 1, None, 0),
+        (4, "source_rows", "INTEGER", 1, None, 0),
+        (5, "diagnostics", "TEXT", 1, None, 0),
+    ),
+}
 _CACHE_ERRORS = (
     OSError,
     sqlite3.Error,
@@ -328,6 +384,7 @@ class GeneratedIndex:
         check = conn.execute("PRAGMA quick_check").fetchall()
         if check != [("ok",)]:
             raise sqlite3.DatabaseError("generated index integrity check failed")
+        _validate_schema(conn)
         row = conn.execute(
             "SELECT schema_version, status, rows, source_rows, diagnostics "
             "FROM index_state WHERE singleton = 1"
@@ -400,12 +457,64 @@ class GeneratedIndex:
         """
         try:
             return conn.execute(sql, (expand_query(query), limit)).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as expanded_error:
             literal = '"' + query.replace('"', '""') + '"'
             try:
                 return conn.execute(sql, (literal, limit)).fetchall()
-            except sqlite3.OperationalError:
-                return []
+            except sqlite3.OperationalError as literal_error:
+                raise literal_error from expanded_error
+
+
+def _validate_schema(conn: sqlite3.Connection) -> None:
+    objects = {
+        name: (object_type, table_name, declaration)
+        for object_type, name, table_name, declaration in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        )
+    }
+    if objects.keys() != _SCHEMA_OBJECTS:
+        raise sqlite3.DatabaseError("generated index schema objects are invalid")
+    fts_type, fts_table, fts_declaration = objects["recall_fts"]
+    if (
+        fts_type != "table"
+        or fts_table != "recall_fts"
+        or fts_declaration != _FTS_DECLARATION
+    ):
+        raise sqlite3.DatabaseError("generated recall_fts is not canonical FTS5")
+    for table, expected_declaration in _TABLE_DECLARATIONS.items():
+        object_type, table_name, declaration = objects[table]
+        if (
+            object_type != "table"
+            or table_name != table
+            or not isinstance(declaration, str)
+            or " ".join(declaration.split()) != expected_declaration
+        ):
+            raise sqlite3.DatabaseError(
+                f"generated {table} declaration is invalid"
+            )
+    for shadow in (
+        "recall_fts_config",
+        "recall_fts_content",
+        "recall_fts_data",
+        "recall_fts_docsize",
+        "recall_fts_idx",
+    ):
+        object_type, table_name, declaration = objects[shadow]
+        if object_type != "table" or table_name != shadow or not declaration:
+            raise sqlite3.DatabaseError("generated FTS5 shadow schema is invalid")
+    if objects["sqlite_autoindex_recall_meta_1"] != (
+        "index",
+        "recall_meta",
+        None,
+    ):
+        raise sqlite3.DatabaseError("generated recall_meta primary index is invalid")
+    for table, expected in _TABLE_COLUMNS.items():
+        if tuple(conn.execute(f"PRAGMA table_info({table})")) != expected:
+            raise sqlite3.DatabaseError(f"generated {table} columns are invalid")
+    if tuple(conn.execute("PRAGMA index_list(recall_meta)")) != (
+        (0, "sqlite_autoindex_recall_meta_1", 1, "pk", 0),
+    ) or tuple(conn.execute("PRAGMA index_list(index_state)")):
+        raise sqlite3.DatabaseError("generated application indexes are invalid")
 
 
 def _validate_metadata_row(row: tuple[object, ...]) -> None:

@@ -381,3 +381,67 @@ def test_sqlite_candidate_error_is_a_structured_degradation(vault_with_memory):
     assert result.diagnostics == (
         "generated index is corrupt: InterfaceError",
     )
+
+
+def test_ordinary_recall_table_is_rebuilt_as_a_corrupt_generated_cache(
+    vault_with_memory,
+):
+    """Catches a non-FTS lookalike cache becoming a resolved empty search."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    connection = sqlite3.connect(service.index.db_path)
+    try:
+        rows = connection.execute("SELECT key, content FROM recall_fts").fetchall()
+        connection.execute("DROP TABLE recall_fts")
+        connection.execute(
+            "CREATE TABLE recall_fts (key TEXT NOT NULL, content TEXT NOT NULL)"
+        )
+        connection.executemany("INSERT INTO recall_fts VALUES (?, ?)", rows)
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = service.recall("checkpoint", 10)
+    with sqlite3.connect(service.index.db_path) as connection:
+        declaration = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'recall_fts'"
+        ).fetchone()[0]
+
+    assert result.status == "resolved"
+    assert len(result.hits) == 1
+    assert result.hits[0].category == "memory"
+    assert declaration.startswith("CREATE VIRTUAL TABLE recall_fts USING fts5")
+
+
+def test_both_fts_query_failures_are_a_structured_degradation(
+    vault_with_memory, monkeypatch
+):
+    """Catches expanded and literal MATCH failures becoming resolved-empty."""
+    from mneme.core.search import index as index_module
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    real_connect = sqlite3.connect
+
+    class MatchFailureConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if " MATCH ?" in sql:
+                raise sqlite3.OperationalError("simulated FTS failure")
+            return super().execute(sql, parameters)
+
+    def connect(*args, **kwargs):
+        kwargs["factory"] = MatchFailureConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(index_module.sqlite3, "connect", connect)
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "degraded"
+    assert result.hits == ()
+    assert result.diagnostics == (
+        "generated index is corrupt: OperationalError",
+    )
