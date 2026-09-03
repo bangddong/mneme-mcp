@@ -49,9 +49,20 @@ class CoreService:
         return IndexReport(report.rows, report.source_rows, status, all_diagnostics)
 
     def recall(self, query: str, limit: int, scope: object = None) -> RecallResult:
-        report = self.reindex() if not self.index.db_path.is_file() else None
+        report = self.index.inspect()
+        if not report.usable:
+            try:
+                report = self.reindex()
+            except Exception as exc:
+                return RecallResult(
+                    (),
+                    "degraded",
+                    (f"generated index rebuild failed: {type(exc).__name__}",),
+                )
+        if report.status == "invalid":
+            return RecallResult((), "invalid", report.diagnostics)
         hits: list[RecallHit] = []
-        diagnostics = list(self._bound_sources()[1] if report is None else report.diagnostics)
+        diagnostics = list(self._bound_sources()[1])
         candidate_limit = limit
         processed = 0
         while candidate_limit > 0:

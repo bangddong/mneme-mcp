@@ -258,3 +258,38 @@ def test_core_recall_requires_current_registry_policy_reference(vault_with_memor
 
     assert result.hits == ()
     assert result.status == "degraded"
+
+
+def test_non_sqlite_cache_is_rebuilt_instead_of_returning_resolved_empty(
+    vault_with_memory,
+):
+    """Catches a corrupt generated database being treated as a successful empty search."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    service.index.db_path.write_bytes(b"this is not sqlite")
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "resolved"
+    assert len(result.hits) == 1
+    assert result.hits[0].category == "memory"
+
+
+def test_malformed_cached_scope_is_rebuilt_without_escaping_json_error(
+    vault_with_memory,
+):
+    """Catches malformed generated row JSON escaping the recall boundary."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault_with_memory)
+    service.reindex()
+    with sqlite3.connect(service.index.db_path) as connection:
+        connection.execute("UPDATE recall_meta SET scope = '{malformed'")
+
+    result = service.recall("checkpoint", 10)
+
+    assert result.status == "resolved"
+    assert len(result.hits) == 1
+    assert result.hits[0].scope == {"type": "personal-global"}

@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sqlite3
+import tempfile
 from typing import Iterable, Mapping
 
+from mneme.core.fs import exclusive_file_lock
 from mneme.core.memories import MemoryStore
 from mneme.core.registries import RegistryStore
 from mneme.core.sessions import SessionRevisionRef, SessionStore
@@ -24,6 +27,7 @@ class IndexReport:
     source_rows: int
     status: str
     diagnostics: tuple[str, ...] = ()
+    usable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,18 +54,24 @@ class GeneratedIndex:
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
+        self.lock_path = self.db_path.with_name(f".{self.db_path.name}.lock")
 
     def rebuild(self, vault: object, bound_sources: Iterable[SourceBinding]) -> IndexReport:
         """Replace this generated database from Vault files and available mounts."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         rows: list[_IndexRow] = []
         diagnostics: list[str] = []
-        canonical_invalid = False
         try:
             rows.extend(_vault_rows(vault))
         except Exception as exc:
-            canonical_invalid = True
-            diagnostics.append(f"canonical Vault indexing failed: {type(exc).__name__}")
+            report = IndexReport(
+                0,
+                0,
+                "invalid",
+                (f"canonical Vault indexing failed: {type(exc).__name__}",),
+            )
+            self._replace([], report)
+            return report
 
         for binding in sorted(tuple(bound_sources), key=lambda item: item.source_id):
             if not isinstance(binding, SourceBinding):
@@ -100,26 +110,65 @@ class GeneratedIndex:
             except Exception as exc:
                 diagnostics.append(f"source {binding.source_id} is unavailable: {type(exc).__name__}")
 
-        self._replace(rows)
         source_rows = sum(row.category == "source" for row in rows)
-        status = "invalid" if canonical_invalid else ("degraded" if diagnostics else "resolved")
-        return IndexReport(len(rows), source_rows, status, tuple(diagnostics))
+        report = IndexReport(
+            len(rows),
+            source_rows,
+            "degraded" if diagnostics else "resolved",
+            tuple(diagnostics),
+        )
+        self._replace(rows, report)
+        return report
+
+    def inspect(self) -> IndexReport:
+        """Return validated operational index state without granting policy authority."""
+        if not self.db_path.is_file():
+            return IndexReport(
+                0, 0, "degraded", ("generated index is unavailable",), usable=False
+            )
+        try:
+            with exclusive_file_lock(self.lock_path):
+                conn = sqlite3.connect(self.db_path)
+                try:
+                    return self._inspect_connection(conn)
+                finally:
+                    conn.close()
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            return IndexReport(
+                0,
+                0,
+                "degraded",
+                (f"generated index is corrupt: {type(exc).__name__}",),
+                usable=False,
+            )
 
     def search(self, query: str, limit: int, scope: object = None) -> list[RecallHit]:
         if limit <= 0 or not isinstance(query, str) or not query.strip() or not self.db_path.is_file():
             return []
         try:
-            conn = sqlite3.connect(self.db_path)
-            try:
-                conn.row_factory = sqlite3.Row
-                rows = self._search_rows(conn, query, -1 if scope is not None else limit)
-            finally:
-                conn.close()
-        except sqlite3.DatabaseError:
+            with exclusive_file_lock(self.lock_path):
+                conn = sqlite3.connect(self.db_path)
+                try:
+                    report = self._inspect_connection(conn)
+                    if report.status == "invalid":
+                        return []
+                    conn.row_factory = sqlite3.Row
+                    rows = self._search_rows(
+                        conn, query, -1 if scope is not None else limit
+                    )
+                    return self._decode_hits(rows, query, limit, scope)
+                finally:
+                    conn.close()
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
             return []
+
+    @staticmethod
+    def _decode_hits(rows: object, query: str, limit: int, scope: object) -> list[RecallHit]:
         hits: list[RecallHit] = []
         for row in rows:
             metadata = json.loads(row["scope"])
+            if metadata is not None and not isinstance(metadata, dict):
+                raise ValueError("generated scope metadata is invalid")
             if not _in_scope(metadata, scope):
                 continue
             content = row["content"]
@@ -146,10 +195,14 @@ class GeneratedIndex:
                 break
         return hits
 
-    def _replace(self, rows: list[_IndexRow]) -> None:
-        temporary = self.db_path.with_suffix(self.db_path.suffix + ".rebuilding")
-        if temporary.exists():
-            temporary.unlink()
+    def _replace(self, rows: list[_IndexRow], report: IndexReport) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self.db_path.parent,
+            prefix=f".{self.db_path.name}.",
+            suffix=".rebuilding",
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
         try:
             conn = sqlite3.connect(temporary)
             try:
@@ -162,6 +215,14 @@ class GeneratedIndex:
                         content_hash TEXT NOT NULL, scope TEXT NOT NULL, excerpt_base INTEGER NOT NULL
                     );
                     CREATE VIRTUAL TABLE recall_fts USING fts5(key UNINDEXED, content, tokenize='unicode61');
+                    CREATE TABLE index_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        schema_version INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        rows INTEGER NOT NULL,
+                        source_rows INTEGER NOT NULL,
+                        diagnostics TEXT NOT NULL
+                    );
                     """
                 )
                 for row in rows:
@@ -173,13 +234,81 @@ class GeneratedIndex:
                          json.dumps(row.scope, sort_keys=True), row.excerpt_base),
                     )
                     conn.execute("INSERT INTO recall_fts VALUES (?, ?)", (row.key, row.content))
+                conn.execute(
+                    "INSERT INTO index_state VALUES (1, 1, ?, ?, ?, ?)",
+                    (
+                        report.status,
+                        report.rows,
+                        report.source_rows,
+                        json.dumps(report.diagnostics, ensure_ascii=False),
+                    ),
+                )
                 conn.commit()
             finally:
                 conn.close()
-            temporary.replace(self.db_path)
+            self._publish(temporary)
         finally:
-            if temporary.exists():
+            try:
                 temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _publish(self, temporary: Path) -> None:
+        """Publish under the API lock, using SQLite backup for an open target."""
+        with exclusive_file_lock(self.lock_path):
+            if self.db_path.is_file():
+                source = target = None
+                try:
+                    source = sqlite3.connect(temporary)
+                    target = sqlite3.connect(self.db_path)
+                    source.backup(target)
+                    return
+                except sqlite3.DatabaseError:
+                    pass
+                finally:
+                    if target is not None:
+                        target.close()
+                    if source is not None:
+                        source.close()
+            os.replace(temporary, self.db_path)
+
+    @staticmethod
+    def _inspect_connection(conn: sqlite3.Connection) -> IndexReport:
+        check = conn.execute("PRAGMA quick_check").fetchall()
+        if check != [("ok",)]:
+            raise sqlite3.DatabaseError("generated index integrity check failed")
+        row = conn.execute(
+            "SELECT schema_version, status, rows, source_rows, diagnostics "
+            "FROM index_state WHERE singleton = 1"
+        ).fetchone()
+        if row is None or row[0] != 1 or row[1] not in {"resolved", "degraded", "invalid"}:
+            raise sqlite3.DatabaseError("generated index state is invalid")
+        rows, source_rows = row[2], row[3]
+        if (
+            not isinstance(rows, int)
+            or isinstance(rows, bool)
+            or rows < 0
+            or not isinstance(source_rows, int)
+            or isinstance(source_rows, bool)
+            or not 0 <= source_rows <= rows
+        ):
+            raise sqlite3.DatabaseError("generated index counts are invalid")
+        diagnostics_value = json.loads(row[4])
+        if not isinstance(diagnostics_value, list) or not all(
+            isinstance(item, str) for item in diagnostics_value
+        ):
+            raise ValueError("generated index diagnostics are invalid")
+        for (encoded_scope,) in conn.execute("SELECT scope FROM recall_meta"):
+            decoded_scope = json.loads(encoded_scope)
+            if decoded_scope is not None and not isinstance(decoded_scope, dict):
+                raise ValueError("generated scope metadata is invalid")
+        if row[1] == "invalid" and (
+            rows != 0
+            or conn.execute("SELECT EXISTS(SELECT 1 FROM recall_meta)").fetchone()[0]
+            or conn.execute("SELECT EXISTS(SELECT 1 FROM recall_fts)").fetchone()[0]
+        ):
+            raise sqlite3.DatabaseError("invalid generated index contains candidate rows")
+        return IndexReport(rows, source_rows, row[1], tuple(diagnostics_value))
 
     @staticmethod
     def _search_rows(conn: sqlite3.Connection, query: str, limit: int):
