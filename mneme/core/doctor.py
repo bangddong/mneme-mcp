@@ -21,7 +21,6 @@ from mneme.core.memories import MemoryStore
 from mneme.core.policy import PolicyRef, PolicyStore, reevaluate_portability
 from mneme.core.registries import HeadRef, RegistryStore, WorkstreamRegistry
 from mneme.core.search.index import GeneratedIndex, validate_generated_index_target
-from mneme.core.service import CoreService
 from mneme.core.sessions import SessionRevisionRef, SessionStore
 from mneme.core.sources.filesystem import FileSystemSource
 from mneme.core.sources.registry import SourceBindingStore
@@ -103,25 +102,8 @@ class Doctor:
         repairs: list[str] = []
         if repair:
             repairs.extend(self._remove_stale_locks())
-            if (
-                not any(
-                    issue.severity == "invalid"
-                    and issue.code not in {"generated-index-invalid"}
-                    for issue in issues
-                )
-                and any(
-                    issue.code in {"generated-index-rebuildable", "generated-index-invalid"}
-                    for issue in issues
-                )
-            ):
-                try:
-                    CoreService(self._vault, self._index).reindex()
-                except Exception:
-                    # A generated-index failure remains inspectable on the fresh pass.
-                    pass
-                else:
-                    repairs.append("generated-index-rebuilt")
-            issues = self._diagnose()
+            if any(issue.code.startswith("generated-index-") for issue in issues):
+                repairs.append("generated-index-manual-repair-required")
         return DoctorReport(_status(issues), tuple(issues), tuple(sorted(set(repairs))))
 
     def _diagnose(self) -> list[DoctorIssue]:
@@ -130,6 +112,8 @@ class Doctor:
             Vault.open(self._vault.root, self._vault.state_home)
         except Exception:
             issues.append(_issue("canonical-vault-invalid", "invalid", "vault"))
+        if not _canonical_tree_is_strict(self._vault.root):
+            issues.append(_issue("canonical-artifact-invalid", "invalid", "vault"))
         if self._unsafe_supplied_index:
             issues.append(_issue("generated-index-unsafe", "invalid", "generated:index"))
         try:
@@ -144,8 +128,8 @@ class Doctor:
         self._scan_policy_revisions(policies, issues)
 
         registries = RegistryStore(self._vault)
-        self._scan_projects(registries, issues)
-        self._scan_sources(registries, issues)
+        self._scan_projects(registries, policies, issues)
+        self._scan_sources(registries, policies, issues)
         self._scan_workstreams(registries, policies, issues)
         self._scan_memories(policies, issues)
         self._scan_generated_index(issues)
@@ -169,21 +153,25 @@ class Doctor:
                 except Exception:
                     issues.append(_issue("canonical-policy-invalid", "invalid", artifact))
 
-    def _scan_projects(self, registries: RegistryStore, issues: list[DoctorIssue]) -> None:
+    def _scan_projects(self, registries: RegistryStore, policies: PolicyStore, issues: list[DoctorIssue]) -> None:
         for path in _files(self._vault.root / "projects", ".yaml"):
             artifact = f"project:{_safe_id(path.stem)}"
             try:
-                registries.load_project(path.stem)
+                project = registries.load_project(path.stem)
+                if project.policy_ref is not None:
+                    policies.load_rule(project.policy_ref)
             except Exception:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
 
-    def _scan_sources(self, registries: RegistryStore, issues: list[DoctorIssue]) -> None:
+    def _scan_sources(self, registries: RegistryStore, policies: PolicyStore, issues: list[DoctorIssue]) -> None:
         bindings = SourceBindingStore(self._vault)
         for path in _files(self._vault.root / "sources", ".yaml"):
             source_id = path.stem
             artifact = f"source:{_safe_id(source_id)}"
             try:
                 source = registries.load_source(source_id)
+                if source.policy_ref is not None:
+                    policies.load_rule(source.policy_ref)
             except Exception:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
                 continue
@@ -412,3 +400,36 @@ def _safe_id(value: object) -> str:
     except Exception:
         return "invalid"
     return str(value)
+
+
+def _canonical_tree_is_strict(root: Path) -> bool:
+    """Reject hidden/symlinked or unexpected canonical entries; never skip them."""
+    expected = {
+        root / "projects": ".yaml",
+        root / "sources": ".yaml",
+        root / "memory": ".md",
+    }
+    try:
+        for directory, suffix in expected.items():
+            if directory.is_symlink() or not directory.is_dir():
+                return False
+            for item in directory.iterdir():
+                if item.is_symlink() or not item.is_file() or item.suffix != suffix:
+                    return False
+        workstreams = root / "workstreams"
+        if workstreams.is_symlink() or not workstreams.is_dir():
+            return False
+        for item in workstreams.iterdir():
+            if item.is_symlink() or not item.is_dir() or not (item / "workstream.yaml").is_file():
+                return False
+        policies = root / ".madi" / "policies"
+        if policies.is_symlink() or not policies.is_dir():
+            return False
+        for policy in policies.iterdir():
+            if policy.is_symlink() or not policy.is_dir():
+                return False
+            if any(child.is_symlink() or not child.is_file() or child.suffix != ".yaml" for child in policy.iterdir()):
+                return False
+        return True
+    except OSError:
+        return False

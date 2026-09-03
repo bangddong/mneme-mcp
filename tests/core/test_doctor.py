@@ -102,8 +102,8 @@ def test_doctor_marks_unbound_optional_source_degraded(vault):
     ]
 
 
-def test_doctor_rebuilds_only_generated_index_when_explicitly_requested(vault):
-    """Catches repair deleting or changing durable state while restoring an index."""
+def test_doctor_requires_explicit_manual_index_repair(vault):
+    """Catches Doctor invoking path-based index publication during diagnosis repair."""
     from mneme.core.doctor import Doctor
     from mneme.core.registries import RegistryStore
 
@@ -113,9 +113,9 @@ def test_doctor_rebuilds_only_generated_index_when_explicitly_requested(vault):
     before = session_path.read_text(encoding="utf-8")
     report = Doctor(vault).run(repair=True)
 
-    assert report.status == "resolved"
-    assert report.repairs == ("generated-index-rebuilt",)
-    assert (vault.local_root / "index" / "state.db").is_file()
+    assert report.status == "degraded"
+    assert report.repairs == ("generated-index-manual-repair-required",)
+    assert not (vault.local_root / "index" / "state.db").exists()
     assert session_path.read_text(encoding="utf-8") == before
     assert RegistryStore(vault).load_workstream("ws-01").active_heads == (head.as_head(),)
 
@@ -314,8 +314,8 @@ def test_doctor_reevaluates_session_against_new_project_policy_assignment(vault)
     ]
 
 
-def test_doctor_rebuilds_persisted_invalid_index_when_canonical_state_is_valid(vault):
-    """Catches an invalid generated snapshot being reported as resolved or left unrepaired."""
+def test_doctor_reports_persisted_invalid_index_for_manual_rebuild(vault):
+    """Catches an invalid generated snapshot being reported as resolved."""
     import sqlite3
 
     from mneme.core.doctor import Doctor
@@ -329,5 +329,5 @@ def test_doctor_rebuilds_persisted_invalid_index_when_canonical_state_is_valid(v
 
     report = Doctor(vault).run(repair=True)
 
-    assert report.status == "resolved"
-    assert "generated-index-rebuilt" in report.repairs
+    assert report.status == "invalid"
+    assert "generated-index-manual-repair-required" in report.repairs
