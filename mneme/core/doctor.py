@@ -18,14 +18,15 @@ from typing import Iterable
 from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact, PortabilityViolation
 from mneme.core.memories import MemoryStore
-from mneme.core.policy import PolicyRef, PolicyStore
-from mneme.core.registries import HeadRef, RegistryStore
-from mneme.core.search.index import GeneratedIndex
+from mneme.core.policy import PolicyRef, PolicyStore, reevaluate_portability
+from mneme.core.registries import HeadRef, RegistryStore, WorkstreamRegistry
+from mneme.core.search.index import GeneratedIndex, validate_generated_index_target
 from mneme.core.service import CoreService
 from mneme.core.sessions import SessionRevisionRef, SessionStore
 from mneme.core.sources.filesystem import FileSystemSource
 from mneme.core.sources.registry import SourceBindingStore
 from mneme.core.validation.vault import validate_identifier
+from mneme.core.vault import Vault
 
 
 _STALE_LOCK_AGE_SECONDS = 60 * 60
@@ -89,7 +90,9 @@ class Doctor:
         ):
             raise TypeError("Doctor requires a Vault and a positive lock age")
         self._vault = vault
-        self._index = index or GeneratedIndex(vault.local_root / "index" / "state.db")
+        expected = vault.local_root / "index" / "state.db"
+        self._unsafe_supplied_index = index is not None and index.db_path != expected
+        self._index = GeneratedIndex(expected) if self._unsafe_supplied_index else (index or GeneratedIndex(expected))
         self._stale_lock_age_seconds = stale_lock_age_seconds
 
     def run(self, *, repair: bool = False) -> DoctorReport:
@@ -101,8 +104,15 @@ class Doctor:
         if repair:
             repairs.extend(self._remove_stale_locks())
             if (
-                not any(issue.severity == "invalid" for issue in issues)
-                and any(issue.code == "generated-index-rebuildable" for issue in issues)
+                not any(
+                    issue.severity == "invalid"
+                    and issue.code not in {"generated-index-invalid"}
+                    for issue in issues
+                )
+                and any(
+                    issue.code in {"generated-index-rebuildable", "generated-index-invalid"}
+                    for issue in issues
+                )
             ):
                 try:
                     CoreService(self._vault, self._index).reindex()
@@ -116,6 +126,16 @@ class Doctor:
 
     def _diagnose(self) -> list[DoctorIssue]:
         issues: list[DoctorIssue] = []
+        try:
+            Vault.open(self._vault.root, self._vault.state_home)
+        except Exception:
+            issues.append(_issue("canonical-vault-invalid", "invalid", "vault"))
+        if self._unsafe_supplied_index:
+            issues.append(_issue("generated-index-unsafe", "invalid", "generated:index"))
+        try:
+            validate_generated_index_target(self._vault, self._index.db_path)
+        except Exception:
+            issues.append(_issue("generated-index-unsafe", "invalid", "generated:index"))
         policies = PolicyStore(self._vault)
         try:
             policies.load_active("vault-default", StorageClass.PORTABLE)
@@ -197,10 +217,12 @@ class Doctor:
                 registry = registries.load_workstream(workstream_id)
             except Exception:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
-                self._scan_session_files(workstream_id, (), policies, issues)
+                self._scan_session_files(workstream_id, (), None, policies, issues)
                 continue
             self._scan_workstream_policy_refs(registry.policy_refs, policies, artifact, issues)
-            self._scan_session_files(workstream_id, registry.active_heads, policies, issues)
+            self._scan_session_files(
+                workstream_id, registry.active_heads, registry, policies, issues
+            )
 
     def _scan_workstream_policy_refs(
         self,
@@ -219,6 +241,7 @@ class Doctor:
         self,
         workstream_id: str,
         active_heads: tuple[HeadRef, ...],
+        registry: WorkstreamRegistry | None,
         policies: PolicyStore,
         issues: list[DoctorIssue],
     ) -> None:
@@ -239,6 +262,14 @@ class Doctor:
                     continue
                 valid.add(ref.as_head())
                 self._scan_receipt(request.policy_evaluation, policies, artifact, issues)
+                if registry is not None:
+                    try:
+                        rules = sessions._applicable_policy_rules(request, registry)
+                        self._scan_reevaluation(
+                            request.policy_evaluation, rules, artifact, issues
+                        )
+                    except Exception:
+                        issues.append(_issue("policy-reevaluation-failed", "invalid", artifact))
         for head in active_heads:
             if head not in valid:
                 issues.append(_issue("missing-active-head", "invalid", f"workstream:{_safe_id(workstream_id)}"))
@@ -265,6 +296,11 @@ class Doctor:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
                 continue
             self._scan_receipt(record.policy_receipt, policies, artifact, issues)
+            try:
+                rules = store._applicable_policy_rules(record)
+                self._scan_reevaluation(record.policy_receipt, rules, artifact, issues)
+            except Exception:
+                issues.append(_issue("policy-reevaluation-failed", "invalid", artifact))
 
     @staticmethod
     def _scan_receipt(receipt: object, policies: PolicyStore, artifact: str, issues: list[DoctorIssue]) -> None:
@@ -280,16 +316,37 @@ class Doctor:
             if current != ref:
                 issues.append(_issue("policy-receipt-stale", "degraded", artifact))
 
+    @staticmethod
+    def _scan_reevaluation(receipt: object, rules: tuple[object, ...], artifact: str, issues: list[DoctorIssue]) -> None:
+        current = reevaluate_portability(receipt, rules)
+        if not current.allowed:
+            issues.append(_issue("policy-reevaluation-noncompliant", "invalid", artifact))
+        elif (
+            current.effective_ceiling != receipt.effective_ceiling
+            or current.refs != receipt.refs
+        ):
+            issues.append(_issue("policy-receipt-stale", "degraded", artifact))
+
     def _scan_generated_index(self, issues: list[DoctorIssue]) -> None:
-        report = self._index.inspect()
+        report = self._index.inspect_read_only()
         if not report.usable:
             issues.append(_issue("generated-index-rebuildable", "degraded", "generated:index"))
+        elif report.status == "invalid":
+            issues.append(_issue("generated-index-invalid", "invalid", "generated:index"))
 
     def _scan_stale_locks(self, issues: list[DoctorIssue]) -> None:
         for _lock in self._stale_locks():
             issues.append(_issue("stale-local-lock", "degraded", "generated:local-lock"))
 
     def _stale_locks(self) -> tuple[Path, ...]:
+        locks = self._vault.local_root / "locks"
+        try:
+            if locks.is_symlink() or not locks.resolve(strict=False).is_relative_to(
+                self._vault.local_root.resolve(strict=False)
+            ):
+                return ()
+        except (OSError, RuntimeError, ValueError):
+            return ()
         now = time.time()
         result: list[Path] = []
         for path in _files(self._vault.local_root / "locks", ".lock"):
@@ -301,23 +358,22 @@ class Doctor:
         return tuple(result)
 
     def _remove_stale_locks(self) -> list[str]:
-        repairs: list[str] = []
-        for path in self._stale_locks():
-            try:
-                path.unlink()
-            except OSError:
-                continue
-            repairs.append("stale-local-lock-removed")
-        return repairs
+        """Lock age cannot establish liveness; automatic lock removal is disabled."""
+        return []
 
 
 def _issue(code: str, severity: str, artifact: str) -> DoctorIssue:
     details = {
         "canonical-artifact-invalid": "canonical artifact failed validation",
+        "canonical-vault-invalid": "foundational Vault state failed validation",
         "canonical-policy-invalid": "canonical policy failed validation",
         "generated-index-rebuildable": "generated index is unavailable or invalid and can be rebuilt",
+        "generated-index-invalid": "generated index records an invalid canonical snapshot",
+        "generated-index-unsafe": "generated index target is outside the allowed local index location",
         "missing-active-head": "declared active head is unavailable or invalid",
         "policy-receipt-stale": "historic policy receipt differs from the current policy pointer",
+        "policy-reevaluation-failed": "current policy reevaluation failed",
+        "policy-reevaluation-noncompliant": "current policy reevaluation no longer permits the artifact",
         "portable-local-reference": "portable canonical artifact contains a local-only reference",
         "session-orphan": "immutable revision is not declared as an active head",
         "source-markdown-unreadable": "mounted Markdown could not be read as UTF-8",

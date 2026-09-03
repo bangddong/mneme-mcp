@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import os
+from pathlib import Path
+import threading
 
 import pytest
 
@@ -200,14 +202,132 @@ def test_doctor_reports_unreadable_mounted_markdown_without_a_local_path(vault, 
 
 
 def test_doctor_removes_only_old_local_locks_when_repairing(vault):
-    """Catches repair deleting a live or portable lock-like artifact."""
+    """Catches repair deleting a lock merely because its timestamp is old."""
     from mneme.core.doctor import Doctor
+    from mneme.core.fs import exclusive_file_lock
 
     stale = vault.local_root / "locks" / "old-operation.lock"
     stale.write_bytes(b"\0")
     os.utime(stale, (1, 1))
 
-    report = Doctor(vault, stale_lock_age_seconds=1).run(repair=True)
+    entered = threading.Event()
+    release = threading.Event()
 
-    assert not stale.exists()
-    assert "stale-local-lock-removed" in report.repairs
+    def hold_lock():
+        with exclusive_file_lock(stale):
+            entered.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert entered.wait(timeout=5)
+    report = Doctor(vault, stale_lock_age_seconds=1).run(repair=True)
+    release.set()
+    holder.join(timeout=5)
+
+    assert stale.exists()
+    assert "stale-local-lock-removed" not in report.repairs
+
+
+def test_doctor_never_repairs_an_injected_external_index_path(vault, tmp_path):
+    """Catches a caller-supplied GeneratedIndex overwriting a mounted source."""
+    from mneme.core.doctor import Doctor
+    from mneme.core.search.index import GeneratedIndex
+
+    external = tmp_path / "mounted-source.md"
+    external.write_text("must remain Markdown\n", encoding="utf-8")
+
+    report = Doctor(vault, GeneratedIndex(external)).run(repair=True)
+
+    assert external.read_text(encoding="utf-8") == "must remain Markdown\n"
+    assert "generated-index-rebuilt" not in report.repairs
+
+
+def test_doctor_rejects_a_symlinked_generated_index_before_repair(vault, tmp_path):
+    """Catches a state.db symlink redirecting SQLite publication outside local state."""
+    from mneme.core.doctor import Doctor
+
+    external = tmp_path / "external.md"
+    external.write_text("outside content\n", encoding="utf-8")
+    index = vault.local_root / "index" / "state.db"
+    try:
+        index.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    report = Doctor(vault).run(repair=True)
+
+    assert external.read_text(encoding="utf-8") == "outside content\n"
+    assert report.status == "invalid"
+    assert "generated-index-rebuilt" not in report.repairs
+
+
+def test_doctor_plain_run_does_not_create_generated_lock_files(vault):
+    """Catches diagnosis creating .state.db.lock as an operational side effect."""
+    from mneme.core.doctor import Doctor
+
+    before = sorted(path.relative_to(vault.local_root) for path in vault.local_root.rglob("*"))
+    Doctor(vault).run()
+    after = sorted(path.relative_to(vault.local_root) for path in vault.local_root.rglob("*"))
+
+    assert after == before
+
+
+@pytest.mark.parametrize("contents", [None, "2\n"])
+def test_doctor_fails_closed_for_missing_or_wrong_schema_version(vault, contents):
+    """Catches foundational Vault corruption becoming an empty optional collection."""
+    from mneme.core.doctor import Doctor
+
+    schema = vault.root / ".madi" / "schema-version"
+    if contents is None:
+        schema.unlink()
+    else:
+        schema.write_text(contents, encoding="utf-8")
+
+    report = Doctor(vault).run(repair=True)
+
+    assert report.status == "invalid"
+    assert "generated-index-rebuilt" not in report.repairs
+
+
+def test_doctor_reevaluates_session_against_new_project_policy_assignment(vault):
+    """Catches Doctor comparing only global active policy IDs after a project tightens."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.doctor import Doctor
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import RegistryStore
+
+    registries = RegistryStore(vault)
+    project = registries.register_project("project-01")
+    registries.create_workstream("ws-01", project=project.id, mode="single")
+    _checkpoint(vault)
+    policies = PolicyStore(vault)
+    restricted = policies.create_revision(
+        "project-policy", "1", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    registries.assign_project_policy(project.id, restricted, expected_generation=0)
+
+    report = Doctor(vault).run()
+
+    assert ("policy-reevaluation-noncompliant", "invalid", "session:ws-01:ses-01:000001") in [
+        (issue.code, issue.severity, issue.artifact) for issue in report.issues
+    ]
+
+
+def test_doctor_rebuilds_persisted_invalid_index_when_canonical_state_is_valid(vault):
+    """Catches an invalid generated snapshot being reported as resolved or left unrepaired."""
+    import sqlite3
+
+    from mneme.core.doctor import Doctor
+    from mneme.core.service import CoreService
+
+    CoreService(vault).reindex()
+    db = vault.local_root / "index" / "state.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute("UPDATE index_state SET status = 'invalid'")
+        connection.commit()
+
+    report = Doctor(vault).run(repair=True)
+
+    assert report.status == "resolved"
+    assert "generated-index-rebuilt" in report.repairs

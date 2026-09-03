@@ -13,7 +13,7 @@ import tempfile
 import threading
 from typing import Iterable, Mapping
 
-from mneme.core.errors import InvalidArtifact
+from mneme.core.errors import InvalidArtifact, UnsafePath
 from mneme.core.fs import exclusive_file_lock
 from mneme.core.memories import MemoryAuthority, MemoryScope, MemoryStore
 from mneme.core.registries import RegistryStore
@@ -157,6 +157,8 @@ class GeneratedIndex:
 
     def rebuild(self, vault: object, bound_sources: Iterable[SourceBinding]) -> IndexReport:
         """Replace this generated database from Vault files and available mounts."""
+        target_check = lambda: validate_generated_index_target(vault, self.db_path)
+        target_check()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         rows: list[_IndexRow] = []
         diagnostics: list[str] = []
@@ -169,7 +171,7 @@ class GeneratedIndex:
                 "invalid",
                 (f"canonical Vault indexing failed: {type(exc).__name__}",),
             )
-            self._replace([], report)
+            self._replace([], report, before_publish=target_check)
             return report
 
         for binding in sorted(tuple(bound_sources), key=lambda item: item.source_id):
@@ -216,8 +218,21 @@ class GeneratedIndex:
             "degraded" if diagnostics else "resolved",
             tuple(diagnostics),
         )
-        self._replace(rows, report)
+        self._replace(rows, report, before_publish=target_check)
         return report
+
+    def inspect_read_only(self) -> IndexReport:
+        """Inspect without creating the operational lock file used by search."""
+        try:
+            if not self.db_path.is_file() or self.db_path.is_symlink():
+                return _unavailable_report()
+            conn = sqlite3.connect(self.db_path)
+            try:
+                return self._inspect_connection(conn)
+            finally:
+                conn.close()
+        except _CACHE_ERRORS as exc:
+            return _corrupt_report(exc)
 
     def inspect(self) -> IndexReport:
         """Return validated operational index state without granting policy authority."""
@@ -301,7 +316,13 @@ class GeneratedIndex:
                 break
         return hits
 
-    def _replace(self, rows: list[_IndexRow], report: IndexReport) -> None:
+    def _replace(
+        self,
+        rows: list[_IndexRow],
+        report: IndexReport,
+        *,
+        before_publish=None,
+    ) -> None:
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.db_path.parent,
             prefix=f".{self.db_path.name}.",
@@ -352,6 +373,8 @@ class GeneratedIndex:
                 conn.commit()
             finally:
                 conn.close()
+            if before_publish is not None:
+                before_publish()
             self._publish(temporary)
         finally:
             try:
@@ -463,6 +486,28 @@ class GeneratedIndex:
                 return conn.execute(sql, (literal, limit)).fetchall()
             except sqlite3.OperationalError as literal_error:
                 raise literal_error from expanded_error
+
+def validate_generated_index_target(vault: object, db_path: Path) -> Path:
+    """Require the one local generated database path before every publication."""
+    try:
+        local_root = Path(vault.local_root)
+        index_root = local_root / "index"
+        expected = index_root / "state.db"
+        candidate = Path(db_path)
+        if (
+            local_root.is_symlink()
+            or index_root.is_symlink()
+            or candidate != expected
+            or candidate.is_symlink()
+            or not index_root.resolve(strict=False).is_relative_to(
+                local_root.resolve(strict=False)
+            )
+            or index_root.resolve(strict=False) != expected.parent.resolve(strict=False)
+        ):
+            raise UnsafePath("generated index target is unsafe")
+        return expected
+    except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+        raise UnsafePath("generated index target is unsafe") from exc
 
 
 def _validate_schema(conn: sqlite3.Connection) -> None:
