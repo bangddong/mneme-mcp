@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from mneme.core.errors import ArtifactExists, InvalidArtifact
-from mneme.core.fs import dump_yaml, read_yaml, write_new
+from mneme.core.fs import dump_yaml, is_symlink_or_reparse, read_yaml, write_new
 from mneme.core.artifacts import StorageClass
 from mneme.core.storage import ArtifactReader, ArtifactStore, StorageRouter, ViewStore
 from mneme.core.validation.vault import (
@@ -60,8 +60,8 @@ class Vault:
     @classmethod
     def open(cls, root: Path, state_home: Path) -> Vault:
         requested_root = Path(root)
-        if requested_root.is_symlink():
-            raise InvalidArtifact("Vault root cannot be a symbolic link")
+        if is_symlink_or_reparse(requested_root):
+            raise InvalidArtifact("Vault root cannot be a link or reparse point")
         portable_root = requested_root.resolve(strict=False)
         local_state_home = Path(state_home).resolve(strict=False)
         _require_file(
@@ -192,18 +192,26 @@ def _create_directories(root: Path, relative_paths: tuple[str, ...]) -> None:
 
 
 def _require_file(root: Path, path: Path, label: str) -> None:
-    if not _is_contained(root, path) or path.is_symlink() or not path.is_file():
+    if (
+        is_symlink_or_reparse(path)
+        or not _is_contained(root, path)
+        or not path.is_file()
+    ):
         raise InvalidArtifact(f"required {label} is missing or unsafe: {path}")
 
 
 def _require_directories(
     root: Path, relative_paths: tuple[str, ...], storage_label: str
 ) -> None:
-    if root.is_symlink() or not root.is_dir():
+    if is_symlink_or_reparse(root) or not root.is_dir():
         raise InvalidArtifact(f"required {storage_label} root is missing or unsafe: {root}")
     for relative in relative_paths:
         path = root / relative
-        if not _is_contained(root, path) or path.is_symlink() or not path.is_dir():
+        if (
+            is_symlink_or_reparse(path)
+            or not _is_contained(root, path)
+            or not path.is_dir()
+        ):
             raise InvalidArtifact(
                 f"required {storage_label} directory is missing or unsafe: {path}"
             )

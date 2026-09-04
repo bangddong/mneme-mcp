@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -17,6 +18,24 @@ from mneme.core.errors import ArtifactExists, ConcurrentWrite, InvalidArtifact
 
 _cas_locks_guard = threading.Lock()
 _cas_locks: dict[Path, threading.Lock] = {}
+
+
+def is_symlink_or_reparse(path: Path) -> bool:
+    """Return whether *path* is a symlink or any Windows reparse point.
+
+    ``Path.is_symlink`` does not identify Windows junctions.  ``lstat`` reads
+    the directory entry itself, and the Windows file-attribute bit covers
+    junctions and other reparse types without following their targets.
+    """
+    try:
+        metadata = os.lstat(Path(path))
+    except (OSError, ValueError):
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_flag)
 
 
 def normalize_text(text: str) -> str:

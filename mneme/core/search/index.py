@@ -14,7 +14,7 @@ import threading
 from typing import Iterable, Mapping
 
 from mneme.core.errors import InvalidArtifact, UnsafePath
-from mneme.core.fs import exclusive_file_lock
+from mneme.core.fs import exclusive_file_lock, is_symlink_or_reparse
 from mneme.core.memories import MemoryAuthority, MemoryScope, MemoryStore
 from mneme.core.registries import RegistryStore
 from mneme.core.sessions import SessionRevisionRef, SessionStore
@@ -495,10 +495,10 @@ def validate_generated_index_target(vault: object, db_path: Path) -> Path:
         expected = index_root / "state.db"
         candidate = Path(db_path)
         if (
-            local_root.is_symlink()
-            or index_root.is_symlink()
+            is_symlink_or_reparse(local_root)
+            or is_symlink_or_reparse(index_root)
             or candidate != expected
-            or candidate.is_symlink()
+            or is_symlink_or_reparse(candidate)
             or not index_root.resolve(strict=False).is_relative_to(
                 local_root.resolve(strict=False)
             )

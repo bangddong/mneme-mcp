@@ -18,6 +18,7 @@ from typing import Iterable
 
 from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact, PortabilityViolation
+from mneme.core.fs import is_symlink_or_reparse
 from mneme.core.memories import MemoryStore
 from mneme.core.policy import PolicyRef, PolicyStore, reevaluate_portability
 from mneme.core.registries import HeadRef, RegistryStore, WorkstreamRegistry
@@ -92,7 +93,8 @@ class Doctor:
         self._vault = vault
         expected = vault.local_root / "index" / "state.db"
         self._unsafe_supplied_index = index is not None and index.db_path != expected
-        self._index = GeneratedIndex(expected) if self._unsafe_supplied_index else (index or GeneratedIndex(expected))
+        self._index_path = expected if index is None else index.db_path
+        self._index = index
         self._stale_lock_age_seconds = stale_lock_age_seconds
 
     def run(self, *, repair: bool = False) -> DoctorReport:
@@ -109,31 +111,38 @@ class Doctor:
 
     def _diagnose(self) -> list[DoctorIssue]:
         issues: list[DoctorIssue] = []
-        try:
-            Vault.open(self._vault.root, self._vault.state_home)
-        except Exception:
-            issues.append(_issue("canonical-vault-invalid", "invalid", "vault"))
-        if not _canonical_tree_is_strict(self._vault.root):
+        canonical_safe, canonical_strict = _canonical_tree_state(self._vault.root)
+        if not canonical_strict:
             issues.append(_issue("canonical-artifact-invalid", "invalid", "vault"))
+        if canonical_safe:
+            try:
+                Vault.open(self._vault.root, self._vault.state_home)
+            except Exception:
+                issues.append(_issue("canonical-vault-invalid", "invalid", "vault"))
         if self._unsafe_supplied_index:
             issues.append(_issue("generated-index-unsafe", "invalid", "generated:index"))
+        index_safe = not self._unsafe_supplied_index
         try:
-            validate_generated_index_target(self._vault, self._index.db_path)
+            validate_generated_index_target(self._vault, self._index_path)
         except Exception:
+            index_safe = False
             issues.append(_issue("generated-index-unsafe", "invalid", "generated:index"))
-        policies = PolicyStore(self._vault)
-        try:
-            policies.load_active("vault-default", StorageClass.PORTABLE)
-        except Exception:
-            issues.append(_issue("canonical-policy-invalid", "invalid", "policy:vault-default"))
-        self._scan_policy_revisions(policies, issues)
+        if canonical_safe:
+            policies = PolicyStore(self._vault)
+            try:
+                policies.load_active("vault-default", StorageClass.PORTABLE)
+            except Exception:
+                issues.append(_issue("canonical-policy-invalid", "invalid", "policy:vault-default"))
+            self._scan_policy_revisions(policies, issues)
 
-        registries = RegistryStore(self._vault)
-        self._scan_projects(registries, policies, issues)
-        self._scan_sources(registries, policies, issues)
-        self._scan_workstreams(registries, policies, issues)
-        self._scan_memories(policies, issues)
-        self._scan_generated_index(issues)
+            registries = RegistryStore(self._vault)
+            self._scan_projects(registries, policies, issues)
+            self._scan_sources(registries, policies, issues)
+            self._scan_workstreams(registries, policies, issues)
+            self._scan_memories(policies, issues)
+        if index_safe:
+            index = self._index or GeneratedIndex(self._index_path)
+            self._scan_generated_index(index, issues)
         self._scan_stale_locks(issues)
         return sorted(set(issues), key=lambda item: (item.code, item.artifact, item.severity))
 
@@ -316,8 +325,10 @@ class Doctor:
         ):
             issues.append(_issue("policy-receipt-stale", "degraded", artifact))
 
-    def _scan_generated_index(self, issues: list[DoctorIssue]) -> None:
-        report = self._index.inspect_read_only()
+    def _scan_generated_index(
+        self, index: GeneratedIndex, issues: list[DoctorIssue]
+    ) -> None:
+        report = index.inspect_read_only()
         if not report.usable:
             issues.append(_issue("generated-index-rebuildable", "degraded", "generated:index"))
         elif report.status == "invalid":
@@ -330,8 +341,12 @@ class Doctor:
     def _stale_locks(self) -> tuple[Path, ...]:
         locks = self._vault.local_root / "locks"
         try:
-            if locks.is_symlink() or not locks.resolve(strict=False).is_relative_to(
-                self._vault.local_root.resolve(strict=False)
+            if (
+                is_symlink_or_reparse(self._vault.local_root)
+                or is_symlink_or_reparse(locks)
+                or not locks.resolve(strict=False).is_relative_to(
+                    self._vault.local_root.resolve(strict=False)
+                )
             ):
                 return ()
         except (OSError, RuntimeError, ValueError):
@@ -383,14 +398,38 @@ def _status(issues: Iterable[DoctorIssue]) -> str:
 
 def _directories(root: Path) -> tuple[Path, ...]:
     try:
-        return tuple(sorted((item for item in root.iterdir() if item.is_dir() and not item.is_symlink()), key=lambda item: item.name))
+        if is_symlink_or_reparse(root) or not root.is_dir():
+            return ()
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in root.iterdir()
+                    if not is_symlink_or_reparse(item) and item.is_dir()
+                ),
+                key=lambda item: item.name,
+            )
+        )
     except OSError:
         return ()
 
 
 def _files(root: Path, suffix: str) -> tuple[Path, ...]:
     try:
-        return tuple(sorted((item for item in root.iterdir() if item.is_file() and not item.is_symlink() and item.suffix == suffix), key=lambda item: item.name))
+        if is_symlink_or_reparse(root) or not root.is_dir():
+            return ()
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in root.iterdir()
+                    if not is_symlink_or_reparse(item)
+                    and item.is_file()
+                    and item.suffix == suffix
+                ),
+                key=lambda item: item.name,
+            )
+        )
     except OSError:
         return ()
 
@@ -403,55 +442,114 @@ def _safe_id(value: object) -> str:
     return str(value)
 
 
+class _UnsafeCanonicalTree(Exception):
+    pass
+
+
+def _canonical_tree_state(root: Path) -> tuple[bool, bool]:
+    """Return ``(safe_to_traverse, structurally_strict)`` for canonical state."""
+    try:
+        return True, _canonical_tree_is_strict(root)
+    except _UnsafeCanonicalTree:
+        return False, False
+
+
 def _canonical_tree_is_strict(root: Path) -> bool:
-    """Reject hidden/symlinked or unexpected canonical entries; never skip them."""
+    """Reject reparse or unexpected canonical entries; never skip or follow them."""
     expected = {
         root / "projects": ".yaml",
         root / "sources": ".yaml",
         root / "memory": ".md",
     }
     try:
+        madi = root / ".madi"
+        if not _safe_is_directory(root) or not _safe_is_directory(madi):
+            return False
+        madi_children = tuple(madi.iterdir())
+        for child in madi_children:
+            _reject_reparse(child)
+        if {child.name for child in madi_children} != {
+            "schema-version",
+            "vault.yaml",
+            "policy-index.yaml",
+            "policies",
+        }:
+            return False
+        for foundation in (
+            madi / "schema-version",
+            madi / "vault.yaml",
+            madi / "policy-index.yaml",
+        ):
+            if not _safe_is_file(foundation):
+                return False
         for directory, suffix in expected.items():
-            if directory.is_symlink() or not directory.is_dir():
+            if not _safe_is_directory(directory):
                 return False
             for item in directory.iterdir():
-                if item.is_symlink() or not item.is_file() or item.suffix != suffix:
+                if not _safe_is_file(item) or item.suffix != suffix:
                     return False
         workstreams = root / "workstreams"
-        if workstreams.is_symlink() or not workstreams.is_dir():
+        if not _safe_is_directory(workstreams):
             return False
         for item in workstreams.iterdir():
-            if item.is_symlink() or not item.is_dir() or not _valid_id(item.name):
+            if not _safe_is_directory(item) or not _valid_id(item.name):
                 return False
-            children = {child.name: child for child in item.iterdir()}
-            if set(children) != {"workstream.yaml", "sessions"}:
+            child_entries = tuple(item.iterdir())
+            for child in child_entries:
+                _reject_reparse(child)
+            children = {child.name: child for child in child_entries}
+            if set(children) not in (
+                {"workstream.yaml"},
+                {"workstream.yaml", "sessions"},
+            ):
                 return False
             registry = children["workstream.yaml"]
-            sessions = children["sessions"]
-            if registry.is_symlink() or not registry.is_file() or sessions.is_symlink() or not sessions.is_dir():
+            if not _safe_is_file(registry):
+                return False
+            sessions = children.get("sessions")
+            if sessions is None:
+                continue
+            if not _safe_is_directory(sessions):
                 return False
             for session in sessions.iterdir():
-                if session.is_symlink() or not session.is_dir() or not _valid_id(session.name):
+                if not _safe_is_directory(session) or not _valid_id(session.name):
                     return False
                 for revision in session.iterdir():
                     if (
-                        revision.is_symlink()
-                        or not revision.is_file()
+                        not _safe_is_file(revision)
                         or revision.suffix != ".md"
                         or not re.fullmatch(r"[0-9]{6}", revision.stem)
                     ):
                         return False
         policies = root / ".madi" / "policies"
-        if policies.is_symlink() or not policies.is_dir():
+        if not _safe_is_directory(policies):
             return False
         for policy in policies.iterdir():
-            if policy.is_symlink() or not policy.is_dir():
+            if not _safe_is_directory(policy):
                 return False
-            if any(child.is_symlink() or not child.is_file() or child.suffix != ".yaml" for child in policy.iterdir()):
+            if any(
+                not _safe_is_file(child) or child.suffix != ".yaml"
+                for child in policy.iterdir()
+            ):
                 return False
         return True
     except OSError:
         return False
+
+
+def _reject_reparse(path: Path) -> None:
+    if is_symlink_or_reparse(path):
+        raise _UnsafeCanonicalTree
+
+
+def _safe_is_directory(path: Path) -> bool:
+    _reject_reparse(path)
+    return path.is_dir()
+
+
+def _safe_is_file(path: Path) -> bool:
+    _reject_reparse(path)
+    return path.is_file()
 
 
 def _valid_id(value: str) -> bool:

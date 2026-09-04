@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import subprocess
 import threading
 
 import pytest
@@ -42,6 +43,37 @@ def _workstream(vault):
     from mneme.core.registries import RegistryStore
 
     RegistryStore(vault).create_workstream("ws-01", project=None, mode="single")
+
+
+def _create_directory_link(link: Path, target: Path, *, junction: bool) -> None:
+    if junction:
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"junction unavailable: {result.stderr or result.stdout}")
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {exc}")
+
+
+def _remove_directory_link(path: Path, *, junction: bool) -> None:
+    if junction:
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _relocate_directory(source: Path, target: Path) -> None:
+    target.mkdir()
+    for child in source.iterdir():
+        child.rename(target / child.name)
+    source.rmdir()
 
 
 def test_doctor_reports_orphan_without_changing_the_declared_head(vault):
@@ -331,6 +363,117 @@ def test_doctor_reports_persisted_invalid_index_for_manual_rebuild(vault):
 
     assert report.status == "invalid"
     assert "generated-index-manual-repair-required" in report.repairs
+
+
+def test_doctor_accepts_a_fresh_registry_only_workstream(vault):
+    """Catches Doctor requiring sessions before the first checkpoint creates it."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+
+    report = Doctor(vault).run()
+
+    assert [(issue.code, issue.severity) for issue in report.issues] == [
+        ("generated-index-rebuildable", "degraded")
+    ]
+
+
+def test_doctor_rejects_symlinked_sessions_without_reading_target(vault, tmp_path):
+    """Catches canonical scanning following a sessions-directory symlink."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    _checkpoint(vault)
+    sessions = vault.root / "workstreams" / "ws-01" / "sessions"
+    target = tmp_path / "external-sessions"
+    sessions.rename(target)
+    _create_directory_link(sessions, target, junction=False)
+    try:
+        report = Doctor(vault).run()
+    finally:
+        _remove_directory_link(sessions, junction=False)
+
+    assert report.status == "invalid"
+    assert not any(issue.artifact.startswith("session:") for issue in report.issues)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_doctor_rejects_junctioned_sessions_without_reading_target(vault, tmp_path):
+    """Catches Windows junctions bypassing Path.is_symlink canonical checks."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    _checkpoint(vault)
+    sessions = vault.root / "workstreams" / "ws-01" / "sessions"
+    target = tmp_path / "external-sessions"
+    sessions.rename(target)
+    _create_directory_link(sessions, target, junction=True)
+    try:
+        report = Doctor(vault).run()
+    finally:
+        _remove_directory_link(sessions, junction=True)
+
+    assert report.status == "invalid"
+    assert not any(issue.artifact.startswith("session:") for issue in report.issues)
+
+
+def test_doctor_rejects_symlinked_index_directory_without_inspecting_target(vault):
+    """Catches generated-index diagnosis following a directory symlink."""
+    import sqlite3
+
+    from mneme.core.doctor import Doctor
+    from mneme.core.service import CoreService
+
+    CoreService(vault).reindex()
+    index = vault.local_root / "index"
+    connection = sqlite3.connect(index / "state.db")
+    try:
+        connection.execute("UPDATE index_state SET status = 'invalid'")
+        connection.commit()
+    finally:
+        connection.close()
+    target = vault.local_root / "linked-index-target"
+    _relocate_directory(index, target)
+    _create_directory_link(index, target, junction=False)
+    try:
+        report = Doctor(vault).run(repair=True)
+    finally:
+        _remove_directory_link(index, junction=False)
+
+    codes = {issue.code for issue in report.issues}
+    assert "canonical-vault-invalid" in codes
+    assert "generated-index-unsafe" in codes
+    assert "generated-index-invalid" not in codes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_doctor_rejects_junctioned_index_directory_without_inspecting_target(vault):
+    """Catches a contained Windows junction being accepted as an index target."""
+    import sqlite3
+
+    from mneme.core.doctor import Doctor
+    from mneme.core.service import CoreService
+
+    CoreService(vault).reindex()
+    index = vault.local_root / "index"
+    connection = sqlite3.connect(index / "state.db")
+    try:
+        connection.execute("UPDATE index_state SET status = 'invalid'")
+        connection.commit()
+    finally:
+        connection.close()
+    target = vault.local_root / "junction-index-target"
+    _relocate_directory(index, target)
+    _create_directory_link(index, target, junction=True)
+    try:
+        report = Doctor(vault).run(repair=True)
+    finally:
+        _remove_directory_link(index, junction=True)
+
+    codes = {issue.code for issue in report.issues}
+    assert "canonical-vault-invalid" in codes
+    assert "generated-index-unsafe" in codes
+    assert "generated-index-invalid" not in codes
 
 
 def test_doctor_rejects_unknown_file_beside_workstream_registry(vault):
