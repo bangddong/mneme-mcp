@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from mneme.core.artifacts import ArtifactDocument, ArtifactFamily
 from mneme.core.errors import InvalidArtifact, PortabilityViolation, UnsafePath
+from mneme.core.fs import validate_path_chain
 
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -49,9 +50,12 @@ def validate_relative_path(family: ArtifactFamily, value: str | Path) -> PurePos
 
 
 def validate_contained_path(root: Path, relative_path: PurePosixPath) -> Path:
-    boundary = Path(root).resolve(strict=False)
-    candidate = boundary.joinpath(*relative_path.parts)
+    raw_boundary = validate_path_chain(Path(root), allow_missing=True)
+    candidate = validate_path_chain(
+        raw_boundary.joinpath(*relative_path.parts), allow_missing=True
+    )
     try:
+        boundary = raw_boundary.resolve(strict=False)
         resolved = candidate.resolve(strict=False)
     except (OSError, RuntimeError) as exc:
         raise UnsafePath(f"cannot resolve artifact path: {candidate}") from exc

@@ -1,6 +1,35 @@
+import os
+import subprocess
 from pathlib import Path, PurePosixPath
 
 import pytest
+
+
+def _directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+
+def _directory_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory junctions unavailable: {result.stderr or result.stdout}")
+
+
+def _directory_link(link: Path, target: Path, kind: str) -> None:
+    if kind == "junction":
+        if os.name != "nt":
+            pytest.skip("Windows junction regression")
+        _directory_junction(link, target)
+        return
+    _directory_symlink(link, target)
 
 
 @pytest.fixture
@@ -525,3 +554,115 @@ def test_view_store_only_targets_named_generated_views_under_local_root(tmp_path
     ):
         with pytest.raises(UnsafePath):
             views.write(path, "forbidden")
+
+
+@pytest.mark.parametrize("aliased_root", ["portable", "local"])
+def test_router_rejects_supplied_root_symlink_before_laundering_it(
+    tmp_path, aliased_root
+):
+    """Catches resolving a caller-supplied root before inspecting its link entry."""
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import StorageRouter
+
+    real_portable = tmp_path / "real-portable"
+    real_local = tmp_path / "real-local"
+    real_portable.mkdir()
+    real_local.mkdir()
+    portable = real_portable
+    local = real_local
+    alias = tmp_path / f"{aliased_root}-alias"
+    _directory_symlink(alias, real_portable if aliased_root == "portable" else real_local)
+    if aliased_root == "portable":
+        portable = alias
+    else:
+        local = alias
+
+    with pytest.raises(UnsafePath, match="link|reparse"):
+        StorageRouter(portable, local)
+
+    assert not (real_local / "overlays").exists()
+    assert not (real_portable / "memory").exists()
+
+
+def test_artifact_location_rejects_a_supplied_root_symlink(tmp_path):
+    """Catches ArtifactLocation erasing an unsafe raw boundary with resolve()."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import ArtifactLocation
+
+    target = tmp_path / "target"
+    target.mkdir()
+    alias = tmp_path / "alias"
+    _directory_symlink(alias, target)
+
+    with pytest.raises(UnsafePath, match="link|reparse"):
+        ArtifactLocation(
+            StorageClass.PORTABLE,
+            alias,
+            PurePosixPath("memory/no-leak.md"),
+        )
+
+    assert not (target / "memory").exists()
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "junction"])
+def test_local_memory_rejects_linked_overlays_to_portable_vault(
+    tmp_path, link_kind
+):
+    """Catches LOCAL_ONLY MemoryStore writes crossing into portable Git."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.errors import UnsafePath
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import Portability, evaluate_portability
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    overlays = vault.local_root / "overlays"
+    overlays.rmdir()
+    _directory_link(overlays, vault.root, link_kind)
+    leaked = vault.root / "memory/junction-leak.md"
+    try:
+        receipt = evaluate_portability(
+            Portability.LOCAL_ONLY,
+            (),
+            memory_semantic_hash(
+                body="confidential local memory",
+                portability=Portability.LOCAL_ONLY,
+            ),
+        )
+        with pytest.raises(UnsafePath, match="link|reparse"):
+            MemoryStore(vault, StorageClass.LOCAL_ONLY).submit_candidate(
+                "knowledge",
+                {"type": "personal-global"},
+                "personal",
+                Portability.LOCAL_ONLY,
+                "confidential local memory",
+                receipt,
+                memory_id="junction-leak",
+            )
+        assert not leaked.exists()
+    finally:
+        overlays.rmdir()
+
+
+@pytest.mark.parametrize("link_kind", ["symlink", "junction"])
+def test_view_store_rejects_linked_views_without_external_creation(
+    tmp_path, link_kind
+):
+    """Catches generated view publication through an existing local junction."""
+    from mneme.core.errors import UnsafePath
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    views_store = vault.views
+    views = vault.local_root / "views"
+    external = tmp_path / "external-views"
+    views.rmdir()
+    external.mkdir()
+    _directory_link(views, external, link_kind)
+    try:
+        with pytest.raises(UnsafePath, match="link|reparse"):
+            views_store.write("CURRENT.md", "must stay local")
+        assert not (external / "CURRENT.md").exists()
+    finally:
+        views.rmdir()

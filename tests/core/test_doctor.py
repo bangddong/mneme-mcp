@@ -407,7 +407,8 @@ def test_doctor_rejects_a_canonical_root_beneath_a_symlink_ancestor(
     _checkpoint(vault)
     alias = tmp_path / "vault-parent-alias"
     _create_directory_link(alias, vault.root.parent, junction=False)
-    injected = replace(vault, root=alias / vault.root.name)
+    injected = replace(vault)
+    object.__setattr__(injected, "root", alias / vault.root.name)
     try:
         report = Doctor(injected).run()
     finally:
@@ -429,7 +430,8 @@ def test_doctor_does_not_traverse_local_locks_beneath_a_symlink_ancestor(
     os.utime(stale, (1, 1))
     alias = tmp_path / "state-alias"
     _create_directory_link(alias, vault.state_home, junction=False)
-    injected = replace(vault, local_root=alias / "vaults" / vault.id)
+    injected = replace(vault)
+    object.__setattr__(injected, "local_root", alias / "vaults" / vault.id)
     try:
         report = Doctor(injected, stale_lock_age_seconds=1).run()
     finally:

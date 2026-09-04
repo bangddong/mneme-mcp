@@ -40,7 +40,8 @@ class ArtifactLocation:
     def __post_init__(self) -> None:
         if not isinstance(self.storage_class, StorageClass):
             raise InvalidArtifact("artifact location requires a StorageClass")
-        object.__setattr__(self, "root", Path(self.root).resolve(strict=False))
+        raw_root = validate_path_chain(Path(self.root), allow_missing=True)
+        object.__setattr__(self, "root", raw_root.resolve(strict=False))
         object.__setattr__(self, "relative_path", PurePosixPath(self.relative_path))
 
     @property
@@ -52,8 +53,12 @@ class StorageRouter:
     """Map one canonical family schema to an explicit portable or local root."""
 
     def __init__(self, portable_root: Path, local_root: Path):
-        self.portable_root = Path(portable_root).resolve(strict=False)
-        self.local_root = Path(local_root).resolve(strict=False)
+        raw_portable_root = validate_path_chain(
+            Path(portable_root), allow_missing=True
+        )
+        raw_local_root = validate_path_chain(Path(local_root), allow_missing=True)
+        self.portable_root = raw_portable_root.resolve(strict=False)
+        self.local_root = raw_local_root.resolve(strict=False)
         validate_separate_roots(self.portable_root, self.local_root)
 
     def location(

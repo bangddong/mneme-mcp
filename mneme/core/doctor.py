@@ -175,7 +175,10 @@ class Doctor:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
 
     def _scan_sources(self, registries: RegistryStore, policies: PolicyStore, issues: list[DoctorIssue]) -> None:
-        bindings = SourceBindingStore(self._vault)
+        try:
+            bindings = SourceBindingStore(self._vault)
+        except Exception:
+            bindings = None
         for path in _files(self._vault.root / "sources", ".yaml"):
             source_id = path.stem
             artifact = f"source:{_safe_id(source_id)}"
@@ -187,7 +190,7 @@ class Doctor:
                 issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
                 continue
             try:
-                binding = bindings.load(source.id)
+                binding = None if bindings is None else bindings.load(source.id)
             except Exception:
                 binding = None
             if binding is None or not binding.path.is_dir():
