@@ -331,3 +331,65 @@ def test_doctor_reports_persisted_invalid_index_for_manual_rebuild(vault):
 
     assert report.status == "invalid"
     assert "generated-index-manual-repair-required" in report.repairs
+
+
+def test_doctor_rejects_unknown_file_beside_workstream_registry(vault):
+    """Catches permissive workstream traversal ignoring an unknown sibling file."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    (vault.root / "workstreams" / "ws-01" / "unexpected.txt").write_text("x", encoding="utf-8")
+
+    assert Doctor(vault).run().status == "invalid"
+
+
+def test_doctor_rejects_symlinked_workstream_registry(vault, tmp_path):
+    """Catches Path.is_file accepting a symlinked canonical registry."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    registry = vault.root / "workstreams" / "ws-01" / "workstream.yaml"
+    target = tmp_path / "registry.yaml"
+    registry.rename(target)
+    try:
+        registry.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink unavailable: {exc}")
+
+    assert Doctor(vault).run().status == "invalid"
+
+
+@pytest.mark.parametrize("kind", ["unknown-session-entry", "symlink-session-dir", "unknown-revision", "symlink-revision", "missing-sessions"])
+def test_doctor_rejects_invalid_session_tree_entries(vault, tmp_path, kind):
+    """Catches session descendant grammar being filtered rather than rejected."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    _checkpoint(vault)
+    workstream = vault.root / "workstreams" / "ws-01"
+    sessions = workstream / "sessions"
+    session = sessions / "ses-01"
+    revision = session / "000001.md"
+    if kind == "unknown-session-entry":
+        (sessions / "junk.txt").write_text("x", encoding="utf-8")
+    elif kind == "symlink-session-dir":
+        target = tmp_path / "session"
+        session.rename(target)
+        try:
+            session.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    elif kind == "unknown-revision":
+        (session / "junk.txt").write_text("x", encoding="utf-8")
+    elif kind == "symlink-revision":
+        target = tmp_path / "revision.md"
+        revision.rename(target)
+        try:
+            revision.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+    else:
+        target = tmp_path / "sessions"
+        sessions.rename(target)
+
+    assert Doctor(vault).run(repair=True).status == "invalid"

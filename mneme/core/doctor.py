@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+import re
 import time
 from typing import Iterable
 
@@ -420,8 +421,26 @@ def _canonical_tree_is_strict(root: Path) -> bool:
         if workstreams.is_symlink() or not workstreams.is_dir():
             return False
         for item in workstreams.iterdir():
-            if item.is_symlink() or not item.is_dir() or not (item / "workstream.yaml").is_file():
+            if item.is_symlink() or not item.is_dir() or not _valid_id(item.name):
                 return False
+            children = {child.name: child for child in item.iterdir()}
+            if set(children) != {"workstream.yaml", "sessions"}:
+                return False
+            registry = children["workstream.yaml"]
+            sessions = children["sessions"]
+            if registry.is_symlink() or not registry.is_file() or sessions.is_symlink() or not sessions.is_dir():
+                return False
+            for session in sessions.iterdir():
+                if session.is_symlink() or not session.is_dir() or not _valid_id(session.name):
+                    return False
+                for revision in session.iterdir():
+                    if (
+                        revision.is_symlink()
+                        or not revision.is_file()
+                        or revision.suffix != ".md"
+                        or not re.fullmatch(r"[0-9]{6}", revision.stem)
+                    ):
+                        return False
         policies = root / ".madi" / "policies"
         if policies.is_symlink() or not policies.is_dir():
             return False
@@ -433,3 +452,11 @@ def _canonical_tree_is_strict(root: Path) -> bool:
         return True
     except OSError:
         return False
+
+
+def _valid_id(value: str) -> bool:
+    try:
+        validate_identifier(value, label="artifact id")
+    except InvalidArtifact:
+        return False
+    return True
