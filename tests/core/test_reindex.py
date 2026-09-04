@@ -2,6 +2,7 @@ import pytest
 import sqlite3
 import threading
 from contextlib import contextmanager
+from pathlib import Path
 
 
 @pytest.fixture
@@ -336,3 +337,32 @@ def test_recall_observes_invalid_rebuild_between_setup_and_candidate_snapshot(va
     assert len(results) == 1
     assert results[0].status == "invalid"
     assert results[0].hits == ()
+
+
+def test_generated_index_inspection_rejects_a_symlinked_directory_after_setup(
+    vault,
+):
+    """Catches index and lock reads following a replaced ancestor directory."""
+    from mneme.core.service import CoreService
+
+    service = CoreService(vault)
+    assert service.reindex().status == "resolved"
+    index = service.index
+    index.lock_path.unlink()
+    index_root = index.db_path.parent
+    target = vault.local_root / "linked-index-target"
+    target.mkdir()
+    for child in index_root.iterdir():
+        child.rename(target / child.name)
+    index_root.rmdir()
+    try:
+        index_root.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+    try:
+        report = index.inspect()
+    finally:
+        index_root.unlink()
+
+    assert not report.usable
+    assert not (target / index.lock_path.name).exists()

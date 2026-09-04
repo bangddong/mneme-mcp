@@ -464,6 +464,38 @@ def test_store_rejects_existing_parent_symlink_escape(storage, tmp_path):
     assert not (outside / "proj-1.yaml").exists()
 
 
+def test_store_rejects_symlinked_ancestor_before_creating_nested_parent(
+    storage, tmp_path
+):
+    """Catches parent mkdir creating canonical descendants through an alias."""
+    from mneme.core.artifacts import ArtifactDocument, ArtifactFamily, ReferenceManifest
+    from mneme.core.errors import UnsafePath
+    from mneme.core.storage import StorageClass
+
+    router, store, _ = storage
+    target = router.portable_root / "workstreams-target"
+    target.mkdir()
+    workstreams = router.portable_root / "workstreams"
+    try:
+        workstreams.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(UnsafePath):
+        store.write_new(
+            ArtifactFamily.SESSION,
+            storage_class=StorageClass.PORTABLE,
+            relative_path="workstreams/ws-1/sessions/ses-1/000001.md",
+            document=ArtifactDocument(
+                metadata={"generation": 0},
+                body="checkpoint",
+                references=ReferenceManifest.complete(),
+            ),
+        )
+
+    assert not (target / "ws-1").exists()
+
+
 def test_view_store_only_targets_named_generated_views_under_local_root(tmp_path):
     from mneme.core.errors import UnsafePath
     from mneme.core.storage import StorageRouter, ViewStore

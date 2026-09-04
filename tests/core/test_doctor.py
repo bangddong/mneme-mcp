@@ -397,6 +397,49 @@ def test_doctor_rejects_symlinked_sessions_without_reading_target(vault, tmp_pat
     assert not any(issue.artifact.startswith("session:") for issue in report.issues)
 
 
+def test_doctor_rejects_a_canonical_root_beneath_a_symlink_ancestor(
+    vault, tmp_path
+):
+    """Catches strict diagnosis traversing an alias before checking its leaf root."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    _checkpoint(vault)
+    alias = tmp_path / "vault-parent-alias"
+    _create_directory_link(alias, vault.root.parent, junction=False)
+    injected = replace(vault, root=alias / vault.root.name)
+    try:
+        report = Doctor(injected).run()
+    finally:
+        _remove_directory_link(alias, junction=False)
+
+    assert report.status == "invalid"
+    assert "canonical-artifact-invalid" in {issue.code for issue in report.issues}
+    assert not any(issue.artifact.startswith("session:") for issue in report.issues)
+
+
+def test_doctor_does_not_traverse_local_locks_beneath_a_symlink_ancestor(
+    vault, tmp_path
+):
+    """Catches generated-index and stale-lock diagnosis following local aliases."""
+    from mneme.core.doctor import Doctor
+
+    stale = vault.local_root / "locks" / "old-operation.lock"
+    stale.write_bytes(b"\0")
+    os.utime(stale, (1, 1))
+    alias = tmp_path / "state-alias"
+    _create_directory_link(alias, vault.state_home, junction=False)
+    injected = replace(vault, local_root=alias / "vaults" / vault.id)
+    try:
+        report = Doctor(injected, stale_lock_age_seconds=1).run()
+    finally:
+        _remove_directory_link(alias, junction=False)
+
+    codes = {issue.code for issue in report.issues}
+    assert "generated-index-unsafe" in codes
+    assert "stale-local-lock" not in codes
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
 def test_doctor_rejects_junctioned_sessions_without_reading_target(vault, tmp_path):
     """Catches Windows junctions bypassing Path.is_symlink canonical checks."""

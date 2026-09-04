@@ -19,6 +19,7 @@ from mneme.core.fs import (
     read_frontmatter,
     read_yaml,
     replace_text,
+    validate_path_chain,
     write_text_cas,
     write_new,
 )
@@ -143,7 +144,9 @@ class ArtifactStore:
         validate_portability(location.storage_class, document)
         encoded = self.router.codec(family, location.storage_class).encode(document)
         target = location.path
+        validate_path_chain(target, allow_missing=True)
         target.parent.mkdir(parents=True, exist_ok=True)
+        validate_path_chain(target, allow_missing=True)
         self.router.validate_location(family, location)
         write_new(target, encoded)
         return location

@@ -18,7 +18,7 @@ from typing import Iterable
 
 from mneme.core.artifacts import StorageClass
 from mneme.core.errors import InvalidArtifact, PortabilityViolation
-from mneme.core.fs import is_symlink_or_reparse
+from mneme.core.fs import is_symlink_or_reparse, validate_path_chain
 from mneme.core.memories import MemoryStore
 from mneme.core.policy import PolicyRef, PolicyStore, reevaluate_portability
 from mneme.core.registries import HeadRef, RegistryStore, WorkstreamRegistry
@@ -154,6 +154,7 @@ class Doctor:
             for path in _files(policy_directory, ".yaml"):
                 artifact = f"policy:{_safe_id(policy_directory.name)}:{_safe_id(path.stem)}"
                 try:
+                    validate_path_chain(path, allow_missing=False)
                     reference = PolicyRef(
                         policy_directory.name,
                         path.stem,
@@ -339,22 +340,28 @@ class Doctor:
             issues.append(_issue("stale-local-lock", "degraded", "generated:local-lock"))
 
     def _stale_locks(self) -> tuple[Path, ...]:
-        locks = self._vault.local_root / "locks"
         try:
+            local_root = validate_path_chain(
+                self._vault.local_root, allow_missing=True
+            )
+            locks = validate_path_chain(
+                local_root / "locks", allow_missing=True
+            )
             if (
-                is_symlink_or_reparse(self._vault.local_root)
+                is_symlink_or_reparse(local_root)
                 or is_symlink_or_reparse(locks)
                 or not locks.resolve(strict=False).is_relative_to(
-                    self._vault.local_root.resolve(strict=False)
+                    local_root.resolve(strict=False)
                 )
             ):
                 return ()
-        except (OSError, RuntimeError, ValueError):
+        except (InvalidArtifact, OSError, RuntimeError, ValueError):
             return ()
         now = time.time()
         result: list[Path] = []
-        for path in _files(self._vault.local_root / "locks", ".lock"):
+        for path in _files(locks, ".lock"):
             try:
+                validate_path_chain(path, allow_missing=False)
                 if now - path.stat().st_mtime > self._stale_lock_age_seconds:
                     result.append(path)
             except OSError:
@@ -398,39 +405,35 @@ def _status(issues: Iterable[DoctorIssue]) -> str:
 
 def _directories(root: Path) -> tuple[Path, ...]:
     try:
+        validate_path_chain(root, allow_missing=True)
         if is_symlink_or_reparse(root) or not root.is_dir():
             return ()
-        return tuple(
-            sorted(
-                (
-                    item
-                    for item in root.iterdir()
-                    if not is_symlink_or_reparse(item) and item.is_dir()
-                ),
-                key=lambda item: item.name,
-            )
-        )
-    except OSError:
+        result: list[Path] = []
+        for item in root.iterdir():
+            validate_path_chain(item, allow_missing=True)
+            if not is_symlink_or_reparse(item) and item.is_dir():
+                result.append(item)
+        return tuple(sorted(result, key=lambda item: item.name))
+    except (InvalidArtifact, OSError):
         return ()
 
 
 def _files(root: Path, suffix: str) -> tuple[Path, ...]:
     try:
+        validate_path_chain(root, allow_missing=True)
         if is_symlink_or_reparse(root) or not root.is_dir():
             return ()
-        return tuple(
-            sorted(
-                (
-                    item
-                    for item in root.iterdir()
-                    if not is_symlink_or_reparse(item)
-                    and item.is_file()
-                    and item.suffix == suffix
-                ),
-                key=lambda item: item.name,
-            )
-        )
-    except OSError:
+        result: list[Path] = []
+        for item in root.iterdir():
+            validate_path_chain(item, allow_missing=True)
+            if (
+                not is_symlink_or_reparse(item)
+                and item.is_file()
+                and item.suffix == suffix
+            ):
+                result.append(item)
+        return tuple(sorted(result, key=lambda item: item.name))
+    except (InvalidArtifact, OSError):
         return ()
 
 
@@ -449,6 +452,7 @@ class _UnsafeCanonicalTree(Exception):
 def _canonical_tree_state(root: Path) -> tuple[bool, bool]:
     """Return ``(safe_to_traverse, structurally_strict)`` for canonical state."""
     try:
+        _reject_reparse(root)
         return True, _canonical_tree_is_strict(root)
     except _UnsafeCanonicalTree:
         return False, False
@@ -538,6 +542,10 @@ def _canonical_tree_is_strict(root: Path) -> bool:
 
 
 def _reject_reparse(path: Path) -> None:
+    try:
+        validate_path_chain(path, allow_missing=True)
+    except InvalidArtifact as exc:
+        raise _UnsafeCanonicalTree from exc
     if is_symlink_or_reparse(path):
         raise _UnsafeCanonicalTree
 

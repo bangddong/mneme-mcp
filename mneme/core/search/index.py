@@ -14,7 +14,11 @@ import threading
 from typing import Iterable, Mapping
 
 from mneme.core.errors import InvalidArtifact, UnsafePath
-from mneme.core.fs import exclusive_file_lock, is_symlink_or_reparse
+from mneme.core.fs import (
+    exclusive_file_lock,
+    is_symlink_or_reparse,
+    validate_path_chain,
+)
 from mneme.core.memories import MemoryAuthority, MemoryScope, MemoryStore
 from mneme.core.registries import RegistryStore
 from mneme.core.sessions import SessionRevisionRef, SessionStore
@@ -149,8 +153,9 @@ class GeneratedIndex:
     """A local SQLite cache which can be discarded and rebuilt at any time."""
 
     def __init__(self, db_path: Path):
-        self.db_path = Path(db_path)
+        self.db_path = validate_path_chain(db_path, allow_missing=True)
         self.lock_path = self.db_path.with_name(f".{self.db_path.name}.lock")
+        validate_path_chain(self.lock_path, allow_missing=True)
         normalized = self.lock_path.resolve(strict=False)
         with _INDEX_LOCKS_GUARD:
             self._process_lock = _INDEX_LOCKS.setdefault(normalized, threading.Lock())
@@ -160,6 +165,7 @@ class GeneratedIndex:
         target_check = lambda: validate_generated_index_target(vault, self.db_path)
         target_check()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        target_check()
         rows: list[_IndexRow] = []
         diagnostics: list[str] = []
         try:
@@ -224,7 +230,11 @@ class GeneratedIndex:
     def inspect_read_only(self) -> IndexReport:
         """Inspect without creating the operational lock file used by search."""
         try:
-            if not self.db_path.is_file() or self.db_path.is_symlink():
+            self._validate_paths()
+            if (
+                is_symlink_or_reparse(self.db_path)
+                or not self.db_path.is_file()
+            ):
                 return _unavailable_report()
             conn = sqlite3.connect(self.db_path)
             try:
@@ -237,8 +247,10 @@ class GeneratedIndex:
     def inspect(self) -> IndexReport:
         """Return validated operational index state without granting policy authority."""
         try:
+            self._validate_paths()
             with self._process_lock:
                 with exclusive_file_lock(self.lock_path):
+                    self._validate_paths()
                     if not self.db_path.is_file():
                         return _unavailable_report()
                     conn = sqlite3.connect(self.db_path)
@@ -259,8 +271,10 @@ class GeneratedIndex:
     ) -> tuple[IndexReport, list[RecallHit]]:
         """Inspect and read candidates from one serialized index snapshot."""
         try:
+            self._validate_paths()
             with self._process_lock:
                 with exclusive_file_lock(self.lock_path):
+                    self._validate_paths()
                     if not self.db_path.is_file():
                         return _unavailable_report(), []
                     conn = sqlite3.connect(self.db_path)
@@ -323,6 +337,9 @@ class GeneratedIndex:
         *,
         before_publish=None,
     ) -> None:
+        if before_publish is not None:
+            before_publish()
+        self._validate_paths()
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self.db_path.parent,
             prefix=f".{self.db_path.name}.",
@@ -331,6 +348,7 @@ class GeneratedIndex:
         os.close(descriptor)
         temporary = Path(temporary_name)
         try:
+            validate_path_chain(temporary, allow_missing=False)
             conn = sqlite3.connect(temporary)
             try:
                 conn.executescript(
@@ -375,17 +393,23 @@ class GeneratedIndex:
                 conn.close()
             if before_publish is not None:
                 before_publish()
+            self._validate_paths()
             self._publish(temporary)
         finally:
             try:
+                validate_path_chain(temporary, allow_missing=True)
                 temporary.unlink()
-            except FileNotFoundError:
+            except (FileNotFoundError, InvalidArtifact):
                 pass
 
     def _publish(self, temporary: Path) -> None:
         """Publish under the API lock, using SQLite backup for an open target."""
+        self._validate_paths()
+        validate_path_chain(temporary, allow_missing=False)
         with self._process_lock:
             with exclusive_file_lock(self.lock_path):
+                self._validate_paths()
+                validate_path_chain(temporary, allow_missing=False)
                 if self.db_path.is_file():
                     source = target = None
                     try:
@@ -400,7 +424,14 @@ class GeneratedIndex:
                             target.close()
                         if source is not None:
                             source.close()
+                self._validate_paths()
+                validate_path_chain(temporary, allow_missing=False)
                 os.replace(temporary, self.db_path)
+
+    def _validate_paths(self) -> None:
+        """Preflight both generated database and operational lock components."""
+        validate_path_chain(self.db_path, allow_missing=True)
+        validate_path_chain(self.lock_path, allow_missing=True)
 
     @staticmethod
     def _inspect_connection(conn: sqlite3.Connection) -> IndexReport:
@@ -490,10 +521,14 @@ class GeneratedIndex:
 def validate_generated_index_target(vault: object, db_path: Path) -> Path:
     """Require the one local generated database path before every publication."""
     try:
-        local_root = Path(vault.local_root)
+        local_root = validate_path_chain(vault.local_root, allow_missing=True)
         index_root = local_root / "index"
         expected = index_root / "state.db"
-        candidate = Path(db_path)
+        candidate = validate_path_chain(db_path, allow_missing=True)
+        validate_path_chain(index_root, allow_missing=True)
+        validate_path_chain(
+            expected.with_name(f".{expected.name}.lock"), allow_missing=True
+        )
         if (
             is_symlink_or_reparse(local_root)
             or is_symlink_or_reparse(index_root)
@@ -506,7 +541,7 @@ def validate_generated_index_target(vault: object, db_path: Path) -> Path:
         ):
             raise UnsafePath("generated index target is unsafe")
         return expected
-    except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+    except (AttributeError, InvalidArtifact, OSError, RuntimeError, ValueError) as exc:
         raise UnsafePath("generated index target is unsafe") from exc
 
 

@@ -8,7 +8,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from mneme.core.errors import ArtifactExists, InvalidArtifact
-from mneme.core.fs import dump_yaml, is_symlink_or_reparse, read_yaml, write_new
+from mneme.core.fs import (
+    dump_yaml,
+    is_symlink_or_reparse,
+    read_yaml,
+    validate_path_chain,
+    write_new,
+)
 from mneme.core.artifacts import StorageClass
 from mneme.core.storage import ArtifactReader, ArtifactStore, StorageRouter, ViewStore
 from mneme.core.validation.vault import (
@@ -59,11 +65,10 @@ class Vault:
 
     @classmethod
     def open(cls, root: Path, state_home: Path) -> Vault:
-        requested_root = Path(root)
-        if is_symlink_or_reparse(requested_root):
-            raise InvalidArtifact("Vault root cannot be a link or reparse point")
+        requested_root = validate_path_chain(root, allow_missing=True)
+        requested_state_home = validate_path_chain(state_home, allow_missing=True)
         portable_root = requested_root.resolve(strict=False)
-        local_state_home = Path(state_home).resolve(strict=False)
+        local_state_home = requested_state_home.resolve(strict=False)
         _require_file(
             portable_root, portable_root / ".madi/schema-version", "schema-version"
         )
@@ -105,6 +110,7 @@ class Vault:
             raise InvalidArtifact("Vault metadata has an invalid foundational schema")
         policy_index = read_yaml(portable_root / ".madi/policy-index.yaml")
         local_root = local_state_home / "vaults" / vault_id
+        validate_path_chain(local_root, allow_missing=True)
         validate_separate_roots(portable_root, local_root)
         _require_directories(local_root, _LOCAL_DIRECTORIES, "machine-local")
         vault = cls(portable_root, local_state_home, vault_id, dict(owner), local_root)
@@ -112,21 +118,39 @@ class Vault:
 
         index = parse_policy_index(policy_index, StorageClass.PORTABLE)
         store = PolicyStore(vault)
-        for policy_id in index.policies:
+        for policy_id, ref in index.policies.items():
+            _require_file(
+                portable_root,
+                portable_root
+                / ".madi"
+                / "policies"
+                / policy_id
+                / f"{ref.revision}.yaml",
+                "active policy revision",
+            )
             store.load_active(policy_id, StorageClass.PORTABLE)
         return vault
 
     @classmethod
     def initialize(cls, root: Path, state_home: Path, owner_id: str) -> Vault:
+        """Create clean roots after checking every existing lexical component.
+
+        Missing path tails are intentionally permitted because both roots may be
+        new.  The component checks are repeated around writes, but remain a
+        best-effort preflight rather than a race-free directory-handle walk.
+        """
         validate_owner_id(owner_id)
-        portable_root = Path(root).resolve(strict=False)
-        local_state_home = Path(state_home).resolve(strict=False)
+        requested_root = validate_path_chain(root, allow_missing=True)
+        requested_state_home = validate_path_chain(state_home, allow_missing=True)
+        portable_root = requested_root.resolve(strict=False)
+        local_state_home = requested_state_home.resolve(strict=False)
         validate_separate_roots(portable_root, local_state_home)
         if portable_root.exists() or portable_root.is_symlink():
             raise ArtifactExists(f"Vault path already exists: {portable_root}")
 
         vault_id = uuid4().hex
         local_root = local_state_home / "vaults" / vault_id
+        validate_path_chain(local_root, allow_missing=True)
         validate_separate_roots(portable_root, local_root)
         if local_root.exists() or local_root.is_symlink():
             raise ArtifactExists(f"local Vault state already exists: {local_root}")
@@ -136,14 +160,19 @@ class Vault:
         local_parent = local_state_home / "vaults"
         local_stage = local_parent / f".{vault_id}.initializing"
         for stage in (portable_stage, local_stage):
+            validate_path_chain(stage, allow_missing=True)
             if stage.exists() or stage.is_symlink():
                 raise ArtifactExists(f"Vault initialization stage already exists: {stage}")
 
         portable_root.parent.mkdir(parents=True, exist_ok=True)
         local_parent.mkdir(parents=True, exist_ok=True)
+        validate_path_chain(portable_root.parent, allow_missing=False)
+        validate_path_chain(local_parent, allow_missing=False)
         owned: set[Path] = set()
         try:
+            validate_path_chain(portable_stage, allow_missing=True)
             portable_stage.mkdir(exist_ok=False)
+            validate_path_chain(portable_stage, allow_missing=False)
             owned.add(portable_stage)
             _create_directories(portable_stage, _PORTABLE_DIRECTORIES)
             write_new(portable_stage / ".madi/schema-version", "1")
@@ -163,15 +192,23 @@ class Vault:
                 dump_yaml({"generation": 0, "policies": {}}),
             )
 
+            validate_path_chain(local_stage, allow_missing=True)
             local_stage.mkdir(exist_ok=False)
+            validate_path_chain(local_stage, allow_missing=False)
             owned.add(local_stage)
             _create_directories(local_stage, _LOCAL_DIRECTORIES)
 
+            validate_path_chain(local_root, allow_missing=True)
+            validate_path_chain(portable_root, allow_missing=True)
             if local_root.exists() or portable_root.exists():
                 raise ArtifactExists("Vault target appeared during initialization")
+            validate_path_chain(local_stage, allow_missing=False)
+            validate_path_chain(local_root, allow_missing=True)
             local_stage.rename(local_root)
             owned.remove(local_stage)
             owned.add(local_root)
+            validate_path_chain(portable_stage, allow_missing=False)
+            validate_path_chain(portable_root, allow_missing=True)
             portable_stage.rename(portable_root)
             owned.remove(portable_stage)
             owned.add(portable_root)
@@ -187,11 +224,17 @@ class Vault:
 
 
 def _create_directories(root: Path, relative_paths: tuple[str, ...]) -> None:
+    validate_path_chain(root, allow_missing=False)
     for relative in relative_paths:
-        (root / relative).mkdir(parents=True, exist_ok=False)
+        path = root / relative
+        validate_path_chain(path, allow_missing=True)
+        path.mkdir(parents=True, exist_ok=False)
+        validate_path_chain(path, allow_missing=False)
 
 
 def _require_file(root: Path, path: Path, label: str) -> None:
+    validate_path_chain(root, allow_missing=True)
+    validate_path_chain(path, allow_missing=True)
     if (
         is_symlink_or_reparse(path)
         or not _is_contained(root, path)
@@ -203,10 +246,12 @@ def _require_file(root: Path, path: Path, label: str) -> None:
 def _require_directories(
     root: Path, relative_paths: tuple[str, ...], storage_label: str
 ) -> None:
+    validate_path_chain(root, allow_missing=True)
     if is_symlink_or_reparse(root) or not root.is_dir():
         raise InvalidArtifact(f"required {storage_label} root is missing or unsafe: {root}")
     for relative in relative_paths:
         path = root / relative
+        validate_path_chain(path, allow_missing=True)
         if (
             is_symlink_or_reparse(path)
             or not _is_contained(root, path)
@@ -219,12 +264,18 @@ def _require_directories(
 
 def _is_contained(root: Path, path: Path) -> bool:
     try:
+        validate_path_chain(root, allow_missing=True)
+        validate_path_chain(path, allow_missing=True)
         return path.resolve(strict=False).is_relative_to(root.resolve(strict=False))
-    except (OSError, RuntimeError, ValueError):
+    except (InvalidArtifact, OSError, RuntimeError, ValueError):
         return False
 
 
 def _remove_owned_tree(path: Path) -> None:
+    try:
+        validate_path_chain(path, allow_missing=True)
+    except InvalidArtifact:
+        return
     if path.is_symlink():
         path.unlink()
     elif path.exists():

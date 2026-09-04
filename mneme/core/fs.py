@@ -13,11 +13,64 @@ from typing import Any, BinaryIO, Callable, Iterator
 
 import yaml
 
-from mneme.core.errors import ArtifactExists, ConcurrentWrite, InvalidArtifact
+from mneme.core.errors import (
+    ArtifactExists,
+    ConcurrentWrite,
+    InvalidArtifact,
+    UnsafePath,
+)
 
 
 _cas_locks_guard = threading.Lock()
 _cas_locks: dict[Path, threading.Lock] = {}
+
+
+def validate_path_chain(path: Path, *, allow_missing: bool) -> Path:
+    """Reject links and reparse points in every existing lexical component.
+
+    Components are inspected in order with ``lstat`` from the filesystem anchor,
+    so validation never reaches a child through a link that was already present.
+    ``allow_missing`` permits the first absent component and its necessarily
+    absent tail, which is required for safe initialization preflight.
+
+    This is a best-effort path preflight, not a race-free open.  Another process
+    can replace a checked component before the subsequent filesystem operation;
+    eliminating that race requires platform-specific directory-handle traversal.
+    Callers therefore repeat validation immediately before sensitive I/O.
+    """
+    if not isinstance(allow_missing, bool):
+        raise TypeError("allow_missing must be a boolean")
+    candidate = Path(path)
+    if candidate.drive and not candidate.root:
+        raise UnsafePath(f"path uses a drive-relative anchor: {candidate}")
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    if not candidate.is_absolute() or not candidate.anchor or ".." in candidate.parts:
+        raise UnsafePath(f"path is not lexically anchored: {candidate}")
+
+    current = Path(candidate.anchor)
+    components = [current]
+    for part in candidate.parts[1:]:
+        current /= part
+        components.append(current)
+    missing = False
+    for component in components:
+        if missing:
+            continue
+        try:
+            metadata = os.lstat(component)
+        except FileNotFoundError as exc:
+            if not allow_missing:
+                raise UnsafePath(f"path component is missing: {component}") from exc
+            missing = True
+            continue
+        except (OSError, ValueError) as exc:
+            raise UnsafePath(f"cannot inspect path component: {component}") from exc
+        if _metadata_is_link_or_reparse(metadata):
+            raise UnsafePath(
+                f"path component is a link or reparse point: {component}"
+            )
+    return candidate
 
 
 def is_symlink_or_reparse(path: Path) -> bool:
@@ -31,6 +84,10 @@ def is_symlink_or_reparse(path: Path) -> bool:
         metadata = os.lstat(Path(path))
     except (OSError, ValueError):
         return False
+    return _metadata_is_link_or_reparse(metadata)
+
+
+def _metadata_is_link_or_reparse(metadata: os.stat_result) -> bool:
     if stat.S_ISLNK(metadata.st_mode):
         return True
     attributes = getattr(metadata, "st_file_attributes", 0)
@@ -62,12 +119,13 @@ def dump_yaml(value: Mapping[str, Any]) -> str:
 
 def read_yaml(path: Path) -> dict[str, Any]:
     """Read one UTF-8 YAML mapping."""
+    target = validate_path_chain(path, allow_missing=True)
     try:
-        value = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        value = yaml.safe_load(target.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise InvalidArtifact(f"cannot read YAML artifact: {path}") from exc
+        raise InvalidArtifact(f"cannot read YAML artifact: {target}") from exc
     if not isinstance(value, dict):
-        raise InvalidArtifact(f"YAML artifact is not a mapping: {path}")
+        raise InvalidArtifact(f"YAML artifact is not a mapping: {target}")
     return value
 
 
@@ -79,30 +137,32 @@ def dump_frontmatter(metadata: Mapping[str, Any], body: str) -> str:
 
 def read_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
     """Read strict YAML frontmatter and Markdown body from a UTF-8 file."""
+    target = validate_path_chain(path, allow_missing=True)
     try:
-        text = Path(path).read_text(encoding="utf-8")
+        text = target.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
-        raise InvalidArtifact(f"cannot read Markdown artifact: {path}") from exc
+        raise InvalidArtifact(f"cannot read Markdown artifact: {target}") from exc
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     if not normalized.startswith("---\n"):
-        raise InvalidArtifact(f"Markdown artifact has no frontmatter: {path}")
+        raise InvalidArtifact(f"Markdown artifact has no frontmatter: {target}")
     end = normalized.find("\n---\n", 4)
     if end < 0:
-        raise InvalidArtifact(f"Markdown artifact has unclosed frontmatter: {path}")
+        raise InvalidArtifact(f"Markdown artifact has unclosed frontmatter: {target}")
     try:
         metadata = yaml.safe_load(normalized[4:end])
     except yaml.YAMLError as exc:
-        raise InvalidArtifact(f"invalid YAML frontmatter: {path}") from exc
+        raise InvalidArtifact(f"invalid YAML frontmatter: {target}") from exc
     if not isinstance(metadata, dict):
-        raise InvalidArtifact(f"frontmatter is not a mapping: {path}")
+        raise InvalidArtifact(f"frontmatter is not a mapping: {target}")
     body = normalize_text(normalized[end + len("\n---\n") :])
     return metadata, body
 
 
 def write_new(path: Path, text: str) -> None:
     """Create a new UTF-8 artifact exclusively; never overwrite an existing path."""
-    target = Path(path)
+    target = validate_path_chain(path, allow_missing=True)
     target.parent.mkdir(parents=True, exist_ok=True)
+    validate_path_chain(target, allow_missing=True)
     try:
         with target.open("x", encoding="utf-8", newline="\n") as stream:
             stream.write(normalize_text(text))
@@ -114,8 +174,9 @@ def write_new(path: Path, text: str) -> None:
 
 def replace_text(path: Path, text: str) -> None:
     """Atomically replace a text file using a same-directory temporary."""
-    target = Path(path)
+    target = validate_path_chain(path, allow_missing=True)
     target.parent.mkdir(parents=True, exist_ok=True)
+    validate_path_chain(target, allow_missing=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=target.parent,
         prefix=f".{target.name}.",
@@ -127,6 +188,8 @@ def replace_text(path: Path, text: str) -> None:
             stream.write(normalize_text(text))
             stream.flush()
             os.fsync(stream.fileno())
+        validate_path_chain(temporary, allow_missing=False)
+        validate_path_chain(target, allow_missing=True)
         os.replace(temporary, target)
     finally:
         try:
@@ -139,7 +202,7 @@ def write_yaml_cas(
     path: Path, value: dict[str, Any], expected_generation: int
 ) -> None:
     """Replace a YAML registry only when its generation matches exactly."""
-    target = Path(path).resolve(strict=False)
+    target = validate_path_chain(path, allow_missing=True).resolve(strict=False)
     write_text_cas(
         target,
         dump_yaml(value),
@@ -158,7 +221,7 @@ def write_text_cas(
     read_generation: Callable[[], object],
 ) -> None:
     """Atomically replace text after a process-local generation CAS."""
-    target = Path(path).resolve(strict=False)
+    target = validate_path_chain(path, allow_missing=True).resolve(strict=False)
     lock = _lock_for(target)
     with lock:
         current_generation = read_generation()
@@ -177,8 +240,9 @@ def write_text_cas(
 @contextmanager
 def exclusive_file_lock(path: Path) -> Iterator[None]:
     """Serialize processes through a stable machine-local lock file."""
-    lock_path = Path(path)
+    lock_path = validate_path_chain(path, allow_missing=True)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    validate_path_chain(lock_path, allow_missing=True)
     with lock_path.open("a+b") as stream:
         if stream.seek(0, os.SEEK_END) == 0:
             stream.write(b"\0")

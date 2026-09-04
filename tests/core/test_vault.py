@@ -1,5 +1,7 @@
 from pathlib import Path
+import os
 import shutil
+import subprocess
 from hashlib import sha256
 
 import pytest
@@ -29,6 +31,23 @@ LOCAL_DIRECTORIES = {
     "locks",
     "logs",
 }
+
+
+def _directory_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+
+def _directory_junction(link: Path, target: Path) -> None:
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def _relative_entries(root: Path) -> tuple[set[str], set[str]]:
@@ -222,6 +241,125 @@ def test_open_rejects_required_portable_parent_symlink_escape(tmp_path):
 
     with pytest.raises(InvalidArtifact):
         Vault.open(initialized.root, initialized.state_home)
+
+
+def test_open_rejects_a_vault_beneath_a_directory_symlink_ancestor(tmp_path):
+    """Catches resolving the supplied root before inspecting all path components."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    initialized = Vault.initialize(
+        real_parent / "vault", tmp_path / "state", "person-01"
+    )
+    alias = tmp_path / "alias-parent"
+    _directory_symlink(alias, real_parent)
+    try:
+        with pytest.raises(InvalidArtifact):
+            Vault.open(alias / "vault", initialized.state_home)
+    finally:
+        alias.unlink()
+
+
+def test_open_rejects_state_home_beneath_a_directory_symlink_ancestor(tmp_path):
+    """Catches local layout checks following an aliased state-home ancestor."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(
+        tmp_path / "vault", tmp_path / "real-state", "person-01"
+    )
+    alias = tmp_path / "state-alias"
+    _directory_symlink(alias, initialized.state_home)
+    try:
+        with pytest.raises(InvalidArtifact):
+            Vault.open(initialized.root, alias)
+    finally:
+        alias.unlink()
+
+
+def test_initialize_rejects_a_missing_vault_beneath_a_symlink_ancestor(
+    tmp_path,
+):
+    """Catches initialization resolving and writing through an existing link prefix."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    target_parent = tmp_path / "target-parent"
+    target_parent.mkdir()
+    alias = tmp_path / "alias-parent"
+    _directory_symlink(alias, target_parent)
+    try:
+        with pytest.raises(InvalidArtifact):
+            Vault.initialize(
+                alias / "missing" / "vault",
+                tmp_path / "state",
+                "person-01",
+            )
+    finally:
+        alias.unlink()
+
+    assert not (target_parent / "missing" / "vault").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_open_rejects_a_vault_beneath_an_ancestor_junction(tmp_path):
+    """Catches final-component lstat missing an earlier Windows junction."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    initialized = Vault.initialize(
+        real_parent / "vault", tmp_path / "state", "person-01"
+    )
+    alias = tmp_path / "alias-parent"
+    _directory_junction(alias, real_parent)
+    try:
+        with pytest.raises(InvalidArtifact):
+            Vault.open(alias / "vault", initialized.state_home)
+    finally:
+        alias.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_open_rejects_an_internal_madi_directory_junction(tmp_path):
+    """Catches resolve-plus-containment accepting an in-root junction target."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(
+        tmp_path / "vault", tmp_path / "state", "person-01"
+    )
+    madi = initialized.root / ".madi"
+    target = initialized.root / "madi-target"
+    madi.rename(target)
+    _directory_junction(madi, target)
+    try:
+        with pytest.raises(InvalidArtifact):
+            Vault.open(initialized.root, initialized.state_home)
+    finally:
+        madi.rmdir()
+        target.rename(madi)
+
+
+def test_initialize_and_open_accept_clean_nested_missing_roots(tmp_path):
+    """Catches link validation rejecting ordinary not-yet-created path tails."""
+    from mneme.core.vault import Vault
+
+    root = tmp_path / "portable-parent" / "nested" / "vault"
+    state_home = tmp_path / "local-parent" / "nested" / "state"
+
+    initialized = Vault.initialize(root, state_home, "person-01")
+    opened = Vault.open(root, state_home)
+
+    assert opened.id == initialized.id
+    assert opened.root == root
+    assert opened.local_root == state_home / "vaults" / initialized.id
+    local_directories, local_files = _relative_entries(opened.local_root)
+    assert local_directories == LOCAL_DIRECTORIES
+    assert all(path.startswith("locks/") for path in local_files)
 
 
 @pytest.mark.parametrize("relative_path", sorted(LOCAL_DIRECTORIES))
