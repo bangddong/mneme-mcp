@@ -29,6 +29,7 @@ from mneme.core.memories import (
 )
 from mneme.core.policy import (
     InvalidPolicy,
+    PolicyError,
     PolicyStore,
     Portability,
     UnknownPolicy,
@@ -566,25 +567,55 @@ def _requested_portability(storage_class: StorageClass) -> Portability:
 def _error_envelope(command: str, error: Exception) -> dict[str, Any]:
     if isinstance(error, _CliUsageError):
         code = "cli-usage"
+        message = "Command arguments are invalid; review --help and retry."
     elif isinstance(error, _PolicyDenied):
         code = "policy-denied"
-    elif isinstance(error, (UnknownPolicy, InvalidPolicy)):
+        message = (
+            "Policy evaluation rejected the request; reduce portability or review "
+            "the active policy."
+        )
+    elif isinstance(error, (UnknownPolicy, InvalidPolicy, PolicyError)):
         code = "policy-error"
+        message = (
+            "Policy evaluation could not be completed safely; run doctor and review "
+            "the active policy."
+        )
     elif isinstance(error, RegistryConflict):
-        code = error.code
+        code = "registry-conflict"
+        message = (
+            "Canonical state changed; reload it and retry with explicit expected "
+            "versions."
+        )
     elif isinstance(error, ConcurrentWrite):
         code = "concurrent-write"
+        message = (
+            "Canonical state changed; reload it and retry with explicit expected "
+            "versions."
+        )
     elif isinstance(error, ArtifactExists):
         code = "artifact-conflict"
+        message = (
+            "The request conflicts with canonical state; choose a new identity or "
+            "reload current state."
+        )
     elif isinstance(error, PortabilityViolation):
         code = "portability-violation"
+        message = (
+            "The request violates the portable/local boundary; reduce portability "
+            "or remove local-only references."
+        )
     elif isinstance(error, InvalidArtifact):
         code = "invalid-artifact"
+        message = (
+            "The request or Vault artifact failed validation; run doctor and retry "
+            "with valid input."
+        )
     elif isinstance(error, MadiError):
         code = "core-error"
+        message = "The Core request failed safely; run doctor and review the command."
     else:
         code = "internal-error"
-    message = str(error).strip() or type(error).__name__
+        message = "The command failed safely; run doctor and retry."
     return {
         "command": command,
         "error": {"code": code, "message": message},

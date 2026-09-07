@@ -253,6 +253,11 @@ def test_policy_failure_is_json_stderr_and_exit_two(vault, capsys):
     assert stderr["ok"] is False
     assert stderr["command"] == "remember"
     assert stderr["error"]["code"] == "policy-denied"
+    assert stderr["error"]["message"] == (
+        "Policy evaluation rejected the request; reduce portability or review "
+        "the active policy."
+    )
+    assert "must remain local" not in json.dumps(stderr)
     assert list((vault.root / "memory").glob("*.md")) == []
 
 
@@ -297,6 +302,9 @@ def test_checkpoint_conflict_is_json_stderr_and_exit_two(vault, tmp_path, capsys
     assert stderr["ok"] is False
     assert stderr["command"] == "checkpoint"
     assert stderr["error"]["code"] == "registry-conflict"
+    assert stderr["error"]["message"] == (
+        "Canonical state changed; reload it and retry with explicit expected versions."
+    )
     assert not (vault.root / "workstreams/ws-1/sessions").exists()
 
 
@@ -331,6 +339,138 @@ def test_cli_schema_error_is_json_stderr_and_exit_two(vault, capsys):
     assert stdout is None
     assert stderr["status"] == "error"
     assert stderr["error"]["code"] == "invalid-artifact"
+    assert stderr["error"]["message"] == (
+        "The request or Vault artifact failed validation; run doctor and retry "
+        "with valid input."
+    )
+    assert "../unsafe" not in json.dumps(stderr)
+
+
+def test_missing_vault_schema_does_not_disclose_its_local_path(tmp_path, capsys):
+    vault_root = tmp_path / "local-secret-vault"
+    state_home = tmp_path / "local-secret-state"
+
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        [
+            "--vault-root",
+            str(vault_root),
+            "--state-home",
+            str(state_home),
+            "status",
+        ],
+    )
+
+    encoded = json.dumps(stderr)
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr["error"] == {
+        "code": "invalid-artifact",
+        "message": (
+            "The request or Vault artifact failed validation; run doctor and retry "
+            "with valid input."
+        ),
+    }
+    assert str(vault_root) not in encoded
+    assert "local-secret" not in encoded
+
+
+def test_artifact_conflict_does_not_disclose_identity_or_storage_path(vault, capsys):
+    project_id = "confidential-customer-project"
+    arguments = _arguments(vault, "project", "--id", project_id)
+    first_exit, _first_stdout, first_stderr = _invoke(capsys, arguments)
+    assert first_exit == 0
+    assert first_stderr is None
+
+    exit_code, stdout, stderr = _invoke(capsys, arguments)
+
+    encoded = json.dumps(stderr)
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr["error"] == {
+        "code": "artifact-conflict",
+        "message": (
+            "The request conflicts with canonical state; choose a new identity or "
+            "reload current state."
+        ),
+    }
+    assert project_id not in encoded
+    assert str(vault.root) not in encoded
+
+
+def test_cli_usage_error_does_not_echo_secret_url_from_argv(vault, capsys):
+    secret_url = "https://alice:top-secret@example.invalid/private?token=hidden"
+
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        _arguments(
+            vault,
+            "remember",
+            "--kind",
+            secret_url,
+            "--scope",
+            "personal-global",
+            "--authority",
+            "personal",
+            "--portability",
+            "personal-vault",
+            "--body",
+            "confidential body",
+        ),
+    )
+
+    encoded = json.dumps(stderr)
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr["error"] == {
+        "code": "cli-usage",
+        "message": "Command arguments are invalid; review --help and retry.",
+    }
+    assert secret_url not in encoded
+    assert "top-secret" not in encoded
+    assert "token" not in encoded
+    assert "confidential body" not in encoded
+
+
+def test_unexpected_error_uses_a_closed_message_without_sensitive_details(
+    vault, capsys, monkeypatch
+):
+    sensitive = (
+        r"C:\Users\alice\private\vault "
+        "/home/alice/private/vault "
+        "https://alice:password@example.invalid/api?token=hidden "
+        "api_key=credential-value "
+        f"sha256={'a' * 64} count=47 confidential-overlay exists"
+    )
+
+    def fail_unexpectedly(_vault, _arguments):
+        raise RuntimeError(sensitive)
+
+    monkeypatch.setattr("mneme.cli._dispatch", fail_unexpectedly)
+
+    exit_code, stdout, stderr = _invoke(capsys, _arguments(vault, "status"))
+
+    encoded = json.dumps(stderr)
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr["error"] == {
+        "code": "internal-error",
+        "message": "The command failed safely; run doctor and retry.",
+    }
+    for forbidden in (
+        r"C:\Users\alice\private\vault",
+        "/home/alice/private/vault",
+        "https://",
+        "password",
+        "token",
+        "api_key",
+        "credential-value",
+        "a" * 64,
+        "count=47",
+        "confidential-overlay",
+        "exists",
+    ):
+        assert forbidden not in encoded
 
 
 def test_distribution_keeps_legacy_name_and_adds_only_vault_cli():
