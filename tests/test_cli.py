@@ -487,3 +487,113 @@ def test_distribution_keeps_legacy_name_and_adds_only_vault_cli():
         "mneme"
     ]
     assert not Path("madi").exists()
+
+
+def test_sync_status_is_one_safe_json_envelope_when_git_is_unavailable(vault, capsys):
+    """Catches nested sync status bypassing the Task 17 JSON boundary."""
+    exit_code, stdout, stderr = _invoke(
+        capsys, _arguments(vault, "sync", "status")
+    )
+
+    assert exit_code == 0
+    assert stderr is None
+    assert stdout == {
+        "command": "sync",
+        "ok": True,
+        "result": {
+            "ahead": 0,
+            "behind": 0,
+            "changed": False,
+            "clean": True,
+            "has_upstream": False,
+            "repository": False,
+            "status": "unavailable",
+        },
+        "status": "unavailable",
+    }
+
+
+def test_sync_rejects_a_remote_url_without_disclosing_it(vault, capsys):
+    """Catches a Git error reflecting a credential-bearing remote URL."""
+    secret_url = "https://alice:secret@example.invalid/repo?token=hidden"
+
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        _arguments(vault, "sync", "fetch", "--remote", secret_url),
+    )
+
+    encoded = json.dumps(stderr)
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr == {
+        "command": "sync",
+        "error": {
+            "code": "sync-error",
+            "message": "Git sync failed safely; inspect sync status and retry.",
+        },
+        "ok": False,
+        "status": "error",
+    }
+    assert secret_url not in encoded
+    assert "alice" not in encoded
+    assert "secret" not in encoded
+    assert "token" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("subcommand", "arguments"),
+    (
+        ("fetch", ()),
+        (
+            "commit",
+            ("--path", ".madi/vault.yaml", "--message", "explicit sync batch"),
+        ),
+        ("fast-forward", ()),
+        ("push", ()),
+    ),
+)
+def test_sync_mutation_subcommands_use_the_safe_sync_boundary(
+    vault, capsys, subcommand, arguments
+):
+    """Catches a declared sync verb bypassing the fixed Git error boundary."""
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        _arguments(vault, "sync", subcommand, *arguments),
+    )
+
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr == {
+        "command": "sync",
+        "error": {
+            "code": "sync-error",
+            "message": "Git sync failed safely; inspect sync status and retry.",
+        },
+        "ok": False,
+        "status": "error",
+    }
+
+
+def test_checkpoint_cli_has_no_commit_on_checkpoint_setting(vault, tmp_path, capsys):
+    """Catches re-coupling durable checkpoint persistence to Git policy."""
+    from mneme.core.registries import RegistryStore
+
+    RegistryStore(vault).create_workstream("ws-1", project=None, mode="single")
+    payload = tmp_path / "checkpoint.json"
+    _checkpoint_payload(payload)
+
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        _arguments(
+            vault,
+            "checkpoint",
+            "--payload",
+            str(payload),
+            "--commit-on-checkpoint",
+        ),
+    )
+
+    assert exit_code == 2
+    assert stdout is None
+    assert stderr["error"]["code"] == "cli-usage"
+    assert not (vault.root / "workstreams/ws-1/sessions").exists()

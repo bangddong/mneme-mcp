@@ -20,6 +20,14 @@ from mneme.core.errors import (
     MadiError,
     PortabilityViolation,
 )
+from mneme.core.git_sync import (
+    GitSyncError,
+    commit_paths,
+    fast_forward,
+    fetch,
+    inspect_sync,
+    push,
+)
 from mneme.core.memories import (
     MemoryAuthority,
     MemoryKind,
@@ -50,7 +58,17 @@ from mneme.core.vault import Vault
 
 
 _COMMANDS = frozenset(
-    {"status", "doctor", "context", "recall", "remember", "checkpoint", "project", "reindex"}
+    {
+        "status",
+        "doctor",
+        "context",
+        "recall",
+        "remember",
+        "checkpoint",
+        "project",
+        "reindex",
+        "sync",
+    }
 )
 
 
@@ -147,6 +165,33 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     commands.add_parser("reindex", help="rebuild disposable local recall state")
+
+    sync = commands.add_parser("sync", help="run one explicit non-merging Git action")
+    sync_commands = sync.add_subparsers(
+        dest="sync_command", required=True, parser_class=_JsonParser
+    )
+    sync_commands.add_parser("status", help="inspect Git sync state")
+
+    fetch_command = sync_commands.add_parser("fetch", help="fetch without applying")
+    fetch_command.add_argument("--remote", default="origin")
+
+    commit_command = sync_commands.add_parser(
+        "commit", help="commit only explicitly named canonical artifacts"
+    )
+    commit_command.add_argument("--path", action="append", required=True)
+    commit_command.add_argument("--message", required=True)
+
+    fast_forward_command = sync_commands.add_parser(
+        "fast-forward", help="fetch then apply only a clean verified fast-forward"
+    )
+    fast_forward_command.add_argument("--remote", default="origin")
+    fast_forward_command.add_argument("--branch")
+
+    push_command = sync_commands.add_parser(
+        "push", help="push the current branch without force"
+    )
+    push_command.add_argument("--remote", default="origin")
+    push_command.add_argument("--branch")
     return parser
 
 
@@ -209,7 +254,25 @@ def _dispatch(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[st
             "rows": report.rows,
             "source_rows": report.source_rows,
         }
+    if arguments.command == "sync":
+        return _sync(vault, arguments)
     raise _CliUsageError(f"unknown command: {arguments.command}")
+
+
+def _sync(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    if arguments.sync_command == "status":
+        result = inspect_sync(vault)
+    elif arguments.sync_command == "fetch":
+        result = fetch(vault, arguments.remote)
+    elif arguments.sync_command == "commit":
+        result = commit_paths(vault, arguments.path, arguments.message)
+    elif arguments.sync_command == "fast-forward":
+        result = fast_forward(vault, arguments.remote, arguments.branch)
+    elif arguments.sync_command == "push":
+        result = push(vault, arguments.remote, arguments.branch)
+    else:
+        raise _CliUsageError("unknown sync command")
+    return result.status, asdict(result)
 
 
 def _remember(vault: Vault, arguments: argparse.Namespace) -> dict[str, Any]:
@@ -568,6 +631,9 @@ def _error_envelope(command: str, error: Exception) -> dict[str, Any]:
     if isinstance(error, _CliUsageError):
         code = "cli-usage"
         message = "Command arguments are invalid; review --help and retry."
+    elif isinstance(error, GitSyncError):
+        code = "sync-error"
+        message = "Git sync failed safely; inspect sync status and retry."
     elif isinstance(error, _PolicyDenied):
         code = "policy-denied"
         message = (
