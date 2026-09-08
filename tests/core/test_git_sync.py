@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -45,16 +45,30 @@ def _bare_remote(vault, tmp_path: Path) -> Path:
     return remote
 
 
-def _advance_remote(remote: Path, tmp_path: Path, text: str = "remote update") -> str:
+def _advance_remote(
+    remote: Path,
+    tmp_path: Path,
+    text: str = "remote update",
+    relative_path: str = "README.md",
+) -> str:
     writer = tmp_path / f"writer-{len(tuple(tmp_path.glob('writer-*')))}"
     _git(tmp_path, "clone", "--branch", "main", str(remote), str(writer))
     _git(writer, "config", "user.name", "Remote Test")
     _git(writer, "config", "user.email", "remote@example.invalid")
-    (writer / "README.md").write_text(text, encoding="utf-8")
-    _git(writer, "add", "--", "README.md")
+    target = writer / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    _git(writer, "add", "--", relative_path)
     _git(writer, "commit", "-m", "advance remote")
     _git(writer, "push", "origin", "main")
     return _git(writer, "rev-parse", "HEAD").stdout.strip()
+
+
+def _file_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
 
 
 def _checkpoint(vault):
@@ -130,22 +144,200 @@ def test_fast_forward_reports_divergence_without_merging(vault, tmp_path):
     assert "<<<<<<<" not in (vault.root / "README.md").read_text(encoding="utf-8")
 
 
-def test_fast_forward_updates_only_when_local_head_is_a_verified_ancestor(
+def test_fast_forward_validates_a_verified_ancestor_then_requires_manual_apply(
     vault, tmp_path
 ):
-    """Catches a nominal fast-forward that does not update HEAD and the clean tree."""
+    """Catches direct ref/worktree mutation after a nominal fast-forward."""
     from mneme.core.git_sync import fast_forward
 
     _initialize_git(vault)
     remote = _bare_remote(vault, tmp_path)
     remote_head = _advance_remote(remote, tmp_path, "verified fast-forward")
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
 
     result = fast_forward(vault)
 
-    assert result.status == "fast-forwarded"
-    assert result.changed is True
-    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == remote_head
-    assert (vault.root / "README.md").read_text(encoding="utf-8") == "verified fast-forward"
+    assert result.status == "manual-fast-forward-required"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "refs/remotes/origin/main").stdout.strip() == remote_head
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+    assert not (vault.root / "README.md").exists()
+
+
+def test_fast_forward_refuses_an_invalid_fetched_target_without_mutating_checkout(
+    vault, tmp_path
+):
+    """Catches a fetched target being trusted because the current checkout is valid."""
+    from mneme.core.git_sync import fast_forward
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    remote_head = _advance_remote(
+        remote,
+        tmp_path,
+        "not a canonical memory artifact",
+        "memory/unsafe.txt",
+    )
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    schema_before = (vault.root / ".madi/schema-version").read_text(encoding="utf-8")
+
+    result = fast_forward(vault)
+
+    assert result.status == "target-invalid"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "refs/remotes/origin/main").stdout.strip() == remote_head
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+    assert (vault.root / ".madi/schema-version").read_text(encoding="utf-8") == schema_before
+    assert not (vault.root / "memory/unsafe.txt").exists()
+
+
+@pytest.mark.parametrize("dangerous_command", ("update-ref", "restore"))
+def test_fast_forward_never_reaches_fallible_ref_or_restore_mutation(
+    vault, tmp_path, monkeypatch, dangerous_command
+):
+    """Catches a ref CAS or restore failure after an unsafe partial apply."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _advance_remote(remote, tmp_path)
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    original = git_sync._run_git
+
+    def injected(root, arguments, **kwargs):
+        if arguments[0] == dangerous_command:
+            raise git_sync.GitSyncError("injected mutation failure")
+        return original(root, arguments, **kwargs)
+
+    monkeypatch.setattr(git_sync, "_run_git", injected)
+
+    result = git_sync.fast_forward(vault)
+
+    assert result.status == "manual-fast-forward-required"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+
+
+def test_fast_forward_preserves_a_late_worktree_edit_after_target_validation(
+    vault, tmp_path, monkeypatch
+):
+    """Catches a target apply overwriting a write that arrives after validation."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _advance_remote(remote, tmp_path)
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    original = getattr(git_sync, "_validate_commit_tree", None)
+
+    def validate_then_edit(root, commit):
+        valid = True
+        if original is not None:
+            valid = original(root, commit)
+        (vault.root / "late-edit.txt").write_text("keep me", encoding="utf-8")
+        return valid
+
+    monkeypatch.setattr(git_sync, "_validate_commit_tree", validate_then_edit, raising=False)
+
+    result = git_sync.fast_forward(vault)
+
+    assert result.status == "dirty"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+    assert (vault.root / "late-edit.txt").read_text(encoding="utf-8") == "keep me"
+
+
+def test_fast_forward_returns_a_structured_refusal_when_head_changes_during_validation(
+    vault, tmp_path, monkeypatch
+):
+    """Catches a ref CAS race being reported as a generic Git transport error."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _advance_remote(remote, tmp_path)
+    original = getattr(git_sync, "_validate_commit_tree", None)
+
+    def validate_then_advance(root, commit):
+        valid = True
+        if original is not None:
+            valid = original(root, commit)
+        (vault.root / "concurrent.md").write_text("new head", encoding="utf-8")
+        _git(vault.root, "add", "--", "concurrent.md")
+        _git(vault.root, "commit", "-m", "concurrent local commit")
+        return valid
+
+    monkeypatch.setattr(
+        git_sync, "_validate_commit_tree", validate_then_advance, raising=False
+    )
+
+    result = git_sync.fast_forward(vault)
+
+    assert result.status == "concurrent-ref-changed"
+    assert result.changed is False
+    assert (vault.root / "concurrent.md").read_text(encoding="utf-8") == "new head"
+
+
+def test_fast_forward_uses_the_configured_differently_named_upstream(vault, tmp_path):
+    """Catches synthesis of origin/current-branch instead of @{upstream}."""
+    from mneme.core.git_sync import fast_forward
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _advance_remote(remote, tmp_path, "release update")
+    writer = tmp_path / "release-writer"
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(writer))
+    _git(writer, "config", "user.name", "Remote Test")
+    _git(writer, "config", "user.email", "remote@example.invalid")
+    (writer / "release.txt").write_text("release", encoding="utf-8")
+    _git(writer, "add", "--", "release.txt")
+    _git(writer, "commit", "-m", "release branch")
+    release_head = _git(writer, "rev-parse", "HEAD").stdout.strip()
+    _git(writer, "push", "origin", "HEAD:refs/heads/release")
+    _git(vault.root, "config", "branch.main.merge", "refs/heads/release")
+
+    result = fast_forward(vault)
+
+    assert result.status == "manual-fast-forward-required"
+    assert _git(vault.root, "rev-parse", "refs/remotes/origin/release").stdout.strip() == release_head
+
+
+def test_fast_forward_refuses_a_requested_remote_that_is_not_the_upstream(
+    vault, tmp_path
+):
+    """Catches fetching an arbitrary named remote and treating it as the upstream."""
+    from mneme.core.git_sync import fast_forward
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _git(vault.root, "remote", "add", "mirror", str(remote))
+
+    result = fast_forward(vault, remote="mirror")
+
+    assert result.status == "upstream-mismatch"
+    assert result.changed is False
+    assert _git(
+        vault.root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        "refs/remotes/mirror/main",
+        check=False,
+    ).returncode == 1
+
+
+def test_fast_forward_refuses_a_missing_upstream_before_fetching(vault):
+    """Catches a missing tracking configuration becoming a generic fetch failure."""
+    from mneme.core.git_sync import fast_forward
+
+    _initialize_git(vault)
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+
+    result = fast_forward(vault)
+
+    assert result.status == "no-upstream"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
 
 
 def test_commit_paths_commits_only_explicit_canonical_portable_artifacts(vault):
@@ -191,6 +383,42 @@ def test_commit_paths_commits_only_explicit_canonical_portable_artifacts(vault):
     assert not _git(
         vault.root, "ls-tree", "-r", "--name-only", "HEAD"
     ).stdout.__contains__("CURRENT.md")
+
+
+@pytest.mark.parametrize("mutation", ("delete", "symlink"))
+def test_commit_paths_refuses_a_file_swap_after_preflight_before_staging(
+    vault, mutation, monkeypatch
+):
+    """Catches a deletion or local-state symlink entering after path preflight."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    target = vault.root / ".madi" / "vault.yaml"
+    generated = vault.local_root / "views" / "CURRENT.md"
+    generated.write_text("generated local state", encoding="utf-8")
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    original = git_sync._run_git
+    injected = False
+
+    def swap_before_add(root, arguments, **kwargs):
+        nonlocal injected
+        if arguments[0] == "add" and not injected:
+            injected = True
+            target.unlink()
+            if mutation == "delete":
+                pass
+            else:
+                _file_symlink(target, generated)
+        return original(root, arguments, **kwargs)
+
+    monkeypatch.setattr(git_sync, "_run_git", swap_before_add)
+
+    result = git_sync.commit_paths(vault, (".madi/vault.yaml",), "unsafe race")
+
+    assert result.status == "staged-content-invalid"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+    assert _git(vault.root, "diff", "--cached", "--name-only").stdout == ""
 
 
 @pytest.mark.parametrize(
@@ -291,3 +519,112 @@ def test_push_is_explicit_and_exposes_no_force_mode(vault, tmp_path):
     result = push(vault)
     assert result.status == "pushed"
     assert result.changed is True
+
+
+def test_push_uses_the_captured_validated_head_not_a_late_head_advance(
+    vault, tmp_path, monkeypatch
+):
+    """Catches a dynamic HEAD refspec pushing a commit that preflight never saw."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    (vault.root / "README.md").write_text("validated", encoding="utf-8")
+    _git(vault.root, "add", "--", "README.md")
+    _git(vault.root, "commit", "-m", "validated local commit")
+    validated_head = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    original = git_sync._run_git
+    injected = False
+
+    def advance_head_before_push(root, arguments, **kwargs):
+        nonlocal injected
+        if arguments[0] == "push" and not injected:
+            injected = True
+            (vault.root / "late.md").write_text("late", encoding="utf-8")
+            _git(vault.root, "add", "--", "late.md")
+            _git(vault.root, "commit", "-m", "late local commit")
+        return original(root, arguments, **kwargs)
+
+    monkeypatch.setattr(git_sync, "_run_git", advance_head_before_push)
+
+    result = git_sync.push(vault)
+
+    assert result.status == "pushed"
+    assert result.changed is True
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == validated_head
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() != validated_head
+
+
+def test_push_uses_the_differently_named_tracked_destination(vault, tmp_path):
+    """Catches pushing to the current local branch rather than its upstream branch."""
+    from mneme.core.git_sync import push
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    initial = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    _git(vault.root, "push", "origin", "main:refs/heads/release")
+    _git(vault.root, "fetch", "origin")
+    _git(vault.root, "config", "branch.main.merge", "refs/heads/release")
+    (vault.root / "README.md").write_text("tracked destination", encoding="utf-8")
+    _git(vault.root, "add", "--", "README.md")
+    _git(vault.root, "commit", "-m", "advance tracked destination")
+    head = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+
+    result = push(vault)
+
+    assert result.status == "pushed"
+    assert result.changed is True
+    assert _git(remote, "rev-parse", "refs/heads/release").stdout.strip() == head
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == initial
+
+
+def test_push_returns_a_structured_refusal_when_the_upstream_has_advanced(
+    vault, tmp_path
+):
+    """Catches a non-fast-forward rejection escaping as a generic Git error."""
+    from mneme.core.git_sync import push
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    remote_head = _advance_remote(remote, tmp_path, "remote advance")
+    (vault.root / "README.md").write_text("local advance", encoding="utf-8")
+    _git(vault.root, "add", "--", "README.md")
+    _git(vault.root, "commit", "-m", "advance local")
+
+    result = push(vault)
+
+    assert result.status == "remote-conflict"
+    assert result.changed is False
+    assert _git(remote, "rev-parse", "refs/heads/main").stdout.strip() == remote_head
+
+
+def test_materialize_canonical_tree_rejects_duplicate_entries_before_writing(
+    tmp_path, monkeypatch
+):
+    """Catches a malformed tree creating a partial snapshot before duplicate refusal."""
+    import mneme.core.git_sync as git_sync
+    from mneme.core.errors import InvalidArtifact
+
+    destination = tmp_path / "snapshot"
+    destination.mkdir()
+    duplicate = (
+        "100644",
+        "blob",
+        "a" * 40,
+        PurePosixPath(".madi/vault.yaml"),
+    )
+    monkeypatch.setattr(
+        git_sync,
+        "_tree_entries",
+        lambda _root, _commit: (duplicate, duplicate),
+    )
+
+    def unexpected_blob_read(*_args, **_kwargs):
+        raise AssertionError("duplicate tree entries must fail before blob materialization")
+
+    monkeypatch.setattr(git_sync, "_run_git_bytes", unexpected_blob_read)
+
+    with pytest.raises(InvalidArtifact):
+        git_sync._materialize_canonical_tree(tmp_path, "b" * 40, destination)
+
+    assert list(destination.iterdir()) == []
