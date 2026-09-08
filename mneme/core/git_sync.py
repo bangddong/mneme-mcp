@@ -362,10 +362,21 @@ def push(
 
 
 def _authorize_current_policy(
-    _vault: Vault, _paths: tuple[PurePosixPath, ...]
+    vault: Vault, _paths: tuple[PurePosixPath, ...]
 ) -> LivePolicyDecision:
-    """Task 18 seam: Doctor already performs available current-pointer checks."""
-    return LivePolicyDecision(True)
+    """Fail closed over every current-tree artifact before Git mutation.
+
+    The preflight path list remains exact for staging, while policy evaluation
+    intentionally covers the whole current portable tree: committing one policy
+    assignment must not distribute another now-noncompliant artifact.
+    """
+    try:
+        from mneme.core.security import PolicyAuthorizer
+
+        decision = PolicyAuthorizer(vault).authorize_current_tree()
+        return LivePolicyDecision(decision.allowed, decision.issue_codes)
+    except Exception:
+        return LivePolicyDecision(False, ("policy-current-unavailable",))
 
 
 def _doctor_status_without_generated_authority(report: DoctorReport) -> str:

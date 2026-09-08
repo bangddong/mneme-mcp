@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
+import re
 
 from mneme.core.artifacts import (
     FAMILY_CODECS,
@@ -16,6 +17,8 @@ from mneme.core.artifacts import (
 from mneme.core.errors import InvalidArtifact, UnsafePath
 from mneme.core.fs import (
     exclusive_file_lock,
+    dump_yaml,
+    is_symlink_or_reparse,
     read_frontmatter,
     read_yaml,
     replace_text,
@@ -215,6 +218,8 @@ class ViewStore:
     """Generated-only writer restricted to local CURRENT and PROFILE projections."""
 
     _NAMES = frozenset({"CURRENT.md", "PROFILE.md"})
+    _AUTHORIZATION_SCHEMA = "madi.generated-view-authorization.v1"
+    _FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("obtain ViewStore from StorageRouter.view_store() or Vault.views")
@@ -226,11 +231,73 @@ class ViewStore:
         instance.root = router.local_root / "views"
         return instance
 
-    def write(self, relative_path: str, text: str) -> Path:
+    def write(
+        self,
+        relative_path: str,
+        text: str,
+        *,
+        authorization_fingerprint: str | None = None,
+    ) -> Path:
         if relative_path not in self._NAMES:
             raise UnsafePath(f"unsupported generated view path: {relative_path}")
+        if authorization_fingerprint is not None and not self._valid_fingerprint(
+            authorization_fingerprint
+        ):
+            raise InvalidArtifact("generated view authorization fingerprint is invalid")
         target = validate_contained_path(self.root, PurePosixPath(relative_path))
         self.root.mkdir(parents=True, exist_ok=True)
         target = validate_contained_path(self.root, PurePosixPath(relative_path))
         replace_text(target, text)
+        metadata = self._authorization_path(relative_path)
+        replace_text(
+            metadata,
+            dump_yaml(
+                {
+                    "authorization_fingerprint": authorization_fingerprint,
+                    "schema": self._AUTHORIZATION_SCHEMA,
+                }
+            ),
+        )
         return target
+
+    def load(
+        self, relative_path: str, *, authorization_fingerprint: str | None
+    ) -> str | None:
+        """Return a local view only when its live authorization input still matches.
+
+        The caller obtains the opaque fingerprint from ``PolicyAuthorizer``.  A
+        missing, malformed, stale, or unsafe view is a cache miss rather than a
+        reason to expose stale text or policy detail.
+        """
+        if relative_path not in self._NAMES or not self._valid_fingerprint(
+            authorization_fingerprint
+        ):
+            return None
+        try:
+            target = validate_contained_path(self.root, PurePosixPath(relative_path))
+            metadata_path = self._authorization_path(relative_path)
+            if (
+                is_symlink_or_reparse(target)
+                or is_symlink_or_reparse(metadata_path)
+                or not target.is_file()
+                or not metadata_path.is_file()
+            ):
+                return None
+            metadata = read_yaml(metadata_path)
+            if metadata != {
+                "authorization_fingerprint": authorization_fingerprint,
+                "schema": self._AUTHORIZATION_SCHEMA,
+            }:
+                return None
+            return target.read_text(encoding="utf-8")
+        except Exception:
+            return None
+
+    def _authorization_path(self, relative_path: str) -> Path:
+        return validate_contained_path(
+            self.root, PurePosixPath(f"{relative_path}.authorization.yaml")
+        )
+
+    @classmethod
+    def _valid_fingerprint(cls, value: object) -> bool:
+        return isinstance(value, str) and cls._FINGERPRINT.fullmatch(value) is not None

@@ -189,10 +189,13 @@ class MemoryReaders:
     """Storage-bound reader seam for PROFILE generation; it has no write hook."""
 
     store: MemoryStore
+    authorize_record: Callable[[MemoryRecord], bool] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.store, MemoryStore):
             raise TypeError("PROFILE requires a storage-bound MemoryStore reader")
+        if self.authorize_record is not None and not callable(self.authorize_record):
+            raise TypeError("PROFILE record authorizer must be callable")
 
     @property
     def storage_class(self) -> StorageClass:
@@ -200,6 +203,19 @@ class MemoryReaders:
 
     def load_records(self) -> tuple[MemoryRecord, ...]:
         return self.store.iter_records()
+
+    def allows_current_profile(self, record: MemoryRecord) -> bool:
+        """Apply the live gate without letting a generated PROFILE cache decide."""
+        try:
+            if self.authorize_record is not None:
+                return self.authorize_record(record) is True
+            from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
+
+            return PolicyAuthorizer(self.store.vault).authorize_current(
+                PolicyArtifactRef.memory(record.id), "profile"
+            ).allowed
+        except Exception:
+            return False
 
 
 class MemoryStore:
@@ -504,6 +520,7 @@ def render_profile(
         record for record in all_records if record.scope == selected_scope
         and record.kind is MemoryKind.PREFERENCE and record.status is MemoryStatus.ACCEPTED
         and not _has_successor(record, by_id)
+        and readers.allows_current_profile(record)
     )
     records = tuple(sorted(records, key=lambda item: item.id))
     lines = ["# PROFILE", "", f"storage_class: {storage_class.value}", f"scope: {selected_scope.type.value}"]

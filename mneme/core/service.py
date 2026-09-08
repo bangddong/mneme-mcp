@@ -11,6 +11,7 @@ from mneme.core.memories import MemoryRecord, MemoryStatus, MemoryStore
 from mneme.core.policy import PolicyStore
 from mneme.core.registries import RegistryStore
 from mneme.core.resolver import SessionRevision
+from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer, PolicyDecision
 from mneme.core.search.index import (
     GeneratedIndex,
     IndexReport,
@@ -38,6 +39,7 @@ class CoreService:
     def __init__(self, vault: object, index: GeneratedIndex | None = None):
         self.vault = vault
         self.index = index or GeneratedIndex(vault.local_root / "index" / "state.db")
+        self.authorizer = PolicyAuthorizer(vault)
 
     def reindex(self) -> IndexReport:
         bindings, diagnostics = self._bound_sources()
@@ -123,8 +125,29 @@ class CoreService:
                 self.index.db_path.is_file(),
                 not source_diagnostics,
             ),
+            authorize_portable_revision=lambda selected, head: self.authorizer.authorize_current(
+                PolicyArtifactRef.session(selected, head.session, head.revision), "context"
+            ).allowed,
         )
         return render_current(readers, workstream_id, mode)
+
+    def profile(self, scope: object) -> ContextView:
+        """Render a portable PROFILE only from records live-authorized now."""
+        from mneme.core.memories import MemoryReaders, render_profile
+
+        return render_profile(
+            MemoryReaders(
+                MemoryStore(self.vault),
+                authorize_record=lambda record: self.authorizer.authorize_current(
+                    PolicyArtifactRef.memory(record.id), "profile"
+                ).allowed,
+            ),
+            scope,
+        )
+
+    def authorize_export(self, artifact_ref: PolicyArtifactRef) -> PolicyDecision:
+        """Expose the same live gate to any explicit export adapter."""
+        return self.authorizer.authorize_current(artifact_ref, "export")
 
     def _bound_sources(self) -> tuple[list[SourceBinding], list[str]]:
         bindings: list[SourceBinding] = []
@@ -145,13 +168,16 @@ class CoreService:
         return bindings, diagnostics
 
     def _authorize(self, hit: RecallHit) -> bool:
-        self._current_policy_pointers()
         if hit.category == "source":
             return self._authorize_source(hit)
         if hit.category == "memory":
             memories = MemoryStore(self.vault)
             record = memories.read(hit.artifact_id)
             return (
+                self.authorizer.authorize_current(
+                    PolicyArtifactRef.memory(record.id), "recall"
+                ).allowed
+                and
                 self._accepted_memory_is_current(memories, record)
                 and hit.revision is None
                 and hit.source_id is None
@@ -168,6 +194,13 @@ class CoreService:
                 workstream_id=(hit.scope or {}).get("workstream_id"),
             )
             return (
+                self.authorizer.authorize_current(
+                    PolicyArtifactRef.session(
+                        request.workstream_id, hit.artifact_id, hit.revision or ""
+                    ),
+                    "recall",
+                ).allowed
+                and
                 hit.source_id is None
                 and hit.path is None
                 and hit.authority == "personal"
@@ -192,6 +225,15 @@ class CoreService:
         return False
 
     def _authorize_registry(self, hit: RecallHit, record: object) -> bool:
+        artifact_ref = {
+            "source-registry": PolicyArtifactRef.source,
+            "project-registry": PolicyArtifactRef.project,
+            "workstream-registry": PolicyArtifactRef.workstream,
+        }.get(hit.category)
+        if artifact_ref is None or not self.authorizer.authorize_current(
+            artifact_ref(hit.artifact_id), "recall"
+        ).allowed:
+            return False
         policies = PolicyStore(self.vault)
         policy_ref = getattr(record, "policy_ref", None)
         if policy_ref is not None:
@@ -218,6 +260,10 @@ class CoreService:
         if hit.source_id is None or hit.path is None:
             return False
         source = RegistryStore(self.vault).load_source(hit.source_id)
+        if not self.authorizer.authorize_current(
+            PolicyArtifactRef.source(source.id), "recall"
+        ).allowed:
+            return False
         expected_scope = {"project_id": source.project} if source.project else None
         if (
             source.kind != "filesystem"

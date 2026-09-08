@@ -35,6 +35,7 @@ class ContextReaders:
     load_overlay: Callable[[str], LocalOverlay | None] | None = None
     load_overlay_revision: Callable[[str, HeadRef], object] | None = None
     portable_optional_inputs: Callable[[str], Sequence[object]] | None = None
+    authorize_portable_revision: Callable[[str, HeadRef], bool] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.load_portable_workstream) or not callable(self.load_portable_revision):
@@ -45,6 +46,10 @@ class ContextReaders:
             raise TypeError("overlay revision reader must be callable")
         if self.portable_optional_inputs is not None and not callable(self.portable_optional_inputs):
             raise TypeError("optional input reader must be callable")
+        if self.authorize_portable_revision is not None and not callable(
+            self.authorize_portable_revision
+        ):
+            raise TypeError("portable revision authorizer must be callable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +118,25 @@ def _resolve_portable(readers: ContextReaders, workstream_id: str) -> ResolvedWo
     try:
         return resolve_workstream(
             registry,
-            lambda head: readers.load_portable_revision(workstream_id, head),
+            lambda head: _load_authorized_portable_revision(
+                readers, workstream_id, head
+            ),
             optional_inputs=optional,
             expected_storage_class=StorageClass.PORTABLE,
         )
     except Exception:
         return _invalid_projection()
+
+
+def _load_authorized_portable_revision(
+    readers: ContextReaders, workstream_id: str, head: HeadRef
+) -> object:
+    if (
+        readers.authorize_portable_revision is not None
+        and readers.authorize_portable_revision(workstream_id, head) is not True
+    ):
+        raise PermissionError("current policy withheld revision")
+    return readers.load_portable_revision(workstream_id, head)
 
 
 def _resolve_overlay(readers: ContextReaders, workstream_id: str) -> ResolvedWorkstream | None:
