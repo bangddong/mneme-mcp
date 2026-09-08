@@ -191,6 +191,33 @@ def test_fast_forward_refuses_an_invalid_fetched_target_without_mutating_checkou
     assert not (vault.root / "memory/unsafe.txt").exists()
 
 
+def test_fast_forward_refuses_an_invalid_target_hidden_by_a_replacement_ref(
+    vault, tmp_path
+):
+    """Catches Git object replacement making an invalid fetched commit look valid."""
+    from mneme.core.git_sync import fast_forward
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    valid_head = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+    invalid_head = _advance_remote(
+        remote,
+        tmp_path,
+        "unsafe canonical artifact",
+        "memory/unsafe.txt",
+    )
+    _git(vault.root, "fetch", "origin")
+    _git(vault.root, "replace", invalid_head, valid_head)
+    before = _git(vault.root, "rev-parse", "HEAD").stdout.strip()
+
+    result = fast_forward(vault)
+
+    assert result.status == "target-invalid"
+    assert result.changed is False
+    assert _git(vault.root, "rev-parse", "HEAD").stdout.strip() == before
+    assert not (vault.root / "memory/unsafe.txt").exists()
+
+
 @pytest.mark.parametrize("dangerous_command", ("update-ref", "restore"))
 def test_fast_forward_never_reaches_fallible_ref_or_restore_mutation(
     vault, tmp_path, monkeypatch, dangerous_command
@@ -276,6 +303,46 @@ def test_fast_forward_returns_a_structured_refusal_when_head_changes_during_vali
     assert result.status == "concurrent-ref-changed"
     assert result.changed is False
     assert (vault.root / "concurrent.md").read_text(encoding="utf-8") == "new head"
+
+
+def test_fast_forward_refuses_when_upstream_changes_during_target_validation(
+    vault, tmp_path, monkeypatch
+):
+    """Catches returning an approval after the validated tracking ref has changed."""
+    import mneme.core.git_sync as git_sync
+
+    _initialize_git(vault)
+    remote = _bare_remote(vault, tmp_path)
+    _advance_remote(remote, tmp_path, "validated remote advance")
+    attacker = tmp_path / "attacker"
+    _git(tmp_path, "clone", str(remote), str(attacker))
+    _git(attacker, "config", "user.name", "Attacker Test")
+    _git(attacker, "config", "user.email", "attacker@example.invalid")
+    unsafe_path = attacker / "memory" / "unsafe.txt"
+    unsafe_path.parent.mkdir(parents=True)
+    unsafe_path.write_text("unsafe", encoding="utf-8")
+    _git(attacker, "add", "--", "memory/unsafe.txt")
+    _git(attacker, "commit", "-m", "invalid replacement target")
+    invalid_target = _git(attacker, "rev-parse", "HEAD").stdout.strip()
+    original = git_sync._validate_commit_tree
+
+    def validate_then_replace_upstream(root, commit):
+        valid = original(root, commit)
+        _git(root, "fetch", str(attacker), "main:refs/heads/attacker-target")
+        _git(root, "update-ref", "refs/remotes/origin/main", invalid_target, commit)
+        return valid
+
+    monkeypatch.setattr(git_sync, "_validate_commit_tree", validate_then_replace_upstream)
+
+    result = git_sync.fast_forward(vault)
+
+    assert result.status == "concurrent-upstream-changed"
+    assert result.changed is False
+    assert (
+        _git(vault.root, "rev-parse", "refs/remotes/origin/main").stdout.strip()
+        == invalid_target
+    )
+    assert not (vault.root / "memory/unsafe.txt").exists()
 
 
 def test_fast_forward_uses_the_configured_differently_named_upstream(vault, tmp_path):

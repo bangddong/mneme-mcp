@@ -58,6 +58,7 @@ _GIT_ENVIRONMENT_OVERRIDES = frozenset(
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NO_REPLACE_OBJECTS",
     }
 )
 
@@ -295,6 +296,14 @@ def fast_forward(
         return GitSyncResult("no-upstream", False)
     if not _validate_commit_tree(root, target):
         return GitSyncResult("target-invalid", False)
+    current_upstream, _current_upstream_status = _configured_upstream(
+        root, safe_remote, branch
+    )
+    if current_upstream != upstream or (
+        current_upstream is not None
+        and _try_commit(root, current_upstream.reference) != target
+    ):
+        return GitSyncResult("concurrent-upstream-changed", False)
     if not _is_clean(root):
         return GitSyncResult("dirty", False)
     if not _same_branch_head(root, upstream.branch_ref, current):
@@ -871,4 +880,5 @@ def _git_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
         result.pop(name, None)
     if environment is not None:
         result.update(environment)
+    result["GIT_NO_REPLACE_OBJECTS"] = "1"
     return result
