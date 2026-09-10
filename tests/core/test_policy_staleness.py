@@ -698,6 +698,83 @@ def test_local_memory_authorization_tracks_portable_source_policy_inputs(tmp_pat
     assert unavailable.issue_codes == ("policy-current-unavailable",)
 
 
+def test_local_memory_uses_its_explicit_portable_source_over_a_same_id_local_shadow(tmp_path):
+    """Catches local-first lookup replacing typed portable Memory provenance."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.registries import RegistryStore
+    from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    policies = PolicyStore(vault)
+    initial = policies.create_revision(
+        "portable-source-policy", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    policies.activate(initial, expected_generation=1)
+    portable_sources = RegistryStore(vault)
+    portable_source = portable_sources.register_source("shared-source")
+    portable_sources.assign_source_policy(portable_source.id, initial, expected_generation=0)
+    local_shadow_policy = policies.create_revision(
+        "local-shadow-policy", "1", {"ceiling": "local-only"}, StorageClass.LOCAL_ONLY
+    )
+    local_sources = RegistryStore(vault, StorageClass.LOCAL_ONLY)
+    local_shadow = local_sources.register_source(portable_source.id)
+    local_sources.assign_source_policy(
+        local_shadow.id, local_shadow_policy, expected_generation=0
+    )
+
+    body = "LOCAL_SECRET_FROM_EXPLICIT_PORTABLE_SOURCE"
+    provenance = (
+        ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, portable_source.id),
+    )
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+    receipt = evaluate_portability(
+        Portability.LOCAL_ONLY,
+        (policies.load_rule(default),),
+        memory_semantic_hash(
+            body=body,
+            kind="preference",
+            portability="local-only",
+            provenance=provenance,
+        ),
+    )
+    records = MemoryStore(vault, StorageClass.LOCAL_ONLY)
+    candidate = records.submit_candidate(
+        "preference",
+        {"type": "personal-global"},
+        "personal",
+        "local-only",
+        body,
+        receipt,
+        provenance=provenance,
+    )
+    local_memory = records.promote(candidate.id, 0, receipt)
+    authorizer = PolicyAuthorizer(vault)
+    reference = PolicyArtifactRef.memory(local_memory.id, StorageClass.LOCAL_ONLY)
+
+    before = authorizer.authorize_current(reference, "profile")
+    changed = policies.create_revision(
+        initial.policy_id, "2", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    policies.activate(changed, expected_generation=2)
+    observed = portable_sources.load_source(portable_source.id)
+    portable_sources.assign_source_policy(
+        portable_source.id, changed, expected_generation=observed.generation
+    )
+    after_assignment = authorizer.authorize_current(reference, "profile")
+    policy_path = vault.root / f".madi/policies/{changed.policy_id}/{changed.revision}.yaml"
+    policy_path.write_text("corrupt policy", encoding="utf-8")
+    unavailable = authorizer.authorize_current(reference, "profile")
+
+    assert before.allowed is True
+    assert after_assignment.allowed is True
+    assert after_assignment.authorization_fingerprint != before.authorization_fingerprint
+    assert unavailable.allowed is False
+    assert unavailable.issue_codes == ("policy-current-unavailable",)
+
+
 @pytest.mark.parametrize("view_kind", ("context", "profile"))
 @pytest.mark.parametrize("operation", ("load", "write"))
 def test_generated_view_io_failure_returns_the_fresh_safe_projection(

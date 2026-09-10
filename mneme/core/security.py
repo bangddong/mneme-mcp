@@ -7,7 +7,7 @@ from hashlib import sha256
 import json
 import re
 
-from mneme.core.artifacts import ReferenceKind, StorageClass
+from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
 from mneme.core.errors import InvalidArtifact
 from mneme.core.policy import (
     PolicyEvaluation,
@@ -335,23 +335,30 @@ class PolicyAuthorizer:
                 raise ValueError("Memory portability does not match canonical storage")
             self._validate_historic_receipt(record.policy_receipt, requested)
             project_id = record.scope.project_id
+            source_references: list[ArtifactReference] = []
+            for reference in record.provenance:
+                if reference.kind is not ReferenceKind.ID or not isinstance(
+                    reference.value, str
+                ):
+                    continue
+                if (
+                    artifact_ref.storage_class is StorageClass.PORTABLE
+                    and reference.storage_class is StorageClass.LOCAL_ONLY
+                ):
+                    raise ValueError("portable Memory provenance cannot name local state")
+                if (
+                    reference.storage_class is artifact_ref.storage_class
+                    or (
+                        artifact_ref.storage_class is StorageClass.LOCAL_ONLY
+                        and reference.storage_class is StorageClass.PORTABLE
+                    )
+                ):
+                    source_references.append(reference)
             rules, inputs = self._current_rules(
                 storage_class=artifact_ref.storage_class,
                 workstream_id=record.scope.workstream_id,
                 project_ids=() if project_id is None else (project_id,),
-                source_ids=tuple(
-                    reference.value
-                    for reference in record.provenance
-                    if reference.kind is ReferenceKind.ID
-                    and isinstance(reference.value, str)
-                    and (
-                        reference.storage_class is artifact_ref.storage_class
-                        or (
-                            artifact_ref.storage_class is StorageClass.LOCAL_ONLY
-                            and reference.storage_class is StorageClass.PORTABLE
-                        )
-                    )
-                ),
+                source_references=tuple(source_references),
             )
             return (
                 record.policy_receipt,
@@ -399,6 +406,7 @@ class PolicyAuthorizer:
         workstream_id: str | None = None,
         project_ids: tuple[str, ...] = (),
         source_ids: tuple[str, ...] = (),
+        source_references: tuple[ArtifactReference, ...] = (),
     ) -> tuple[tuple[PolicyRule, ...], tuple[str, ...]]:
         policies = PolicyStore(self._vault)
         registries = RegistryStore(self._vault, storage_class)
@@ -408,6 +416,7 @@ class PolicyAuthorizer:
             self._input_token("vault", "vault-default", vault_ref)
         ]
         projects = set(project_ids)
+        exact_projects: set[tuple[StorageClass, str]] = set()
         if workstream_id is not None:
             workstream = registries.load_workstream(workstream_id)
             inputs.extend(
@@ -424,9 +433,38 @@ class PolicyAuthorizer:
                 refs.append(source.policy_ref)
             if source.project is not None:
                 projects.add(source.project)
+        for source_reference in sorted(
+            source_references,
+            key=lambda item: (item.storage_class.value, str(item.value)),
+        ):
+            source = RegistryStore(
+                self._vault, source_reference.storage_class
+            ).load_source(source_reference.value)
+            inputs.append(
+                self._input_token(
+                    "source",
+                    f"{source_reference.storage_class.value}:{source.id}",
+                    source.policy_ref,
+                )
+            )
+            if source.policy_ref is not None:
+                refs.append(source.policy_ref)
+            if source.project is not None:
+                exact_projects.add((source_reference.storage_class, source.project))
         for project_id in sorted(projects):
             project = self._load_project(registries, project_id)
             inputs.append(self._input_token("project", project.id, project.policy_ref))
+            if project.policy_ref is not None:
+                refs.append(project.policy_ref)
+        for storage_class, project_id in sorted(
+            exact_projects, key=lambda item: (item[0].value, item[1])
+        ):
+            project = RegistryStore(self._vault, storage_class).load_project(project_id)
+            inputs.append(
+                self._input_token(
+                    "project", f"{storage_class.value}:{project.id}", project.policy_ref
+                )
+            )
             if project.policy_ref is not None:
                 refs.append(project.policy_ref)
         return tuple(policies.load_rule(reference) for reference in refs), tuple(sorted(inputs))
