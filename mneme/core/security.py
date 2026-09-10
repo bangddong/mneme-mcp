@@ -214,6 +214,8 @@ class PolicyAuthorizer:
         self,
         workstream_id: str,
         storage_class: StorageClass = StorageClass.PORTABLE,
+        *,
+        mode: str = "portable",
     ) -> PolicyDecision:
         """Bind the current workstream registry and every active head to CURRENT."""
         try:
@@ -233,6 +235,7 @@ class PolicyAuthorizer:
                 refs,
                 "context",
                 view_binding={
+                    "mode": mode,
                     "storage_class": storage_class.value,
                     "view": "CURRENT",
                     "workstream_id": workstream_id,

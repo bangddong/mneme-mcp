@@ -113,7 +113,9 @@ class CoreService:
         sessions = SessionStore(self.vault)
         _bindings, source_diagnostics = self._bound_sources()
         with policy_admission_gate(self.vault):
-            view_decision = self.authorizer.authorize_context_view(workstream_id)
+            view_decision = self.authorizer.authorize_context_view(
+                workstream_id, mode=mode
+            )
             readers = ContextReaders(
                 registries.load_workstream,
                 lambda selected, head: SessionRevision(

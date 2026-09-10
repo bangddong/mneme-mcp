@@ -728,3 +728,19 @@ def test_generated_view_io_failure_returns_the_fresh_safe_projection(
     )
     assert expected_body in view.text
     assert local_path not in view.text
+
+
+def test_current_cache_binds_the_exact_render_mode(admitted_artifacts):
+    """Catches a portable CURRENT cache being reused for effective-local output."""
+    from mneme.core.service import CoreService
+
+    vault, _session, _memory, _permitted = admitted_artifacts
+    service = CoreService(vault)
+
+    portable = service.context("ws-01", "portable")
+    effective_local = service.context("ws-01", "effective-local")
+
+    assert "# Current" in portable.text
+    assert "# CURRENT" in effective_local.text
+    assert "# Portable base" in effective_local.text
+    assert effective_local.text != portable.text
