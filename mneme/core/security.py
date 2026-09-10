@@ -157,7 +157,11 @@ class PolicyAuthorizer:
             return PolicyDecision(False, ("policy-current-unavailable",))
 
     def authorize_current_view(
-        self, artifact_refs: tuple[PolicyArtifactRef, ...], operation: str
+        self,
+        artifact_refs: tuple[PolicyArtifactRef, ...],
+        operation: str,
+        *,
+        view_binding: object | None = None,
     ) -> PolicyDecision:
         """Authorize every rendered artifact and bind one local view cache key.
 
@@ -190,11 +194,18 @@ class PolicyAuthorizer:
             if decision.authorization_fingerprint is None:
                 return PolicyDecision(False, ("policy-current-unavailable",))
             fingerprints.append(decision.authorization_fingerprint)
-        payload = json.dumps(
-            {"operation": operation, "artifacts": fingerprints},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        try:
+            payload = json.dumps(
+                {
+                    "artifacts": fingerprints,
+                    "operation": operation,
+                    "view_binding": view_binding,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return PolicyDecision(False, ("policy-current-unavailable",))
         return PolicyDecision(
             True, (), sha256(payload.encode("utf-8")).hexdigest()
         )
@@ -218,22 +229,56 @@ class PolicyAuthorizer:
                 )
                 for head in registry.active_heads
             )
-            return self.authorize_current_view(refs, "context")
+            return self.authorize_current_view(
+                refs,
+                "context",
+                view_binding={
+                    "storage_class": storage_class.value,
+                    "view": "CURRENT",
+                    "workstream_id": workstream_id,
+                },
+            )
         except Exception:
             return PolicyDecision(False, ("policy-current-unavailable",))
 
     def authorize_profile_view(
-        self, storage_class: StorageClass = StorageClass.PORTABLE
+        self,
+        scope: object,
+        storage_class: StorageClass = StorageClass.PORTABLE,
     ) -> PolicyDecision:
-        """Bind every readable memory in the selected storage tree to PROFILE."""
+        """Bind exactly the rendered PROFILE selection and lifecycle to CURRENT."""
         try:
-            from mneme.core.memories import MemoryStore
-
-            records = MemoryStore(self._vault, storage_class).iter_records()
-            refs = (PolicyArtifactRef.vault(self._vault.id),) + tuple(
-                PolicyArtifactRef.memory(record.id, storage_class) for record in records
+            from mneme.core.memories import (
+                MemoryKind,
+                MemoryScope,
+                MemoryStatus,
+                MemoryStore,
+                _has_successor,
             )
-            return self.authorize_current_view(refs, "profile")
+
+            selected_scope = MemoryScope.parse(scope)
+            records = MemoryStore(self._vault, storage_class).iter_records()
+            by_id = {record.id: record for record in records}
+            selected = tuple(
+                record
+                for record in records
+                if record.scope == selected_scope
+                and record.kind is MemoryKind.PREFERENCE
+                and record.status is MemoryStatus.ACCEPTED
+                and not _has_successor(record, by_id)
+            )
+            refs = (PolicyArtifactRef.vault(self._vault.id),) + tuple(
+                PolicyArtifactRef.memory(record.id, storage_class) for record in selected
+            )
+            return self.authorize_current_view(
+                refs,
+                "profile",
+                view_binding={
+                    "scope": selected_scope.as_dict(),
+                    "storage_class": storage_class.value,
+                    "view": "PROFILE",
+                },
+            )
         except Exception:
             return PolicyDecision(False, ("policy-current-unavailable",))
 
@@ -287,21 +332,29 @@ class PolicyAuthorizer:
                 raise ValueError("Memory portability does not match canonical storage")
             self._validate_historic_receipt(record.policy_receipt, requested)
             project_id = record.scope.project_id
+            rules, inputs = self._current_rules(
+                storage_class=artifact_ref.storage_class,
+                workstream_id=record.scope.workstream_id,
+                project_ids=() if project_id is None else (project_id,),
+                source_ids=tuple(
+                    reference.value
+                    for reference in record.provenance
+                    if reference.kind is ReferenceKind.ID
+                    and isinstance(reference.value, str)
+                    and (
+                        reference.storage_class is artifact_ref.storage_class
+                        or (
+                            artifact_ref.storage_class is StorageClass.LOCAL_ONLY
+                            and reference.storage_class is StorageClass.PORTABLE
+                        )
+                    )
+                ),
+            )
             return (
                 record.policy_receipt,
                 requested,
-                *self._current_rules(
-                    storage_class=artifact_ref.storage_class,
-                    workstream_id=record.scope.workstream_id,
-                    project_ids=() if project_id is None else (project_id,),
-                    source_ids=tuple(
-                        reference.value
-                        for reference in record.provenance
-                        if reference.kind is ReferenceKind.ID
-                        and reference.storage_class is artifact_ref.storage_class
-                        and isinstance(reference.value, str)
-                    ),
-                ),
+                rules,
+                tuple(sorted((*inputs, self._memory_state_token(record)))),
             )
         if artifact_ref.kind == "source":
             return (
@@ -425,6 +478,21 @@ class PolicyAuthorizer:
             return f"{kind}:{artifact_id}:none"
         return ":".join(
             (kind, artifact_id, reference.policy_id, reference.revision, reference.digest)
+        )
+
+    @staticmethod
+    def _memory_state_token(record: object) -> str:
+        """Bind a generated PROFILE cache to canonical Memory lifecycle/content state."""
+        return ":".join(
+            (
+                "memory-state",
+                record.id,
+                record.status.value,
+                str(record.generation),
+                record.semantic_hash,
+                record.accepted_semantic_hash or "none",
+                record.superseded_by or "none",
+            )
         )
 
     @staticmethod

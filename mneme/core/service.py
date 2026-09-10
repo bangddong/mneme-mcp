@@ -8,7 +8,7 @@ from hashlib import sha256
 from mneme.core.artifacts import StorageClass
 from mneme.core.context import ContextReaders, ContextView, render_current
 from mneme.core.memories import MemoryRecord, MemoryStatus, MemoryStore
-from mneme.core.policy import PolicyStore
+from mneme.core.policy import PolicyStore, policy_admission_gate
 from mneme.core.registries import RegistryStore
 from mneme.core.resolver import SessionRevision
 from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer, PolicyDecision
@@ -112,29 +112,30 @@ class CoreService:
         registries = RegistryStore(self.vault)
         sessions = SessionStore(self.vault)
         _bindings, source_diagnostics = self._bound_sources()
-        view_decision = self.authorizer.authorize_context_view(workstream_id)
-        readers = ContextReaders(
-            registries.load_workstream,
-            lambda selected, head: SessionRevision(
-                head,
-                sessions.read_revision(
-                    SessionRevisionRef(head.session, head.revision),
-                    workstream_id=selected,
+        with policy_admission_gate(self.vault):
+            view_decision = self.authorizer.authorize_context_view(workstream_id)
+            readers = ContextReaders(
+                registries.load_workstream,
+                lambda selected, head: SessionRevision(
+                    head,
+                    sessions.read_revision(
+                        SessionRevisionRef(head.session, head.revision),
+                        workstream_id=selected,
+                    ),
                 ),
-            ),
-            portable_optional_inputs=lambda _selected: (
-                self.index.db_path.is_file(),
-                not source_diagnostics,
-            ),
-            authorize_revision=lambda selected, head, storage_class: self.authorizer.authorize_current(
-                PolicyArtifactRef.session(
-                    selected, head.session, head.revision, storage_class
+                portable_optional_inputs=lambda _selected: (
+                    self.index.db_path.is_file(),
+                    not source_diagnostics,
                 ),
-                "context",
-            ).allowed,
-        )
-        view = render_current(readers, workstream_id, mode)
-        return self._cache_view("CURRENT.md", view, view_decision)
+                authorize_revision=lambda selected, head, storage_class: self.authorizer.authorize_current(
+                    PolicyArtifactRef.session(
+                        selected, head.session, head.revision, storage_class
+                    ),
+                    "context",
+                ).allowed,
+            )
+            view = render_current(readers, workstream_id, mode)
+            return self._cache_view("CURRENT.md", view, view_decision)
 
     def profile(
         self, scope: object, *, storage_class: StorageClass = StorageClass.PORTABLE
@@ -144,18 +145,19 @@ class CoreService:
 
         if not isinstance(storage_class, StorageClass):
             raise TypeError("PROFILE requires an explicit StorageClass")
-        view_decision = self.authorizer.authorize_profile_view(storage_class)
-        view = render_profile(
-            MemoryReaders(
-                MemoryStore(self.vault, storage_class),
-                authorize_record=lambda record: self.authorizer.authorize_current(
-                    PolicyArtifactRef.memory(record.id, storage_class), "profile"
-                ).allowed,
-            ),
-            scope,
-            storage_class=storage_class,
-        )
-        return self._cache_view("PROFILE.md", view, view_decision)
+        with policy_admission_gate(self.vault):
+            view_decision = self.authorizer.authorize_profile_view(scope, storage_class)
+            view = render_profile(
+                MemoryReaders(
+                    MemoryStore(self.vault, storage_class),
+                    authorize_record=lambda record: self.authorizer.authorize_current(
+                        PolicyArtifactRef.memory(record.id, storage_class), "profile"
+                    ).allowed,
+                ),
+                scope,
+                storage_class=storage_class,
+            )
+            return self._cache_view("PROFILE.md", view, view_decision)
 
     def authorize_export(self, artifact_ref: PolicyArtifactRef) -> PolicyDecision:
         """Expose the same live gate to any explicit export adapter."""
@@ -167,13 +169,16 @@ class CoreService:
         """Reuse only a common-gate-authorized local projection, otherwise rerender."""
         if not decision.allowed:
             return view
-        cached = self.vault.views.load(name, authorization=decision)
-        if cached is None:
-            self.vault.views.write(name, view.text, authorization=decision)
+        try:
             cached = self.vault.views.load(name, authorization=decision)
             if cached is None:
-                return view
-        return replace(view, text=cached)
+                self.vault.views.write(name, view.text, authorization=decision)
+                cached = self.vault.views.load(name, authorization=decision)
+                if cached is None:
+                    return view
+            return replace(view, text=cached)
+        except OSError:
+            return view
 
     def _bound_sources(self) -> tuple[list[SourceBinding], list[str]]:
         bindings: list[SourceBinding] = []

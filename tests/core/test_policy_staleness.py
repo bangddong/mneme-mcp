@@ -404,14 +404,7 @@ def test_service_view_cache_uses_all_parallel_current_heads(admitted_artifacts):
     single = service.authorizer.authorize_current(
         PolicyArtifactRef.session("ws-01", session.session, session.revision), "context"
     )
-    aggregate = service.authorizer.authorize_current_view(
-        (
-            PolicyArtifactRef.workstream("ws-01"),
-            PolicyArtifactRef.session("ws-01", session.session, session.revision),
-            PolicyArtifactRef.session("ws-01", second.session, second.revision),
-        ),
-        "context",
-    )
+    aggregate = service.authorizer.authorize_context_view("ws-01")
     vault.views.write(
         "CURRENT.md", "one-head cache body", authorization_fingerprint=single.authorization_fingerprint
     )
@@ -467,13 +460,8 @@ def test_service_view_cache_uses_all_rendered_profile_memories(admitted_artifact
     single = service.authorizer.authorize_current(
         PolicyArtifactRef.memory(memory.id), "profile"
     )
-    aggregate = service.authorizer.authorize_current_view(
-        (
-            PolicyArtifactRef.vault(vault.id),
-            PolicyArtifactRef.memory(memory.id),
-            PolicyArtifactRef.memory(second.id),
-        ),
-        "profile",
+    aggregate = service.authorizer.authorize_profile_view(
+        {"type": "project", "project_id": "project-01"}
     )
     vault.views.write(
         "PROFILE.md", "one-memory cache body", authorization_fingerprint=single.authorization_fingerprint
@@ -541,3 +529,202 @@ def test_local_session_context_authorization_uses_local_session_and_portable_sou
     )
 
     assert decision.allowed is True
+
+
+def test_profile_cache_binds_the_exact_selected_scope(admitted_artifacts):
+    """Catches a global PROFILE cache body being reused for a project PROFILE."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.service import CoreService
+
+    vault, _session, _memory, _permitted = admitted_artifacts
+    body = "GLOBAL_SECRET"
+    policies = PolicyStore(vault)
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+    receipt = evaluate_portability(
+        Portability.PERSONAL_VAULT,
+        (policies.load_rule(default),),
+        memory_semantic_hash(body=body, kind="preference"),
+    )
+    records = MemoryStore(vault)
+    global_record = records.submit_candidate(
+        "preference", {"type": "personal-global"}, "personal", "personal-vault", body, receipt
+    )
+    records.promote(global_record.id, 0, receipt)
+    service = CoreService(vault)
+
+    global_view = service.profile({"type": "personal-global"})
+    project_view = service.profile({"type": "project", "project_id": "project-01"})
+
+    assert body in global_view.text
+    assert "sensitive-preference-body" in project_view.text
+    assert body not in project_view.text
+
+
+def test_profile_cache_tracks_memory_lifecycle_promotion(admitted_artifacts):
+    """Catches a candidate-to-accepted transition leaving a PROFILE cache stale."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.service import CoreService
+
+    vault, _session, _memory, permitted = admitted_artifacts
+    body = "PROMOTED_PROJECT_SECRET"
+    provenance = (ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, "source-01"),)
+    policies = PolicyStore(vault)
+    receipt = evaluate_portability(
+        Portability.PERSONAL_VAULT,
+        tuple(
+            policies.load_rule(reference)
+            for reference in (policies.load_active("vault-default", StorageClass.PORTABLE), permitted, permitted)
+        ),
+        memory_semantic_hash(
+            body=body, kind="preference", scope={"type": "project", "project_id": "project-01"}, provenance=provenance
+        ),
+    )
+    records = MemoryStore(vault)
+    candidate = records.submit_candidate(
+        "preference", {"type": "project", "project_id": "project-01"}, "personal", "personal-vault", body, receipt,
+        provenance=provenance,
+    )
+    service = CoreService(vault)
+
+    before = service.profile({"type": "project", "project_id": "project-01"})
+    records.promote(candidate.id, 0, receipt)
+    after = service.profile({"type": "project", "project_id": "project-01"})
+
+    assert body not in before.text
+    assert body in after.text
+
+
+def test_profile_does_not_reuse_pre_tightening_cache_after_render_race(
+    admitted_artifacts, monkeypatch
+):
+    """Catches an allowed pre-render decision loading a cache after official tightening."""
+    import threading
+
+    import mneme.core.memories as memories_module
+
+    from mneme.core.service import CoreService
+
+    vault, _session, _memory, permitted = admitted_artifacts
+    service = CoreService(vault)
+    safe_before_tightening = service.profile({"type": "project", "project_id": "project-01"})
+    original = memories_module.render_profile
+    started = threading.Event()
+    completed = threading.Event()
+    triggered = False
+
+    def tighten_concurrently():
+        started.set()
+        _tighten(vault, permitted)
+        completed.set()
+
+    def render_after_official_tightening(*args, **kwargs):
+        nonlocal triggered
+        if triggered:
+            return original(*args, **kwargs)
+        triggered = True
+        thread = threading.Thread(target=tighten_concurrently)
+        thread.start()
+        assert started.wait(timeout=2)
+        thread.join(timeout=0.5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            if completed.is_set():
+                thread.join(timeout=2)
+
+    monkeypatch.setattr(memories_module, "render_profile", render_after_official_tightening)
+    after = service.profile({"type": "project", "project_id": "project-01"})
+    completed_during_render = completed.is_set()
+    assert completed.wait(timeout=5)
+    final = service.profile({"type": "project", "project_id": "project-01"})
+
+    assert "sensitive-preference-body" in safe_before_tightening.text
+    if completed_during_render:
+        assert "sensitive-preference-body" not in after.text
+    assert "sensitive-preference-body" not in final.text
+
+
+def test_local_memory_authorization_tracks_portable_source_policy_inputs(tmp_path):
+    """Catches a local Memory ignoring its permitted portable source assignment or digest."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.registries import RegistryStore
+    from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    policies = PolicyStore(vault)
+    initial = policies.create_revision(
+        "portable-source-policy", "1", {"ceiling": "personal-vault"}, StorageClass.PORTABLE
+    )
+    policies.activate(initial, expected_generation=1)
+    source = RegistryStore(vault).register_source("portable-source")
+    RegistryStore(vault).assign_source_policy(source.id, initial, expected_generation=0)
+    body = "LOCAL_SECRET_FROM_PORTABLE_SOURCE"
+    provenance = (ArtifactReference(ReferenceKind.ID, StorageClass.PORTABLE, source.id),)
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+    receipt = evaluate_portability(
+        Portability.LOCAL_ONLY, (policies.load_rule(default),),
+        memory_semantic_hash(body=body, kind="preference", portability="local-only", provenance=provenance),
+    )
+    records = MemoryStore(vault, StorageClass.LOCAL_ONLY)
+    candidate = records.submit_candidate(
+        "preference", {"type": "personal-global"}, "personal", "local-only", body, receipt, provenance=provenance
+    )
+    local = records.promote(candidate.id, 0, receipt)
+    authorizer = PolicyAuthorizer(vault)
+    reference = PolicyArtifactRef.memory(local.id, StorageClass.LOCAL_ONLY)
+    before = authorizer.authorize_current(reference, "profile")
+    changed = policies.create_revision(
+        initial.policy_id, "2", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    policies.activate(changed, expected_generation=2)
+    observed = RegistryStore(vault).load_source(source.id)
+    RegistryStore(vault).assign_source_policy(source.id, changed, expected_generation=observed.generation)
+    after_assignment = authorizer.authorize_current(reference, "profile")
+    policy_path = vault.root / f".madi/policies/{changed.policy_id}/{changed.revision}.yaml"
+    policy_path.write_text("corrupt policy", encoding="utf-8")
+    unavailable = authorizer.authorize_current(reference, "profile")
+
+    assert before.allowed is True
+    assert after_assignment.allowed is True
+    assert after_assignment.authorization_fingerprint != before.authorization_fingerprint
+    assert unavailable.allowed is False
+    assert unavailable.issue_codes == ("policy-current-unavailable",)
+
+
+@pytest.mark.parametrize("view_kind", ("context", "profile"))
+@pytest.mark.parametrize("operation", ("load", "write"))
+def test_generated_view_io_failure_returns_the_fresh_safe_projection(
+    admitted_artifacts, monkeypatch, view_kind, operation
+):
+    """Catches a generated-view OSError leaking a local path through Core output."""
+    from mneme.core.service import CoreService
+    from mneme.core.storage import ViewStore
+
+    vault, _session, _memory, _permitted = admitted_artifacts
+    local_path = r"C:\\private\\madi-local\\views\\CURRENT.md"
+
+    def fail_io(*_args, **_kwargs):
+        raise OSError(f"unable to access {local_path}")
+
+    monkeypatch.setattr(ViewStore, operation, fail_io)
+    service = CoreService(vault)
+    view = (
+        service.context("ws-01")
+        if view_kind == "context"
+        else service.profile({"type": "project", "project_id": "project-01"})
+    )
+
+    expected_body = (
+        "sensitive-session-body"
+        if view_kind == "context"
+        else "sensitive-preference-body"
+    )
+    assert expected_body in view.text
+    assert local_path not in view.text
