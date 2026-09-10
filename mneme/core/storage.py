@@ -236,10 +236,17 @@ class ViewStore:
         relative_path: str,
         text: str,
         *,
+        authorization: object | None = None,
         authorization_fingerprint: str | None = None,
     ) -> Path:
         if relative_path not in self._NAMES:
             raise UnsafePath(f"unsupported generated view path: {relative_path}")
+        if authorization is not None:
+            if authorization_fingerprint is not None:
+                raise InvalidArtifact("generated view authorization is ambiguous")
+            authorization_fingerprint = self._allowed_decision_fingerprint(
+                authorization, for_write=True
+            )
         if authorization_fingerprint is not None and not self._valid_fingerprint(
             authorization_fingerprint
         ):
@@ -261,7 +268,11 @@ class ViewStore:
         return target
 
     def load(
-        self, relative_path: str, *, authorization_fingerprint: str | None
+        self,
+        relative_path: str,
+        *,
+        authorization: object | None = None,
+        authorization_fingerprint: str | None = None,
     ) -> str | None:
         """Return a local view only when its live authorization input still matches.
 
@@ -269,6 +280,12 @@ class ViewStore:
         missing, malformed, stale, or unsafe view is a cache miss rather than a
         reason to expose stale text or policy detail.
         """
+        if authorization is not None:
+            if authorization_fingerprint is not None:
+                return None
+            authorization_fingerprint = self._allowed_decision_fingerprint(
+                authorization, for_write=False
+            )
         if relative_path not in self._NAMES or not self._valid_fingerprint(
             authorization_fingerprint
         ):
@@ -301,3 +318,25 @@ class ViewStore:
     @classmethod
     def _valid_fingerprint(cls, value: object) -> bool:
         return isinstance(value, str) and cls._FINGERPRINT.fullmatch(value) is not None
+
+    @classmethod
+    def _allowed_decision_fingerprint(
+        cls, authorization: object, *, for_write: bool
+    ) -> str | None:
+        """Accept only an allowed common-gate decision as local cache authority."""
+        try:
+            from mneme.core.security import PolicyDecision
+
+            if not isinstance(authorization, PolicyDecision):
+                raise TypeError("generated view authorization must be a PolicyDecision")
+            fingerprint = authorization.authorization_fingerprint
+            if authorization.allowed and cls._valid_fingerprint(fingerprint):
+                return fingerprint
+            if for_write:
+                raise InvalidArtifact("generated view authorization is not allowed")
+        except InvalidArtifact:
+            raise
+        except Exception:
+            if for_write:
+                raise InvalidArtifact("generated view authorization is invalid") from None
+        return None

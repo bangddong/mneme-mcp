@@ -556,6 +556,19 @@ def test_view_store_only_targets_named_generated_views_under_local_root(tmp_path
             views.write(path, "forbidden")
 
 
+def test_view_store_never_loads_a_view_from_a_denied_policy_decision(tmp_path):
+    """Catches an opaque cache hash being usable after the common gate has denied it."""
+    from mneme.core.security import PolicyDecision
+    from mneme.core.storage import StorageRouter
+
+    views = StorageRouter(tmp_path / "vault", tmp_path / "local").view_store()
+    allowed = PolicyDecision(True, (), "a" * 64)
+    denied = PolicyDecision(False, ("policy-current-denied",))
+    views.write("CURRENT.md", "sensitive generated current", authorization=allowed)
+
+    assert views.load("CURRENT.md", authorization=denied) is None
+
+
 @pytest.mark.parametrize("aliased_root", ["portable", "local"])
 def test_router_rejects_supplied_root_symlink_before_laundering_it(
     tmp_path, aliased_root

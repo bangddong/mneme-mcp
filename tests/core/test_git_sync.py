@@ -573,6 +573,24 @@ def test_sync_preflight_combines_doctor_with_a_live_authorization_seam(vault):
     assert preflight.blocker_codes == ("live-policy-denied",)
 
 
+def test_sync_preflight_authorizes_the_vault_root_when_no_data_artifacts_exist(vault):
+    """Catches an empty current tree allowing .madi metadata past a tightened vault policy."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.git_sync import sync_preflight
+    from mneme.core.policy import PolicyStore
+
+    policies = PolicyStore(vault)
+    restrictive = policies.create_revision(
+        "vault-default", "2", {"ceiling": "local-only"}, StorageClass.PORTABLE
+    )
+    policies.activate(restrictive, expected_generation=1)
+
+    preflight = sync_preflight(vault, (".madi/vault.yaml",))
+
+    assert preflight.allowed is False
+    assert "policy-current-denied" in preflight.blocker_codes
+
+
 def test_push_is_explicit_and_exposes_no_force_mode(vault, tmp_path):
     """Catches an API option allowing callers to turn a safe push into a force push."""
     from mneme.core.git_sync import push

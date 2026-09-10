@@ -35,7 +35,7 @@ class ContextReaders:
     load_overlay: Callable[[str], LocalOverlay | None] | None = None
     load_overlay_revision: Callable[[str, HeadRef], object] | None = None
     portable_optional_inputs: Callable[[str], Sequence[object]] | None = None
-    authorize_portable_revision: Callable[[str, HeadRef], bool] | None = None
+    authorize_revision: Callable[[str, HeadRef, StorageClass], bool] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.load_portable_workstream) or not callable(self.load_portable_revision):
@@ -46,10 +46,8 @@ class ContextReaders:
             raise TypeError("overlay revision reader must be callable")
         if self.portable_optional_inputs is not None and not callable(self.portable_optional_inputs):
             raise TypeError("optional input reader must be callable")
-        if self.authorize_portable_revision is not None and not callable(
-            self.authorize_portable_revision
-        ):
-            raise TypeError("portable revision authorizer must be callable")
+        if self.authorize_revision is not None and not callable(self.authorize_revision):
+            raise TypeError("CURRENT revision authorizer must be callable")
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +116,8 @@ def _resolve_portable(readers: ContextReaders, workstream_id: str) -> ResolvedWo
     try:
         return resolve_workstream(
             registry,
-            lambda head: _load_authorized_portable_revision(
-                readers, workstream_id, head
+            lambda head: _load_authorized_revision(
+                readers, workstream_id, head, StorageClass.PORTABLE
             ),
             optional_inputs=optional,
             expected_storage_class=StorageClass.PORTABLE,
@@ -128,15 +126,21 @@ def _resolve_portable(readers: ContextReaders, workstream_id: str) -> ResolvedWo
         return _invalid_projection()
 
 
-def _load_authorized_portable_revision(
-    readers: ContextReaders, workstream_id: str, head: HeadRef
+def _load_authorized_revision(
+    readers: ContextReaders,
+    workstream_id: str,
+    head: HeadRef,
+    storage_class: StorageClass,
 ) -> object:
-    if (
-        readers.authorize_portable_revision is not None
-        and readers.authorize_portable_revision(workstream_id, head) is not True
-    ):
+    if readers.authorize_revision is None:
+        raise PermissionError("current policy authorization is unavailable")
+    if readers.authorize_revision(workstream_id, head, storage_class) is not True:
         raise PermissionError("current policy withheld revision")
-    return readers.load_portable_revision(workstream_id, head)
+    if storage_class is StorageClass.PORTABLE:
+        return readers.load_portable_revision(workstream_id, head)
+    if readers.load_overlay_revision is None:
+        raise PermissionError("current policy authorization is unavailable")
+    return readers.load_overlay_revision(workstream_id, head)
 
 
 def _resolve_overlay(readers: ContextReaders, workstream_id: str) -> ResolvedWorkstream | None:
@@ -157,7 +161,12 @@ def _resolve_overlay(readers: ContextReaders, workstream_id: str) -> ResolvedWor
     try:
         return resolve_workstream(
             overlay.registry,
-            lambda head: readers.load_overlay_revision(overlay.registry.id, head),
+            lambda head: _load_authorized_revision(
+                readers,
+                overlay.registry.id,
+                head,
+                StorageClass.LOCAL_ONLY,
+            ),
             optional_inputs=overlay.optional_inputs,
             expected_storage_class=StorageClass.LOCAL_ONLY,
         )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 
 from mneme.core.artifacts import StorageClass
@@ -112,6 +112,7 @@ class CoreService:
         registries = RegistryStore(self.vault)
         sessions = SessionStore(self.vault)
         _bindings, source_diagnostics = self._bound_sources()
+        view_decision = self.authorizer.authorize_context_view(workstream_id)
         readers = ContextReaders(
             registries.load_workstream,
             lambda selected, head: SessionRevision(
@@ -125,29 +126,54 @@ class CoreService:
                 self.index.db_path.is_file(),
                 not source_diagnostics,
             ),
-            authorize_portable_revision=lambda selected, head: self.authorizer.authorize_current(
-                PolicyArtifactRef.session(selected, head.session, head.revision), "context"
+            authorize_revision=lambda selected, head, storage_class: self.authorizer.authorize_current(
+                PolicyArtifactRef.session(
+                    selected, head.session, head.revision, storage_class
+                ),
+                "context",
             ).allowed,
         )
-        return render_current(readers, workstream_id, mode)
+        view = render_current(readers, workstream_id, mode)
+        return self._cache_view("CURRENT.md", view, view_decision)
 
-    def profile(self, scope: object) -> ContextView:
-        """Render a portable PROFILE only from records live-authorized now."""
+    def profile(
+        self, scope: object, *, storage_class: StorageClass = StorageClass.PORTABLE
+    ) -> ContextView:
+        """Render PROFILE from the matching storage tree under the live gate."""
         from mneme.core.memories import MemoryReaders, render_profile
 
-        return render_profile(
+        if not isinstance(storage_class, StorageClass):
+            raise TypeError("PROFILE requires an explicit StorageClass")
+        view_decision = self.authorizer.authorize_profile_view(storage_class)
+        view = render_profile(
             MemoryReaders(
-                MemoryStore(self.vault),
+                MemoryStore(self.vault, storage_class),
                 authorize_record=lambda record: self.authorizer.authorize_current(
-                    PolicyArtifactRef.memory(record.id), "profile"
+                    PolicyArtifactRef.memory(record.id, storage_class), "profile"
                 ).allowed,
             ),
             scope,
+            storage_class=storage_class,
         )
+        return self._cache_view("PROFILE.md", view, view_decision)
 
     def authorize_export(self, artifact_ref: PolicyArtifactRef) -> PolicyDecision:
         """Expose the same live gate to any explicit export adapter."""
         return self.authorizer.authorize_current(artifact_ref, "export")
+
+    def _cache_view(
+        self, name: str, view: ContextView, decision: PolicyDecision
+    ) -> ContextView:
+        """Reuse only a common-gate-authorized local projection, otherwise rerender."""
+        if not decision.allowed:
+            return view
+        cached = self.vault.views.load(name, authorization=decision)
+        if cached is None:
+            self.vault.views.write(name, view.text, authorization=decision)
+            cached = self.vault.views.load(name, authorization=decision)
+            if cached is None:
+                return view
+        return replace(view, text=cached)
 
     def _bound_sources(self) -> tuple[list[SourceBinding], list[str]]:
         bindings: list[SourceBinding] = []

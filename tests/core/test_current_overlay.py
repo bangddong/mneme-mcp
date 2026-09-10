@@ -38,6 +38,10 @@ def _local_registry():
     return local
 
 
+def _allow_current(_workstream_id, _head, _storage_class):
+    return True
+
+
 def test_portable_mode_never_opens_or_mentions_local_overlay_data():
     """Catches portable CURRENT probing, or disclosing facts about, local-only state."""
     from mneme.core.context import ContextReaders, render_current
@@ -49,6 +53,7 @@ def test_portable_mode_never_opens_or_mentions_local_overlay_data():
         load_portable_workstream=lambda _id: _portable_registry(),
         load_portable_revision=lambda _id, head: _revision(head),
         load_overlay=forbidden_overlay,
+        authorize_revision=_allow_current,
     )
 
     view = render_current(readers, "ws-1", "portable")
@@ -69,6 +74,7 @@ def test_effective_local_labels_base_and_foreground_without_rewriting_portable_s
         load_portable_revision=lambda _id, head: _revision(head, objective="portable base continuity"),
         load_overlay=lambda _id: LocalOverlay("ws-1", _local_registry()),
         load_overlay_revision=lambda _id, head: _revision(head, workstream_id="local-ws", storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY, objective="confidential foreground"),
+        authorize_revision=_allow_current,
     )
 
     view = render_current(readers, "ws-1", "effective-local")
@@ -84,6 +90,40 @@ def test_effective_local_labels_base_and_foreground_without_rewriting_portable_s
     assert view.overlay.selected_head.session == "local-secret"
 
 
+def test_effective_local_current_uses_the_storage_aware_common_authorizer():
+    """Catches an overlay revision bypassing the same gate used by portable CURRENT."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.context import ContextReaders, LocalOverlay, render_current
+
+    seen_storage_classes = []
+
+    def authorize(_workstream_id, _head, storage_class):
+        seen_storage_classes.append(storage_class)
+        return storage_class is StorageClass.PORTABLE
+
+    view = render_current(
+        ContextReaders(
+            load_portable_workstream=lambda _id: _portable_registry(),
+            load_portable_revision=lambda _id, head: _revision(head),
+            load_overlay=lambda _id: LocalOverlay("ws-1", _local_registry()),
+            load_overlay_revision=lambda _id, head: _revision(
+                head,
+                workstream_id="local-ws",
+                storage_class=StorageClass.LOCAL_ONLY,
+                objective="confidential foreground",
+            ),
+            authorize_revision=authorize,
+        ),
+        "ws-1",
+        "effective-local",
+    )
+
+    assert seen_storage_classes == [StorageClass.PORTABLE, StorageClass.LOCAL_ONLY]
+    assert view.portable_status.value == "resolved"
+    assert view.overlay_status.value == "invalid"
+    assert "confidential foreground" not in view.text
+
+
 def test_invalid_optional_overlay_falls_back_to_portable_and_degrades():
     """Catches invalid local state leaking into an otherwise usable portable view."""
     from mneme.core.context import ContextReaders, LocalOverlay, render_current
@@ -93,6 +133,7 @@ def test_invalid_optional_overlay_falls_back_to_portable_and_degrades():
         load_portable_revision=lambda _id, head: _revision(head),
         load_overlay=lambda _id: LocalOverlay("wrong-base", _local_registry()),
         load_overlay_revision=lambda _id, head: _revision(head, storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY, objective="must not render"),
+        authorize_revision=_allow_current,
     )
 
     view = render_current(readers, "ws-1", "effective-local")
@@ -113,6 +154,7 @@ def test_invalid_portable_base_remains_invalid_even_with_a_valid_local_overlay()
         load_portable_revision=lambda _id, _head: None,
         load_overlay=lambda _id: LocalOverlay("ws-1", _local_registry()),
         load_overlay_revision=lambda _id, head: _revision(head, storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY, objective="confidential foreground"),
+        authorize_revision=_allow_current,
     )
 
     view = render_current(readers, "ws-1", "effective-local")
@@ -130,6 +172,7 @@ def test_absent_optional_overlay_degrades_without_mutating_portable_registry():
         load_portable_workstream=lambda _id: portable,
         load_portable_revision=lambda _id, head: _revision(head),
         load_overlay=lambda _id: None,
+        authorize_revision=_allow_current,
     )
 
     view = render_current(readers, "ws-1", "effective-local")
@@ -147,7 +190,11 @@ def test_portable_reader_rejects_arbitrary_text_payload_without_rendering_it():
         text = "local-id local-path local-hash local-count"
 
     view = render_current(
-        ContextReaders(lambda _id: _portable_registry(), lambda _id, _head: Payload()),
+        ContextReaders(
+            lambda _id: _portable_registry(),
+            lambda _id, _head: Payload(),
+            authorize_revision=_allow_current,
+        ),
         "ws-1", "portable",
     )
 
@@ -163,6 +210,7 @@ def test_optional_reader_failures_and_malformed_inputs_degrade_a_valid_portable_
         load_portable_workstream=lambda _id: _portable_registry(),
         load_portable_revision=lambda _id, head: _revision(head),
         portable_optional_inputs=lambda _id: (_ for _ in ()).throw(FileNotFoundError("mount unavailable")),
+        authorize_revision=_allow_current,
     )
     assert render_current(readers, "ws-1", "portable").status.value == "degraded"
 
@@ -170,6 +218,7 @@ def test_optional_reader_failures_and_malformed_inputs_degrade_a_valid_portable_
         load_portable_workstream=lambda _id: _portable_registry(),
         load_portable_revision=lambda _id, head: _revision(head),
         portable_optional_inputs=lambda _id: object(),
+        authorize_revision=_allow_current,
     )
     assert render_current(malformed, "ws-1", "portable").status.value == "degraded"
 
@@ -183,6 +232,7 @@ def test_optional_overlay_reader_exception_falls_back_to_portable():
             load_portable_workstream=lambda _id: _portable_registry(),
             load_portable_revision=lambda _id, head: _revision(head),
             load_overlay=lambda _id: (_ for _ in ()).throw(FileNotFoundError("overlay missing")),
+            authorize_revision=_allow_current,
         ),
         "ws-1",
         "effective-local",
@@ -238,6 +288,7 @@ def test_exploding_portable_optional_sequence_degrades_without_crashing(sequence
             lambda _id: _portable_registry(),
             lambda _id, head: _revision(head),
             portable_optional_inputs=lambda _id: sequence_type(),
+            authorize_revision=_allow_current,
         ),
         "ws-1", "portable",
     )
@@ -263,6 +314,7 @@ def test_exploding_overlay_optional_sequence_degrades_without_partial_overlay_re
                 storage_class=__import__("mneme.core.artifacts", fromlist=["StorageClass"]).StorageClass.LOCAL_ONLY,
                 objective="confidential foreground",
             ),
+            authorize_revision=_allow_current,
         ),
         "ws-1", "effective-local",
     )
@@ -279,7 +331,11 @@ def test_context_view_does_not_change_when_reader_result_is_mutated_after_render
     head = _portable_registry().active_heads[0]
     reader_result = _revision(head, objective="stable before render")
     view = render_current(
-        ContextReaders(lambda _id: _portable_registry(), lambda _id, _head: reader_result),
+        ContextReaders(
+            lambda _id: _portable_registry(),
+            lambda _id, _head: reader_result,
+            authorize_revision=_allow_current,
+        ),
         "ws-1", "portable",
     )
 
@@ -305,7 +361,11 @@ def test_context_view_does_not_retain_the_reader_owned_registry_or_heads():
         "ws-1", 0, None, "active", "single", (caller_head,)
     )
     view = render_current(
-        ContextReaders(lambda _id: registry, lambda _id, head: _revision(head)),
+        ContextReaders(
+            lambda _id: registry,
+            lambda _id, head: _revision(head),
+            authorize_revision=_allow_current,
+        ),
         "ws-1", "portable",
     )
 

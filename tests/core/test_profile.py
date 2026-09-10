@@ -73,6 +73,71 @@ def test_portable_profile_refuses_a_local_only_reader(vault):
         render_profile(MemoryReaders(local), {"type": "personal-global"})
 
 
+def test_service_profile_reads_local_only_preferences_with_the_matching_gate(vault):
+    """Catches a portable MemoryStore being hard-coded into all PROFILE authorization."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import Portability, evaluate_portability
+    from mneme.core.service import CoreService
+
+    body = "Local preference must remain available locally."
+    receipt = evaluate_portability(
+        Portability.LOCAL_ONLY,
+        (),
+        memory_semantic_hash(
+            body=body,
+            kind="preference",
+            portability="local-only",
+        ),
+    )
+    local = MemoryStore(vault, StorageClass.LOCAL_ONLY)
+    record = local.submit_candidate(
+        "preference",
+        {"type": "personal-global"},
+        "personal",
+        "local-only",
+        body,
+        receipt,
+    )
+    local.promote(record.id, 0, receipt)
+
+    view = CoreService(vault).profile(
+        {"type": "personal-global"}, storage_class=StorageClass.LOCAL_ONLY
+    )
+
+    assert view.mode == "effective-local"
+    assert body in view.text
+
+
+def test_profile_with_unreadable_canonical_receipt_returns_closed_invalid_view(vault):
+    """Catches raw canonical-read paths or exceptions escaping the PROFILE boundary."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.memories import MemoryReaders, MemoryStore, render_profile
+    from mneme.core.policy import PolicyStore
+
+    body = "Preference that must not escape a broken policy read."
+    store = MemoryStore(vault)
+    record = store.submit_candidate(
+        "preference",
+        {"type": "personal-global"},
+        "personal",
+        "personal-vault",
+        body,
+        _receipt(vault, body, kind="preference"),
+    )
+    store.promote(record.id, 0, _receipt(vault, body, kind="preference"))
+    active = PolicyStore(vault).load_active("vault-default", StorageClass.PORTABLE)
+    policy_path = vault.root / f".madi/policies/{active.policy_id}/{active.revision}.yaml"
+    policy_path.write_text("not a valid policy revision\n", encoding="utf-8")
+
+    view = render_profile(MemoryReaders(MemoryStore(vault)), {"type": "personal-global"})
+
+    assert view.status.value == "invalid"
+    assert "policy-current-unavailable" in view.text
+    assert body not in view.text
+    assert str(policy_path) not in view.text
+
+
 def test_profile_excludes_accepted_superseded_preferences_and_shows_audit_metadata(vault):
     from mneme.core.memories import MemoryReaders, MemoryStore, render_profile
 

@@ -212,7 +212,7 @@ class MemoryReaders:
             from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
 
             return PolicyAuthorizer(self.store.vault).authorize_current(
-                PolicyArtifactRef.memory(record.id), "profile"
+                PolicyArtifactRef.memory(record.id, self.storage_class), "profile"
             ).allowed
         except Exception:
             return False
@@ -459,6 +459,14 @@ class MemoryStore:
             raise InvalidArtifact("memory semantic hash does not bind content")
         if record.policy_receipt.semantic_hash != record.semantic_hash:
             raise InvalidArtifact("memory receipt does not bind semantic hash")
+        requested = _requested_portability(self.storage_class)
+        if record.portability is not requested:
+            raise InvalidArtifact("memory portability does not match canonical storage")
+        if (
+            record.policy_receipt.requested is not requested
+            or not record.policy_receipt.allowed
+        ):
+            raise InvalidArtifact("memory receipt does not bind canonical storage")
         if document.body != record.body:
             raise InvalidArtifact("memory body is not canonical")
         return record
@@ -514,7 +522,10 @@ def render_profile(
             f"{storage_class.value} PROFILE cannot read {readers.storage_class.value} memory records"
         )
     selected_scope = MemoryScope.parse(scope)
-    all_records = readers.load_records()
+    try:
+        all_records = readers.load_records()
+    except Exception:
+        return _unavailable_profile(storage_class)
     by_id = {record.id: record for record in all_records}
     records = tuple(
         record for record in all_records if record.scope == selected_scope
@@ -543,6 +554,23 @@ def render_profile(
     resolved = ResolvedWorkstream(ResolutionState.RESOLVED, None, (), (), None, ())
     mode = "portable" if storage_class is StorageClass.PORTABLE else "effective-local"
     return ContextView("profile", mode, text, resolved, None, ResolutionState.RESOLVED, None, ResolutionState.RESOLVED)
+
+
+def _unavailable_profile(storage_class: StorageClass) -> ContextView:
+    """Keep canonical read failures local-safe at the generated PROFILE boundary."""
+    state = ResolutionState.INVALID
+    resolved = ResolvedWorkstream(state, None, (), (), None, ("policy-current-unavailable",))
+    mode = "portable" if storage_class is StorageClass.PORTABLE else "effective-local"
+    return ContextView(
+        "profile",
+        mode,
+        "# PROFILE\n\nstatus: invalid\npolicy-current-unavailable\n",
+        resolved,
+        None,
+        state,
+        None,
+        state,
+    )
 
 
 def _has_successor(record: MemoryRecord, by_id: Mapping[str, MemoryRecord]) -> bool:
