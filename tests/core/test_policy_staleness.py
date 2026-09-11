@@ -869,6 +869,97 @@ def test_memory_source_project_resolution_binds_the_resolved_storage_identity(tm
     )
 
 
+def test_malformed_selected_local_project_cannot_resurrect_portable_fallback_cache(
+    tmp_path,
+):
+    """Catches invalid local project state being mistaken for local absence."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.fs import dump_yaml, read_yaml
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.registries import RegistryStore
+    from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    policies = PolicyStore(vault)
+    portable = RegistryStore(vault, StorageClass.PORTABLE)
+    local = RegistryStore(vault, StorageClass.LOCAL_ONLY)
+    portable_project = portable.register_project("shared-project")
+    local_source = local.register_source(
+        "local-source", project=portable_project.id
+    )
+    provenance = (
+        ArtifactReference(ReferenceKind.ID, StorageClass.LOCAL_ONLY, local_source.id),
+    )
+    body = "LOCAL_MEMORY_WITH_PROJECT_POLICY"
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+    receipt = evaluate_portability(
+        Portability.LOCAL_ONLY,
+        (policies.load_rule(default),),
+        memory_semantic_hash(
+            body=body,
+            kind="preference",
+            portability="local-only",
+            provenance=provenance,
+        ),
+    )
+    memories = MemoryStore(vault, StorageClass.LOCAL_ONLY)
+    candidate = memories.submit_candidate(
+        "preference",
+        {"type": "personal-global"},
+        "personal",
+        "local-only",
+        body,
+        receipt,
+        provenance=provenance,
+    )
+    memory = memories.promote(candidate.id, 0, receipt)
+    authorizer = PolicyAuthorizer(vault)
+    reference = PolicyArtifactRef.memory(memory.id, StorageClass.LOCAL_ONLY)
+
+    portable_fallback = authorizer.authorize_current(reference, "profile")
+    vault.views.write(
+        "PROFILE.md", "PORTABLE_FALLBACK_CACHE_BODY", authorization=portable_fallback
+    )
+    local_project = local.register_project(portable_project.id)
+    local_policy = policies.create_revision(
+        "local-project-policy",
+        "1",
+        {"ceiling": "local-only"},
+        StorageClass.LOCAL_ONLY,
+    )
+    local.assign_project_policy(
+        local_project.id, local_policy, expected_generation=local_project.generation
+    )
+    selected_local = authorizer.authorize_current(reference, "profile")
+
+    project_path = (
+        vault.local_root / "overlays" / "projects" / f"{local_project.id}.yaml"
+    )
+    malformed_project = read_yaml(project_path)
+    malformed_project["policy"]["digest"] = "not-a-policy-digest"
+    project_path.write_text(dump_yaml(malformed_project), encoding="utf-8")
+    unavailable = authorizer.authorize_current(reference, "profile")
+    resurrected = vault.views.load("PROFILE.md", authorization=unavailable)
+
+    assert portable_fallback.allowed is True
+    assert portable_fallback.authorization_fingerprint is not None
+    assert selected_local.allowed is True
+    assert (
+        selected_local.authorization_fingerprint
+        != portable_fallback.authorization_fingerprint
+    )
+    assert (
+        unavailable.authorization_fingerprint
+        != portable_fallback.authorization_fingerprint
+    )
+    assert unavailable.authorization_fingerprint is None
+    assert unavailable.allowed is False
+    assert unavailable.issue_codes == ("policy-current-unavailable",)
+    assert resurrected is None
+
+
 @pytest.mark.parametrize("view_kind", ("context", "profile"))
 @pytest.mark.parametrize("operation", ("load", "write"))
 def test_generated_view_io_failure_returns_the_fresh_safe_projection(

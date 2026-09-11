@@ -498,7 +498,10 @@ class PolicyAuthorizer:
         try:
             return registries.load_project(project_id), registries.storage_class
         except InvalidArtifact as local_error:
-            if registries.storage_class is not StorageClass.LOCAL_ONLY:
+            if (
+                registries.storage_class is not StorageClass.LOCAL_ONLY
+                or not isinstance(local_error.__cause__, FileNotFoundError)
+            ):
                 raise
             try:
                 return (
