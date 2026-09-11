@@ -775,6 +775,100 @@ def test_local_memory_uses_its_explicit_portable_source_over_a_same_id_local_sha
     assert unavailable.issue_codes == ("policy-current-unavailable",)
 
 
+def test_memory_source_project_resolution_binds_the_resolved_storage_identity(tmp_path):
+    """Catches a local source losing portable project fallback or portable exactness."""
+    from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
+    from mneme.core.memories import MemoryStore, memory_semantic_hash
+    from mneme.core.policy import PolicyStore, Portability, evaluate_portability
+    from mneme.core.registries import RegistryStore
+    from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer
+    from mneme.core.vault import Vault
+
+    vault = Vault.initialize(tmp_path / "vault", tmp_path / "state", "person-01")
+    policies = PolicyStore(vault)
+    portable = RegistryStore(vault, StorageClass.PORTABLE)
+    local = RegistryStore(vault, StorageClass.LOCAL_ONLY)
+    project = portable.register_project("shared-project")
+    portable_source = portable.register_source(
+        "portable-source", project=project.id
+    )
+    local_source = local.register_source("local-source", project=project.id)
+    memories = MemoryStore(vault, StorageClass.LOCAL_ONLY)
+    default = policies.load_active("vault-default", StorageClass.PORTABLE)
+
+    def accepted_memory(source_storage: StorageClass, source_id: str, body: str):
+        provenance = (
+            ArtifactReference(ReferenceKind.ID, source_storage, source_id),
+        )
+        receipt = evaluate_portability(
+            Portability.LOCAL_ONLY,
+            (policies.load_rule(default),),
+            memory_semantic_hash(
+                body=body,
+                kind="preference",
+                portability="local-only",
+                provenance=provenance,
+            ),
+        )
+        candidate = memories.submit_candidate(
+            "preference",
+            {"type": "personal-global"},
+            "personal",
+            "local-only",
+            body,
+            receipt,
+            provenance=provenance,
+        )
+        return memories.promote(candidate.id, 0, receipt)
+
+    local_memory = accepted_memory(
+        StorageClass.LOCAL_ONLY, local_source.id, "LOCAL_SOURCE_PORTABLE_PROJECT"
+    )
+    portable_memory = accepted_memory(
+        StorageClass.PORTABLE, portable_source.id, "PORTABLE_SOURCE_PORTABLE_PROJECT"
+    )
+    authorizer = PolicyAuthorizer(vault)
+    local_ref = PolicyArtifactRef.memory(local_memory.id, StorageClass.LOCAL_ONLY)
+    portable_ref = PolicyArtifactRef.memory(portable_memory.id, StorageClass.LOCAL_ONLY)
+
+    local_before_shadow = authorizer.authorize_current(local_ref, "profile")
+    portable_before_shadow = authorizer.authorize_current(portable_ref, "profile")
+    local.register_project(project.id)
+    local_after_shadow = authorizer.authorize_current(local_ref, "profile")
+    portable_after_shadow = authorizer.authorize_current(portable_ref, "profile")
+    portable_policy = policies.create_revision(
+        "portable-project-policy",
+        "1",
+        {"ceiling": "personal-vault"},
+        StorageClass.PORTABLE,
+    )
+    portable.assign_project_policy(project.id, portable_policy, expected_generation=0)
+    local_after_portable_change = authorizer.authorize_current(local_ref, "profile")
+    portable_after_portable_change = authorizer.authorize_current(
+        portable_ref, "profile"
+    )
+
+    assert local_before_shadow.allowed is True
+    assert portable_before_shadow.allowed is True
+    assert local_after_shadow.allowed is True
+    assert (
+        local_after_shadow.authorization_fingerprint
+        != local_before_shadow.authorization_fingerprint
+    )
+    assert (
+        portable_after_shadow.authorization_fingerprint
+        == portable_before_shadow.authorization_fingerprint
+    )
+    assert (
+        local_after_portable_change.authorization_fingerprint
+        == local_after_shadow.authorization_fingerprint
+    )
+    assert (
+        portable_after_portable_change.authorization_fingerprint
+        != portable_after_shadow.authorization_fingerprint
+    )
+
+
 @pytest.mark.parametrize("view_kind", ("context", "profile"))
 @pytest.mark.parametrize("operation", ("load", "write"))
 def test_generated_view_io_failure_returns_the_fresh_safe_projection(

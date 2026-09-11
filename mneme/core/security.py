@@ -459,10 +459,14 @@ class PolicyAuthorizer:
         for storage_class, project_id in sorted(
             exact_projects, key=lambda item: (item[0].value, item[1])
         ):
-            project = RegistryStore(self._vault, storage_class).load_project(project_id)
+            project, resolved_storage_class = self._load_project_with_storage(
+                RegistryStore(self._vault, storage_class), project_id
+            )
             inputs.append(
                 self._input_token(
-                    "project", f"{storage_class.value}:{project.id}", project.policy_ref
+                    "project",
+                    f"{resolved_storage_class.value}:{project.id}",
+                    project.policy_ref,
                 )
             )
             if project.policy_ref is not None:
@@ -483,15 +487,26 @@ class PolicyAuthorizer:
                 raise local_error
 
     def _load_project(self, registries: RegistryStore, project_id: str):
+        project, _storage_class = self._load_project_with_storage(
+            registries, project_id
+        )
+        return project
+
+    def _load_project_with_storage(
+        self, registries: RegistryStore, project_id: str
+    ):
         try:
-            return registries.load_project(project_id)
+            return registries.load_project(project_id), registries.storage_class
         except InvalidArtifact as local_error:
             if registries.storage_class is not StorageClass.LOCAL_ONLY:
                 raise
             try:
-                return RegistryStore(
-                    self._vault, StorageClass.PORTABLE
-                ).load_project(project_id)
+                return (
+                    RegistryStore(
+                        self._vault, StorageClass.PORTABLE
+                    ).load_project(project_id),
+                    StorageClass.PORTABLE,
+                )
             except InvalidArtifact:
                 raise local_error
 
