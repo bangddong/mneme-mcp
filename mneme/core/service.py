@@ -435,6 +435,10 @@ class CoreService:
         )
         storage_class = _storage_class(payload.get("storage_class", "portable"))
         workstream_id = _text(payload["workstream_id"], "workstream id")
+        if not self.authorizer.authorize_current(
+            PolicyArtifactRef.workstream(workstream_id, storage_class), "context"
+        ).allowed:
+            raise PolicyDenied("workstream is unavailable under current policy")
         heads = _heads(payload["active_heads"])
         store = RegistryStore(self.vault, storage_class)
         current = store.load_workstream(workstream_id)

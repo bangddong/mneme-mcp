@@ -474,6 +474,66 @@ def test_head_and_source_commands_delegate_to_cas_registry_lifecycle(service):
     assert [event.name for event in source.domain_events] == ["source_registered"]
 
 
+def test_set_active_heads_fails_closed_before_empty_removal_of_restricted_workstream(
+    service,
+):
+    """Catches empty heads bypassing live workstream policy and clearing state."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.policy import PolicyStore
+    from mneme.core.registries import HeadRef, RegistryStore
+
+    registries = RegistryStore(service.vault)
+    registries.create_workstream("secret-workstream", project=None, mode="parallel")
+    checkpoint = _checkpoint_payload()
+    checkpoint["workstream_id"] = "secret-workstream"
+    created = service.execute(_command("create_session_revision", checkpoint))
+    restrictive = PolicyStore(service.vault).create_revision(
+        "restricted-workstream",
+        "1",
+        {"ceiling": "local-only"},
+        StorageClass.PORTABLE,
+    )
+    current = registries.load_workstream("secret-workstream")
+    before = registries.update_workstream(
+        current.with_policy_refs((restrictive,)),
+        expected_generation=current.generation,
+    )
+
+    forbidden = service.execute(
+        _command(
+            "set_active_heads",
+            {
+                "active_heads": [],
+                "expected_generation": before.generation,
+                "workstream_id": "secret-workstream",
+            },
+        )
+    )
+    absent = service.execute(
+        _command(
+            "set_active_heads",
+            {
+                "active_heads": [],
+                "expected_generation": before.generation,
+                "workstream_id": "absent-workstream",
+            },
+        )
+    )
+    after = registries.load_workstream("secret-workstream")
+
+    assert created.ok is True
+    assert forbidden.ok is absent.ok is False
+    assert forbidden.error.code == "policy-denied"
+    assert forbidden.as_dict() == absent.as_dict()
+    assert after == before
+    assert after.generation == 2
+    assert after.active_heads == (HeadRef("s1", "000001"),)
+    encoded = json.dumps(forbidden.as_dict())
+    assert "secret-workstream" not in encoded
+    assert "restricted-workstream" not in encoded
+    assert "local-only" not in encoded
+
+
 def test_operational_source_failure_is_intrinsically_local_only(service):
     """Catches an availability observation becoming portable knowledge."""
     from mneme.core.artifacts import StorageClass
