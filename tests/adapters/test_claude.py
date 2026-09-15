@@ -193,6 +193,56 @@ def test_adapter_rejects_detectable_credential_reference_without_writing(
     assert registry.active_heads == ()
 
 
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+def test_adapter_rejects_quoted_credential_reference_without_writing(
+    service, project, storage_class, workstream_id
+):
+    """Catches quote-wrapped reference credentials escaping the shared guard."""
+    from mneme.adapters.claude import ClaudeAdapter
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        RegistryStore(service.vault, selected_class).create_workstream(
+            workstream_id, project=None, mode="parallel"
+        )
+    checkpoint = project / ".madi" / "checkpoints" / f"quoted-reference-{storage_class}.json"
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["source_refs"] = [
+        {
+            "kind": "label",
+            "storage_class": "portable",
+            "value": 'API_KEY="SENSITIVE_SENTINEL"',
+        }
+    ]
+    _write_checkpoint(checkpoint, payload)
+
+    result = ClaudeAdapter(service, project_root=project).handle(
+        _envelope(workstream_id=workstream_id, checkpoint_file=str(checkpoint))
+    )
+
+    encoded = json.dumps(result.as_dict())
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.block_host is False
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert str(checkpoint) not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
 def test_adapter_accepts_checkpoint_under_an_explicit_configured_temp_root(
     service, project, tmp_path
 ):

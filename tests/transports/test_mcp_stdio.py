@@ -187,6 +187,51 @@ def test_madi_checkpoint_rejects_detectable_credential_reference_without_writing
     assert registry.active_heads == ()
 
 
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+def test_madi_checkpoint_rejects_quoted_credential_reference_without_writing(
+    service, storage_class, workstream_id
+):
+    """Catches quote-wrapped reference credentials bypassing stdio validation."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+    from mneme.transports.mcp_stdio import create_app
+
+    selected_class = StorageClass(storage_class)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        RegistryStore(service.vault, selected_class).create_workstream(
+            workstream_id, project=None, mode="parallel"
+        )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["source_refs"] = [
+        {
+            "kind": "label",
+            "storage_class": "portable",
+            "value": 'API_KEY="SENSITIVE_SENTINEL"',
+        }
+    ]
+
+    result = _handler(create_app(service), "madi_checkpoint")(payload)
+
+    encoded = json.dumps(result)
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid-artifact"
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
 def test_importing_core_does_not_require_fastmcp():
     """Catches a transport dependency entering the import-safe Core boundary."""
     script = r'''

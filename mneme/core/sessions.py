@@ -40,16 +40,27 @@ from mneme.core.validation.vault import validate_identifier
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
-_DETECTABLE_SECRET = re.compile(
+_DETECTABLE_ASSIGNMENT = re.compile(
+    r"""(?ix)
+    \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
+    \s*(?:=|:)\s*
+    (?:
+        "(?P<double_value>[^"\r\n]+)"
+      | '(?P<single_value>[^'\r\n]+)'
+      | (?P<bare_value>[A-Za-z0-9._~+/=-]+)
+    )
+    """
+)
+_DETECTABLE_SECRET_MATERIAL = re.compile(
     r"""(?ix)
     (?:
-        \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
-        \s*(?:=|:)\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{8,}
-      | \bbearer\s+[A-Za-z0-9._~+/=-]{8,}
+        \bbearer\s+[A-Za-z0-9._~+/=-]{8,}
       | -----BEGIN(?:\s+[A-Z0-9]+)?\s+PRIVATE\s+KEY-----
     )
     """
 )
+_PLACEHOLDER_SECRET_VALUES = frozenset({"redacted", "placeholder"})
+_MINIMUM_SECRET_VALUE_LENGTH = 8
 @dataclass(frozen=True, slots=True)
 class SessionRevisionRef:
     session: str
@@ -748,8 +759,30 @@ def _reject_detectable_secrets(
                     values.append(provenance.value)
             else:
                 values.extend((provenance.kind, provenance.id))
-    if any(_DETECTABLE_SECRET.search(value) for value in values):
+    if any(_contains_detectable_secret(value) for value in values):
         raise InvalidArtifact("checkpoint contains a detectable credential")
+
+
+def _contains_detectable_secret(value: str) -> bool:
+    """Match bounded assigned values while allowing exact redaction reminders."""
+    for match in _DETECTABLE_ASSIGNMENT.finditer(value):
+        assigned = next(
+            captured
+            for captured in (
+                match["double_value"],
+                match["single_value"],
+                match["bare_value"],
+            )
+            if captured is not None
+        )
+        normalized = assigned.strip().casefold()
+        is_exact_placeholder = (
+            normalized in _PLACEHOLDER_SECRET_VALUES
+            and value[match.end():].strip() == ""
+        )
+        if len(normalized) >= _MINIMUM_SECRET_VALUE_LENGTH and not is_exact_placeholder:
+            return True
+    return _DETECTABLE_SECRET_MATERIAL.search(value) is not None
 
 
 def _require_text_tuple(value: object, label: str) -> None:

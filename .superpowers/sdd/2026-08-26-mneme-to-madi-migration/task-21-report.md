@@ -225,3 +225,53 @@ Round-2 files changed:
 Round-2 commit message: `fix: scan serialized session references for secrets`.
 No unresolved round-2 concern remains. Captured test logs and the exact fresh
 base-temp directory are removed before the final clean-worktree audit.
+
+## Round 3: quote-aware assigned-value guard
+
+### Finding and correction
+
+Review of `83b4cf7` found that the deterministic assignment pattern admitted a
+quoted right-hand-side value.  For example,
+`API_KEY="SENSITIVE_SENTINEL"` did not satisfy the old immediate bare-token
+pattern, so it could reach the serialized Session content.  The issue applied
+at the shared Core admission point and therefore affected direct Core,
+Claude-adapter, and stdio checkpoint routes.
+
+The revised pattern parses a bounded assigned value as double-quoted,
+single-quoted, or bare text for the existing API/access/private-key label
+variants.  It allows only an exact, whole assigned value of `REDACTED` or
+`placeholder` (case-insensitive, with optional matching quotes); a placeholder
+prefix followed by additional material is still rejected.  The shared
+pre-admission scan continues to enumerate every host-controlled serialized
+Session string: body text, reference values, relation text, and relation
+provenance.  It does not inspect transcripts or infer semantics.  Its generic
+error remains closed, so neither Core nor either transport echoes the matched
+value, and rejection occurs before artifact creation or registry mutation.
+
+### Red-green and verification evidence
+
+| Command/result | Outcome |
+|---|---|
+| Quote-wrapped credential and placeholder regressions before the correction | Expected RED: quoted assignment values were not recognized by the previous bare-token matcher. |
+| Selected Core quote/placeholder/security cases | 21 passed. |
+| Selected Claude adapter quote/reference cases | 5 passed. |
+| Selected stdio quote/reference cases | 4 passed. |
+| `python -m pytest tests/adapters/test_claude.py tests/core/test_contracts.py tests/transports/test_mcp_stdio.py -q` | 108 passed in 123.33s. |
+| `python -m pytest tests/core/test_sessions.py tests/core/test_contracts.py tests/core/test_policy_staleness.py tests/core/test_storage.py -q` | 94 passed in 220.62s. |
+| First full suite: `python -m pytest -q --basetemp .pytest-task21-r3-full` | 594 passed, then one setup-only `WinError 5` while `Vault.initialize` renamed its temporary Doctor fixture directory before `test_doctor_never_repairs_an_injected_external_index_path` executed (1197.37s). No matcher test failed. |
+| Retried full suite in the same foreground process: `python -m pytest -q --basetemp .pytest-task21-r3-full-retry` | 595 passed in 1116.61s (18:36), exit 0. |
+
+### Round-3 files and concern disposition
+
+- `mneme/core/sessions.py`
+- `tests/core/test_contracts.py`
+- `tests/adapters/test_claude.py`
+- `tests/transports/test_mcp_stdio.py`
+- `task-21-report.md`
+
+The first full-run error was investigated as a Windows filesystem setup flake:
+the error arose in `Vault.initialize` before the Doctor test body and the exact
+test passed as part of the subsequent clean full retry.  No production retry or
+Doctor behavior was changed.  The retry is the definitive full-suite evidence.
+Exact Task 21 round-3 pytest base-temp directories and captured logs are removed
+after this report update; no Python test process remains.
