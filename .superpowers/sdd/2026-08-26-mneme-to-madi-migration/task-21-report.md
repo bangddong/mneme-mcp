@@ -89,3 +89,71 @@ Commit message: `feat: add opt-in non-blocking Claude adapter`.
 No unresolved Task 21 concern remains. The invalid first full-suite invocation is
 documented above and intentionally not used as test evidence; the replacement
 foreground invocation is the definitive result.
+
+## Round 1: checkpoint privacy and file-confinement hardening
+
+### Findings and root cause
+
+Two review findings were reproduced from the clean `a39780d` baseline. A
+detectable `API_KEY=SENSITIVE_SENTINEL` in an otherwise valid checkpoint body
+passed schema and policy validation, then persisted through the Claude adapter,
+direct `CoreService.execute`, and `madi_checkpoint`. Session body validation had
+no deterministic credential guard before `SessionStore.create_revision` wrote the
+immutable artifact and advanced its head.
+
+The adapter also treated the entire system temporary directory as its default
+checkpoint trust root. Its path checks therefore accepted a sibling temporary
+project. It read a validated path by name, which also permitted a hard-link alias
+inside the project to outside content.
+
+### Red-green evidence
+
+| Command/result | Outcome |
+|---|---|
+| New adapter/Core/stdio/confinement regressions against `a39780d` | Expected RED: 6 failures. Secret checkpoint writes succeeded for adapter, portable Core, local-only Core, and stdio; sibling system-temp and hard-link aliases also succeeded. One stdio fixture setup error was corrected before its own RED assertion was re-run. |
+| Corrected stdio secret regression alone | Expected RED: checkpoint result was successful. |
+| Secret regressions after the `SessionStore` guard | 5 passed: adapter, portable and local-only Core, stdio, plus a non-secret mention of credential detection. |
+| Confinement regressions after explicit-root/descriptor validation | 5 passed: project-root positive, configured temporary-root positive, configured-outside rejection, system-temp sibling rejection, and hard-link rejection. |
+| Adapter/installer plus Task 20 contracts/stdio | 68 passed in 37.63s. |
+| Task 19 policy-staleness, Session, and storage privacy boundaries | 94 passed in 141.24s. |
+| Foreground full suite: `python -m pytest -q --basetemp '.pytest-task21-r1-full'` | 555 passed in 1097.92s (18:17), exit 0. |
+
+### Implementation and review
+
+`SessionStore.create_revision` now rejects bounded, explicit detectable
+credential/token/Bearer/private-key patterns across the durable semantic Session
+fields before policy admission, artifact creation, registry generation change, or
+head update. It applies to both portable and local-only Session storage; it does
+not use an LLM or scan a raw transcript, and a descriptive sentence about the
+credential detector remains valid.
+
+`ClaudeAdapter` now defaults to the explicitly supplied project root only. A
+temporary checkpoint root must be explicitly configured. Its checkpoint reader
+rejects links and multi-linked regular files, re-checks lexical path safety,
+opens a descriptor with no-follow support where available, and compares regular
+file identity, size, modification time, and link count before and after reading.
+All adapter error results remain closed, non-blocking, and path/secret-free.
+
+Round-1 files changed:
+
+- `mneme/core/sessions.py`
+- `mneme/adapters/claude.py`
+- `tests/core/test_contracts.py`
+- `tests/transports/test_mcp_stdio.py`
+- `tests/adapters/test_claude.py`
+- `task-21-report.md`
+
+### Round-1 requirement matrix and handoff
+
+| Requirement | Evidence |
+|---|---|
+| Detectable credentials never reach a Session revision | The central `SessionStore.create_revision` guard rejects them before admission or storage; adapter, direct portable/local-only Core, and stdio no-write regressions pass. |
+| No broad transcript prohibition | A descriptive, non-secret reference to credential detection still creates a revision. |
+| Checkpoint confinement | Project-root checkpoints remain valid; a configured temporary root is the sole optional extension. Sibling system-temp and configured-outside paths are rejected. |
+| Link/race-resistant read | Symlink/reparse rejection, one-link requirement, checked descriptor read, and pre/post identity checks protect the checkpoint read; the hard-link regression passes where hard links are supported. |
+| Closed failure surface | Adapter errors remain non-blocking and omit both the checkpoint path and detected credential. |
+
+Round-1 commit message: `fix: protect checkpoint secrets and file confinement`.
+No unresolved round-1 concern remains. The full-run temporary directory, including
+test-created nested repositories, was removed with an exact-path `git clean -ffdx`;
+no Python process or test log remains.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -119,23 +120,113 @@ def test_host_composed_checkpoint_file_issues_only_the_core_revision_command(
     assert str(checkpoint) not in json.dumps(result.as_dict())
 
 
+def test_adapter_rejects_detectable_secret_checkpoint_without_writing_or_echoing(
+    service, project
+):
+    """Catches a secret-bearing checkpoint reaching the portable Session writer."""
+    from mneme.adapters.claude import ClaudeAdapter
+
+    checkpoint = project / ".madi" / "checkpoints" / "secret.json"
+    payload = _checkpoint_payload()
+    payload["body"]["current_state"] = "API_KEY=SENSITIVE_SENTINEL"
+    _write_checkpoint(checkpoint, payload)
+
+    result = ClaudeAdapter(service, project_root=project).handle(
+        _envelope(checkpoint_file=str(checkpoint))
+    )
+
+    encoded = json.dumps(result.as_dict())
+    assert result.ok is False
+    assert result.block_host is False
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert str(checkpoint) not in encoded
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+
+
+def test_adapter_accepts_checkpoint_under_an_explicit_configured_temp_root(
+    service, project, tmp_path
+):
+    """Catches an explicit narrow temporary checkpoint root being rejected."""
+    from mneme.adapters.claude import ClaudeAdapter
+
+    temp_root = tmp_path / "madi-checkpoints"
+    temp_root.mkdir()
+    checkpoint = temp_root / "selected.json"
+    _write_checkpoint(checkpoint, _checkpoint_payload())
+
+    result = ClaudeAdapter(
+        service, project_root=project, temp_root=temp_root
+    ).handle(_envelope(checkpoint_file=str(checkpoint)))
+
+    assert result.ok is True
+    assert result.command_result is not None
+    assert str(checkpoint) not in json.dumps(result.as_dict())
+
+
 def test_checkpoint_file_must_be_under_the_project_or_configured_temp_root(
     service, project, tmp_path
 ):
     """Catches a native envelope using an arbitrary host path as Core input."""
     from mneme.adapters.claude import ClaudeAdapter
 
+    temp_root = tmp_path / "adapter-temp"
+    temp_root.mkdir()
     outside = tmp_path / "outside.json"
     _write_checkpoint(outside, _checkpoint_payload())
 
     result = ClaudeAdapter(
-        service, project_root=project, temp_root=tmp_path / "adapter-temp"
+        service, project_root=project, temp_root=temp_root
     ).handle(_envelope(checkpoint_file=str(outside)))
 
     assert result.ok is False
     assert result.block_host is False
     assert result.warning == "Madi could not use the selected checkpoint; continue ordinary Claude work."
     assert str(outside) not in json.dumps(result.as_dict())
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+
+
+def test_adapter_does_not_trust_a_sibling_system_temp_checkpoint_by_default(
+    service, project, tmp_path
+):
+    """Catches the full system temporary directory becoming an implicit trust root."""
+    from mneme.adapters.claude import ClaudeAdapter
+
+    sibling_checkpoint = tmp_path / "sibling-project-checkpoint.json"
+    _write_checkpoint(sibling_checkpoint, _checkpoint_payload())
+
+    result = ClaudeAdapter(service, project_root=project).handle(
+        _envelope(checkpoint_file=str(sibling_checkpoint))
+    )
+
+    encoded = json.dumps(result.as_dict())
+    assert result.ok is False
+    assert result.block_host is False
+    assert str(sibling_checkpoint) not in encoded
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+
+
+def test_adapter_rejects_a_hard_linked_checkpoint_alias(service, project, tmp_path):
+    """Catches an outside checkpoint gaining project trust through a hard link."""
+    from mneme.adapters.claude import ClaudeAdapter
+
+    outside = tmp_path / "outside-content.json"
+    _write_checkpoint(outside, _checkpoint_payload())
+    alias = project / ".madi" / "checkpoints" / "alias.json"
+    alias.parent.mkdir(parents=True)
+    try:
+        os.link(outside, alias)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc.__class__.__name__}")
+
+    result = ClaudeAdapter(service, project_root=project).handle(
+        _envelope(checkpoint_file=str(alias))
+    )
+
+    encoded = json.dumps(result.as_dict())
+    assert result.ok is False
+    assert result.block_host is False
+    assert str(alias) not in encoded
+    assert str(outside) not in encoded
     assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
 
 

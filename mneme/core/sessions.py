@@ -40,6 +40,16 @@ from mneme.core.validation.vault import validate_identifier
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
+_DETECTABLE_SECRET = re.compile(
+    r"""(?ix)
+    (?:
+        \b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|password|passwd|token)\b
+        \s*(?:=|:)\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{8,}
+      | \bbearer\s+[A-Za-z0-9._~+/=-]{8,}
+      | -----BEGIN(?:\s+[A-Z0-9]+)?\s+PRIVATE\s+KEY-----
+    )
+    """
+)
 @dataclass(frozen=True, slots=True)
 class SessionRevisionRef:
     session: str
@@ -193,6 +203,7 @@ class SessionStore:
             raise InvalidArtifact("create_revision requires a CheckpointRequest")
         if request.storage_class is not self.storage_class:
             raise InvalidArtifact("checkpoint storage class does not match SessionStore")
+        _reject_detectable_secrets(request.body, request.relations)
         # Lock order is admission gate then any ArtifactStore path lock.  Do not
         # call registry mutation APIs here: head advancement intentionally runs
         # after release so a later conflict leaves a doctor-visible orphan.
@@ -701,6 +712,31 @@ def _require_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise InvalidArtifact(f"session {label} must be non-empty trimmed text")
     return value
+
+
+def _reject_detectable_secrets(
+    body: SessionBody, relations: tuple[SessionRelation, ...]
+) -> None:
+    """Keep recognizable credentials out of every durable Session storage class."""
+    values = [
+        body.objective,
+        body.current_state,
+        *body.verified_facts,
+        *body.completed_work,
+        *body.blockers,
+        *body.next_actions,
+    ]
+    for relation in relations:
+        values.extend(
+            (
+                relation.target,
+                relation.purpose,
+                relation.required_context,
+                relation.next_action,
+            )
+        )
+    if any(_DETECTABLE_SECRET.search(value) for value in values):
+        raise InvalidArtifact("checkpoint contains a detectable credential")
 
 
 def _require_text_tuple(value: object, label: str) -> None:

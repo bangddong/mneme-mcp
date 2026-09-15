@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import os
 from pathlib import Path, PureWindowsPath
 import stat
-import tempfile
 from typing import Any
 
 from mneme.adapters.base import AdapterEnvelope, AdapterResult
@@ -120,15 +120,7 @@ class ClaudeAdapter:
         """Read a bounded host-composed JSON object without forwarding its path."""
         checkpoint = self._safe_checkpoint_path(envelope.checkpoint_file)
         try:
-            if checkpoint.suffix.lower() != ".json" or is_symlink_or_reparse(checkpoint):
-                raise InvalidArtifact("checkpoint is not a safe JSON file")
-            metadata = checkpoint.stat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_CHECKPOINT_BYTES:
-                raise InvalidArtifact("checkpoint is not a bounded regular file")
-            # Repeat the lexical chain check immediately before opening the host file.
-            validate_path_chain(checkpoint, allow_missing=False)
-            with checkpoint.open("rb") as stream:
-                raw = stream.read(_MAX_CHECKPOINT_BYTES + 1)
+            raw = self._read_checkpoint_bytes(checkpoint)
         except (OSError, ValueError) as exc:
             raise InvalidArtifact("checkpoint cannot be read safely") from exc
         if len(raw) > _MAX_CHECKPOINT_BYTES:
@@ -150,15 +142,53 @@ class ClaudeAdapter:
             raise InvalidArtifact("checkpoint adapter identity is invalid")
         return dict(payload)
 
+    @staticmethod
+    def _read_checkpoint_bytes(checkpoint: Path) -> bytes:
+        """Read one trusted single-link file through a checked descriptor."""
+        if checkpoint.suffix.lower() != ".json" or is_symlink_or_reparse(checkpoint):
+            raise InvalidArtifact("checkpoint is not a safe JSON file")
+        # Repeat the lexical check immediately before opening. A descriptor then
+        # pins the actual file read; its identity is checked before and after I/O.
+        validate_path_chain(checkpoint, allow_missing=False)
+        before = os.lstat(checkpoint)
+        _validate_checkpoint_metadata(before)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(checkpoint, flags)
+        try:
+            opened = os.fstat(descriptor)
+            _validate_checkpoint_metadata(opened)
+            if not _same_checkpoint_file(before, opened):
+                raise InvalidArtifact("checkpoint changed before it could be opened")
+            raw = bytearray()
+            while len(raw) <= _MAX_CHECKPOINT_BYTES:
+                chunk = os.read(descriptor, _MAX_CHECKPOINT_BYTES + 1 - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        _validate_checkpoint_metadata(after)
+        validate_path_chain(checkpoint, allow_missing=False)
+        path_after = os.lstat(checkpoint)
+        _validate_checkpoint_metadata(path_after)
+        if not (
+            _same_checkpoint_file(before, after)
+            and _same_checkpoint_file(before, path_after)
+        ):
+            raise InvalidArtifact("checkpoint changed while it was read")
+        return bytes(raw)
+
     def _safe_checkpoint_path(self, value: str | None) -> Path:
         if not isinstance(value, str) or "\x00" in value:
             raise InvalidArtifact("checkpoint path is invalid")
         requested = Path(value)
         windows_requested = PureWindowsPath(value)
         project_root = self._configured_root(self._project_root, required=False)
-        temp_root = self._configured_root(
-            tempfile.gettempdir() if self._temp_root is None else self._temp_root,
-            required=True,
+        temp_root = (
+            None
+            if self._temp_root is None
+            else self._configured_root(self._temp_root, required=True)
         )
         if requested.is_absolute() or windows_requested.is_absolute() or windows_requested.drive:
             candidate = requested
@@ -216,6 +246,25 @@ def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate JSON object field")
         value[key] = item
     return value
+
+
+def _validate_checkpoint_metadata(metadata: os.stat_result) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > _MAX_CHECKPOINT_BYTES
+        or metadata.st_nlink != 1
+    ):
+        raise InvalidArtifact("checkpoint is not a bounded single-link regular file")
+
+
+def _same_checkpoint_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_nlink == second.st_nlink
+    )
 
 
 def _unwrap_checkpoint(value: object) -> Mapping[str, Any]:

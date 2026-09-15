@@ -43,6 +43,59 @@ def _command(name: str, payload: dict[str, object]):
     return CoreCommand(version=1, name=name, payload=payload)
 
 
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+def test_checkpoint_rejects_detectable_credentials_before_any_session_write(
+    service, storage_class, workstream_id
+):
+    """Catches credentials entering durable portable or local-only Session revisions."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    RegistryStore(service.vault, selected_class).create_workstream(
+        workstream_id, project=None, mode="parallel"
+    )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["current_state"] = "API_KEY=SENSITIVE_SENTINEL"
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    encoded = json.dumps(result.as_dict())
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.error.code == "invalid-artifact"
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
+def test_checkpoint_allows_a_non_secret_reference_to_credential_detection(service):
+    """Catches the deterministic guard becoming a broad transcript-content ban."""
+    from mneme.core.registries import RegistryStore
+
+    RegistryStore(service.vault).create_workstream("ws-1", project=None, mode="parallel")
+    payload = _checkpoint_payload()
+    payload["body"]["verified_facts"] = [
+        "The API key detector rejects detectable credentials before persistence."
+    ]
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    assert result.ok is True
+    assert result.result["revision"] == "000001"
+
+
 def test_lifecycle_event_cannot_mutate_core(service):
     """Catches pre-compact observation being treated as an implicit checkpoint."""
     from mneme.core.contracts import LifecycleEvent

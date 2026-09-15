@@ -126,6 +126,22 @@ def test_direct_handler_errors_are_closed_and_hide_raw_input(service, tmp_path):
     assert set(result["error"]) == {"code", "message"}
 
 
+def test_madi_checkpoint_rejects_detectable_credentials_without_writing(service):
+    """Catches stdio bypassing the Core secret guard for durable checkpoints."""
+    from mneme.transports.mcp_stdio import create_app
+
+    payload = _checkpoint_payload()
+    payload["body"]["current_state"] = "API_KEY=SENSITIVE_SENTINEL"
+
+    result = _handler(create_app(service), "madi_checkpoint")(payload)
+
+    encoded = json.dumps(result)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid-artifact"
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+
+
 def test_importing_core_does_not_require_fastmcp():
     """Catches a transport dependency entering the import-safe Core boundary."""
     script = r'''
