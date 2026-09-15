@@ -157,3 +157,71 @@ Round-1 commit message: `fix: protect checkpoint secrets and file confinement`.
 No unresolved round-1 concern remains. The full-run temporary directory, including
 test-created nested repositories, was removed with an exact-path `git clean -ffdx`;
 no Python process or test log remains.
+
+## Round 2: complete serialized-reference and label secret guard
+
+### Findings and root cause
+
+Review against clean `134bedf` found that the deterministic guard only inspected
+free-text Session fields. `ArtifactReference.value` is also serialized into a
+Session's front matter, Markdown body, and reference manifest, but a
+credential-bearing `label` value was omitted from the pre-admission scan. The
+same omission applied to an `ArtifactReference` carried by relation provenance.
+Thus direct portable/local Core, Claude adapter, and actual stdio checkpoints
+could persist `API_KEY=SENSITIVE_SENTINEL` in `source_refs` and advance the
+corresponding workstream head.
+
+The bounded label pattern accepted underscore/hyphen spelling only. It did not
+recognize common `API KEY`, `API Key`, `access key`, or `private_key` labels when
+followed by an assigned secret value.
+
+### Red-green evidence
+
+| Command/result | Outcome |
+|---|---|
+| New direct Core serialized-reference and spaced-label regressions against `134bedf` | Expected RED: 12 failures. Source and relation-provenance reference values wrote portable and local-only revisions; four common spaced/private-key labels wrote in both storage classes. |
+| Direct Core source-reference case with `-x -vv` | Expected RED: `CommandResult.ok` was `True` and revision `000001` was created instead of the requested closed rejection. |
+| New adapter serialized-reference regressions | Expected RED: 2 failures (portable and local-only): adapter returned success and wrote a revision. |
+| New actual stdio serialized-reference regressions | Expected RED: 2 failures (portable and local-only): `madi_checkpoint` returned success and wrote a revision. |
+| Core serialized references, four label variants in both storage classes, and non-secret reminder | 13 passed in 12.86s. |
+| Adapter secret/reference/confinement subset | 4 passed in 3.75s. |
+| Stdio direct secret/reference subset | 3 passed in 5.97s. |
+| Adapter, installer, Task 20 contracts, and stdio | 84 passed in 80.16s. |
+| Task 19 policy-staleness, Session, and storage privacy boundaries | 94 passed in 235.39s. |
+| Fresh retained logged full suite: `python -m pytest -q --basetemp .pytest-task21-r2-full` | 571 passed in 1310.81s (21:50). |
+
+### Implementation and self-review
+
+The central `SessionStore.create_revision` guard now enumerates every
+host-controlled canonical string that reaches durable Session content: the
+adapter id and semantic text, `source_refs` string values, every relation text
+field, relation `ArtifactReference` provenance values, and typed provenance
+kind/id values. It still runs before policy admission, artifact creation,
+registry generation change, or head advancement, and therefore protects direct
+Core, adapter, and stdio routes for both portable and local-only Sessions.
+
+Its deterministic expression now recognizes space, underscore, hyphen, and
+case variants for API/access/auth/client/private key labels, while retaining the
+assignment-and-bounded-value requirement. PEM private-key headers remain
+detectable. A non-secret sentence that reminds a host to configure a credential
+continues to be accepted, so this is neither an LLM check nor a broad prose or
+transcript scan. Error envelopes remain closed and do not echo the matched value.
+
+| Requirement | Evidence |
+|---|---|
+| Reference-value secrets cannot persist | Source and relation provenance regressions require no artifact, generation, or head change in portable and local-only Core. Adapter and actual stdio assert the same path remains closed. |
+| Common label spelling cannot evade detection | `API KEY=`, `API Key:`, `access key=`, and `private_key:` forms all reject before a write in both storage classes. |
+| Non-secret reminder remains valid | The established detector-description checkpoint is retained in the 13-test green run. |
+| Round-1 confinement remains intact | The adapter subset includes the existing hard-link rejection alongside new guard coverage. |
+
+Round-2 files changed:
+
+- `mneme/core/sessions.py`
+- `tests/core/test_contracts.py`
+- `tests/adapters/test_claude.py`
+- `tests/transports/test_mcp_stdio.py`
+- `task-21-report.md`
+
+Round-2 commit message: `fix: scan serialized session references for secrets`.
+No unresolved round-2 concern remains. Captured test logs and the exact fresh
+base-temp directory are removed before the final clean-worktree audit.

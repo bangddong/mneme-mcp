@@ -43,7 +43,7 @@ _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _DETECTABLE_SECRET = re.compile(
     r"""(?ix)
     (?:
-        \b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret|password|passwd|token)\b
+        \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
         \s*(?:=|:)\s*(?:bearer\s+)?[A-Za-z0-9._~+/=-]{8,}
       | \bbearer\s+[A-Za-z0-9._~+/=-]{8,}
       | -----BEGIN(?:\s+[A-Z0-9]+)?\s+PRIVATE\s+KEY-----
@@ -719,6 +719,7 @@ def _reject_detectable_secrets(
 ) -> None:
     """Keep recognizable credentials out of every durable Session storage class."""
     values = [
+        body.adapter_id,
         body.objective,
         body.current_state,
         *body.verified_facts,
@@ -726,15 +727,27 @@ def _reject_detectable_secrets(
         *body.blockers,
         *body.next_actions,
     ]
+    values.extend(
+        reference.value
+        for reference in body.source_refs
+        if isinstance(reference.value, str)
+    )
     for relation in relations:
         values.extend(
             (
+                relation.kind,
                 relation.target,
                 relation.purpose,
                 relation.required_context,
                 relation.next_action,
             )
         )
+        for provenance in relation.provenance_refs:
+            if isinstance(provenance, ArtifactReference):
+                if isinstance(provenance.value, str):
+                    values.append(provenance.value)
+            else:
+                values.extend((provenance.kind, provenance.id))
     if any(_DETECTABLE_SECRET.search(value) for value in values):
         raise InvalidArtifact("checkpoint contains a detectable credential")
 

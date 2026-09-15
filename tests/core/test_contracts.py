@@ -80,6 +80,105 @@ def test_checkpoint_rejects_detectable_credentials_before_any_session_write(
     assert registry.active_heads == ()
 
 
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+@pytest.mark.parametrize("reference_location", ["source", "relation-provenance"])
+def test_checkpoint_rejects_detectable_credentials_in_serialized_references_before_writing(
+    service, storage_class, workstream_id, reference_location
+):
+    """Catches a credential carried by a persisted reference value."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    RegistryStore(service.vault, selected_class).create_workstream(
+        workstream_id, project=None, mode="parallel"
+    )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    reference = {
+        "kind": "label",
+        "storage_class": "portable",
+        "value": "API_KEY=SENSITIVE_SENTINEL",
+    }
+    if reference_location == "source":
+        payload["body"]["source_refs"] = [reference]
+    else:
+        payload["relations"] = [
+            {
+                "kind": "handoff",
+                "target": "next-agent",
+                "purpose": "Continue the approved work.",
+                "required_context": "Use the explicit checkpoint.",
+                "next_action": "Resume the bounded task.",
+                "provenance_refs": [reference],
+            }
+        ]
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    encoded = json.dumps(result.as_dict())
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.error.code == "invalid-artifact"
+    assert "SENSITIVE_SENTINEL" not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "API KEY=SENSITIVE_SENTINEL",
+        "API Key: SENSITIVE_SENTINEL",
+        "access key=SENSITIVE_SENTINEL",
+        "private_key: SENSITIVE_SENTINEL",
+    ],
+)
+def test_checkpoint_rejects_common_spaced_credential_labels_before_writing(
+    service, storage_class, workstream_id, credential
+):
+    """Catches common separator variants evading the deterministic secret guard."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    RegistryStore(service.vault, selected_class).create_workstream(
+        workstream_id, project=None, mode="parallel"
+    )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["current_state"] = credential
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.error.code == "invalid-artifact"
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
 def test_checkpoint_allows_a_non_secret_reference_to_credential_detection(service):
     """Catches the deterministic guard becoming a broad transcript-content ban."""
     from mneme.core.registries import RegistryStore
