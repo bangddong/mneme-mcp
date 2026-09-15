@@ -232,6 +232,37 @@ def test_madi_checkpoint_rejects_quoted_credential_reference_without_writing(
     assert registry.active_heads == ()
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "API_KEY='SENSITIVE_SENTINEL",
+        'API_KEY="SENSITIVE_SENTINEL\'',
+        "API_KEY='SENSITIVE_\rSENTINEL'",
+    ],
+    ids=("unterminated-single", "mismatched-double", "cr-split"),
+)
+def test_madi_checkpoint_rejects_malformed_quoted_credential_without_writing(
+    service, credential
+):
+    """Catches stdio persisting malformed quoted credentials through Core."""
+    from mneme.core.registries import RegistryStore
+    from mneme.transports.mcp_stdio import create_app
+
+    payload = _checkpoint_payload()
+    payload["body"]["current_state"] = credential
+
+    result = _handler(create_app(service), "madi_checkpoint")(payload)
+
+    encoded = json.dumps(result)
+    registry = RegistryStore(service.vault).load_workstream("ws-1")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "invalid-artifact"
+    assert "SENSITIVE" not in encoded
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
 def test_importing_core_does_not_require_fastmcp():
     """Catches a transport dependency entering the import-safe Core boundary."""
     script = r'''

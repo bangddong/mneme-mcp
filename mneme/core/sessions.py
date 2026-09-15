@@ -40,14 +40,26 @@ from mneme.core.validation.vault import validate_identifier
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
-_DETECTABLE_ASSIGNMENT = re.compile(
-    r"""(?ix)
+_CREDENTIAL_ASSIGNMENT_PREFIX = r"""
     \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
     \s*(?:=|:)\s*
+"""
+_DETECTABLE_ASSIGNMENT = re.compile(
+    rf"""(?ix)
+    {_CREDENTIAL_ASSIGNMENT_PREFIX}
     (?:
         "(?P<double_value>[^"\r\n]+)"
       | '(?P<single_value>[^'\r\n]+)'
       | (?P<bare_value>[A-Za-z0-9._~+/=-]+)
+    )
+    """
+)
+_MALFORMED_QUOTED_ASSIGNMENT = re.compile(
+    rf"""(?ix)
+    {_CREDENTIAL_ASSIGNMENT_PREFIX}
+    (?:
+        "[^"\r\n]*(?:\r|\n|\Z)
+      | '[^'\r\n]*(?:\r|\n|\Z)
     )
     """
 )
@@ -765,6 +777,8 @@ def _reject_detectable_secrets(
 
 def _contains_detectable_secret(value: str) -> bool:
     """Match bounded assigned values while allowing exact redaction reminders."""
+    if _MALFORMED_QUOTED_ASSIGNMENT.search(value) is not None:
+        return True
     for match in _DETECTABLE_ASSIGNMENT.finditer(value):
         assigned = next(
             captured

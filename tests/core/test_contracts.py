@@ -230,6 +230,62 @@ def test_checkpoint_rejects_quoted_credential_assignments_before_writing(
     [("portable", "ws-1"), ("local-only", "ws-local")],
 )
 @pytest.mark.parametrize(
+    "credential",
+    [
+        'API_KEY="SENSITIVE_SENTINEL',
+        "API_KEY='SENSITIVE_SENTINEL",
+        'API_KEY="SENSITIVE_SENTINEL\'',
+        "API_KEY='SENSITIVE_SENTINEL\"",
+        'API_KEY="SENSITIVE_\nSENTINEL"',
+        "API_KEY='SENSITIVE_\rSENTINEL'",
+    ],
+    ids=(
+        "unterminated-double",
+        "unterminated-single",
+        "mismatched-double",
+        "mismatched-single",
+        "lf-split",
+        "cr-split",
+    ),
+)
+def test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writing(
+    service, storage_class, workstream_id, credential
+):
+    """Catches malformed quoted assignments bypassing atomic Core admission."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    RegistryStore(service.vault, selected_class).create_workstream(
+        workstream_id, project=None, mode="parallel"
+    )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["current_state"] = credential
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    encoded = json.dumps(result.as_dict())
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.error.code == "invalid-artifact"
+    assert "SENSITIVE" not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+@pytest.mark.parametrize(
     "reminder",
     [
         "API key: REDACTED",
@@ -272,12 +328,14 @@ def test_checkpoint_allows_explicit_whole_placeholder_assignments(
     [
         'API_KEY="placeholder-SENSITIVE_SENTINEL"',
         "API Key: 'REDACTED-SENSITIVE_SENTINEL'",
+        'API_KEY="SENSITIVE_SENTINEL-placeholder"',
+        "API Key: 'SENSITIVE_SENTINEL-REDACTED'",
     ],
 )
-def test_checkpoint_rejects_placeholder_prefixes_with_extra_secret_material(
+def test_checkpoint_rejects_placeholder_tokens_with_extra_secret_material(
     service, storage_class, workstream_id, credential
 ):
-    """Catches a placeholder allowance accepting a longer assigned secret."""
+    """Catches a placeholder allowance accepting extra material on either side."""
     from mneme.core.artifacts import StorageClass
     from mneme.core.registries import RegistryStore
 
@@ -305,15 +363,22 @@ def test_checkpoint_rejects_placeholder_prefixes_with_extra_secret_material(
     assert registry.active_heads == ()
 
 
-def test_checkpoint_allows_a_non_secret_reference_to_credential_detection(service):
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "The API key detector rejects detectable credentials before persistence.",
+        "The quoted credential parser rejects malformed input before persistence.",
+    ],
+)
+def test_checkpoint_allows_a_non_secret_reference_to_credential_detection(
+    service, statement
+):
     """Catches the deterministic guard becoming a broad transcript-content ban."""
     from mneme.core.registries import RegistryStore
 
     RegistryStore(service.vault).create_workstream("ws-1", project=None, mode="parallel")
     payload = _checkpoint_payload()
-    payload["body"]["verified_facts"] = [
-        "The API key detector rejects detectable credentials before persistence."
-    ]
+    payload["body"]["verified_facts"] = [statement]
 
     result = service.execute(_command("create_session_revision", payload))
 

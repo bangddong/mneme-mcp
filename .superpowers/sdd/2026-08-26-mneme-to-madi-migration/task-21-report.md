@@ -275,3 +275,66 @@ test passed as part of the subsequent clean full retry.  No production retry or
 Doctor behavior was changed.  The retry is the definitive full-suite evidence.
 Exact Task 21 round-3 pytest base-temp directories and captured logs are removed
 after this report update; no Python test process remains.
+
+## Round 4: fail closed on malformed quoted assignments
+
+### Finding and root cause
+
+Review of clean `6e58e44` reproduced a fourth deterministic-guard bypass.  The
+assignment expression recognized a quoted value only when its matching closing
+quote occurred on the same line.  Its bare-value alternative could not consume
+an opening quote.  Consequently double- or single-quoted assignments that were
+unterminated, ended with the other quote type, or crossed CR/LF were not rejected
+at central admission.  Direct Core, Claude-adapter, and stdio calls could create
+a revision; the CR cases could write the artifact and only then surface a later
+registry conflict.
+
+The correction factors the existing bounded credential-label and assignment
+delimiter into one shared expression fragment.  A second bounded matcher now
+recognizes an opening single or double quote that reaches CR, LF, or end of
+string without the corresponding closing quote and fails closed before policy
+admission or storage.  The existing matched-quote and bare-value parser remains
+responsible for assigned values, including its case-insensitive allowance for
+only exact whole values of `REDACTED` and `placeholder`.  No semantic inference,
+transcript scanning, or error echo was added.
+
+### Red-green and verification evidence
+
+| Command/result | Outcome |
+|---|---|
+| New malformed-quote regressions against `6e58e44`: `python -m pytest tests/core/test_contracts.py::test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writing tests/adapters/test_claude.py::test_adapter_rejects_malformed_quoted_credential_without_writing tests/transports/test_mcp_stdio.py::test_madi_checkpoint_rejects_malformed_quoted_credential_without_writing -q` | Expected RED: 18 failed in 33.97s. Both storage classes and all six Core forms bypassed; representative Claude and stdio forms also bypassed. |
+| Same command after the central matcher correction | 18 passed in 17.54s. |
+| Core/adaptor/stdio secret, reference, quote, placeholder, and prose slices | 68 passed (52 Core, 8 Claude, 8 stdio). |
+| `python -m pytest tests/adapters/test_claude.py tests/core/test_contracts.py tests/transports/test_mcp_stdio.py -q` | 120 passed in 111.17s. |
+| `python -m pytest tests/core/test_sessions.py tests/core/test_policy_staleness.py tests/core/test_storage.py -q` | 94 passed in 197.61s. |
+| `python -m pytest -q --basetemp .pytest-task21-r4-full` | 618 passed in 1334.04s (22:14), exit 0. |
+| `git diff --check` | Clean; no whitespace errors. |
+
+### Self-review and requirement matrix
+
+| Requirement | Evidence |
+|---|---|
+| Unterminated and mismatched single/double quotes fail closed | Direct Core covers both quote types and both mismatch directions in portable and local-only storage; Claude and stdio cover representative forms. |
+| CR/LF-split quoted values fail closed | Direct Core covers isolated CR and LF in both storage classes; Claude covers LF and stdio covers CR. |
+| Matching quotes and placeholders retain their bounded behavior | Existing matching-quote cases remain green. Exact quoted and unquoted placeholders remain accepted; new cases reject extra secret material before or after a placeholder token. |
+| Normal prose is not semantically scanned | Two descriptive credential-detector statements without an assignment remain accepted. |
+| Every serialized Session string stays guarded centrally | `_reject_detectable_secrets` retains the complete body, source-reference, relation, and relation-provenance traversal and invokes the corrected matcher for each string. |
+| Rejection is atomic and closed | Tests assert `invalid-artifact`, no secret/path echo, no revision artifact, registry generation zero, and no active head through Core and representative transports. |
+
+Mutation review confirmed that removing either malformed quote branch, either
+line boundary, or the central call is caught by the new regressions.  The
+existing tests catch changes to bounded labels, matching quotes, placeholder
+whole-value handling, serialized-reference traversal, closed errors, and
+pre-write ordering.
+
+Round-4 files changed:
+
+- `mneme/core/sessions.py`
+- `tests/core/test_contracts.py`
+- `tests/adapters/test_claude.py`
+- `tests/transports/test_mcp_stdio.py`
+- `task-21-report.md`
+
+Round-4 commit message: `fix: fail closed on malformed quoted credentials`.
+No unresolved round-4 concern remains.  The exact full-suite base-temp directory
+is removed after verification; no test process or captured test log remains.
