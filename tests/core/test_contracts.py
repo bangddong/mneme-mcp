@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from time import perf_counter
 
 import pytest
 
@@ -279,6 +280,94 @@ def test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writi
     assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
     assert registry.generation == 0
     assert registry.active_heads == ()
+
+
+@pytest.mark.parametrize(
+    ("storage_class", "workstream_id"),
+    [("portable", "ws-1"), ("local-only", "ws-local")],
+)
+@pytest.mark.parametrize(
+    "credential",
+    [
+        'API_KEY="""SENSITIVE_SENTINEL',
+        "API_KEY='''SENSITIVE_SENTINEL",
+        'API_KEY=""SENSITIVE_SENTINEL"',
+        "API_KEY=''SENSITIVE_SENTINEL'",
+        'API_KEY="x"SENSITIVE_SENTINEL',
+        "API_KEY='x'SENSITIVE_SENTINEL",
+        'API_KEY="\'x\'"SENSITIVE_SENTINEL',
+        'API_KEY=\'"x"\'SENSITIVE_SENTINEL',
+        'API_KEY="x""SENSITIVE_SENTINEL"',
+        "API_KEY='x''SENSITIVE_SENTINEL'",
+        'API_KEY=""placeholder-SENSITIVE_SENTINEL',
+        "API_KEY='x'REDACTED-SENSITIVE_SENTINEL",
+        'API_KEY="""REDACTED"""',
+        "API_KEY='x'placeholder",
+        'API_KEY\r\n= "x"SENSITIVE_SENTINEL',
+    ],
+    ids=(
+        "triple-double",
+        "triple-single",
+        "empty-double-prefix",
+        "empty-single-prefix",
+        "adjacent-double",
+        "adjacent-single",
+        "nested-double",
+        "nested-single",
+        "multiple-double",
+        "multiple-single",
+        "empty-quote-placeholder-smuggling",
+        "short-quote-placeholder-smuggling",
+        "triple-quoted-placeholder-smuggling",
+        "adjacent-placeholder-smuggling",
+        "crlf-before-delimiter",
+    ),
+)
+def test_checkpoint_rejects_the_complete_credential_assignment_remainder(
+    service, storage_class, workstream_id, credential
+):
+    """Catches an initial quoted fragment hiding later credential material."""
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import RegistryStore
+
+    selected_class = StorageClass(storage_class)
+    RegistryStore(service.vault, selected_class).create_workstream(
+        workstream_id, project=None, mode="parallel"
+    )
+    payload = _checkpoint_payload()
+    payload["storage_class"] = storage_class
+    payload["workstream_id"] = workstream_id
+    payload["body"]["current_state"] = credential
+
+    result = service.execute(_command("create_session_revision", payload))
+
+    encoded = json.dumps(result.as_dict())
+    root = (
+        service.vault.root
+        if selected_class is StorageClass.PORTABLE
+        else service.vault.local_root / "overlays"
+    )
+    registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    assert result.ok is False
+    assert result.error.code == "invalid-artifact"
+    assert credential not in encoded
+    assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
+def test_credential_assignment_scan_has_a_linear_adversarial_bound():
+    """Catches quote parsing that backtracks over a bounded checkpoint-sized value."""
+    from mneme.core.sessions import _contains_detectable_secret
+
+    credential = "API_KEY=" + ("\"'" * (128 * 1024)) + "SENSITIVE_SENTINEL"
+
+    started = perf_counter()
+    detected = _contains_detectable_secret(credential)
+    elapsed = perf_counter() - started
+
+    assert detected is True
+    assert elapsed < 2.0
 
 
 @pytest.mark.parametrize(

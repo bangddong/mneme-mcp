@@ -279,6 +279,41 @@ def test_adapter_rejects_malformed_quoted_credential_without_writing(
     assert registry.active_heads == ()
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        'API_KEY="""SENSITIVE_SENTINEL',
+        'API_KEY="x"placeholder',
+    ],
+    ids=("triple-quote", "adjacent-placeholder-smuggling"),
+)
+def test_adapter_rejects_the_complete_credential_assignment_remainder(
+    service, project, credential
+):
+    """Catches Claude persisting material hidden after an initial quote fragment."""
+    from mneme.adapters.claude import ClaudeAdapter
+    from mneme.core.registries import RegistryStore
+
+    checkpoint = project / ".madi" / "checkpoints" / "fragmented-secret.json"
+    payload = _checkpoint_payload()
+    payload["body"]["current_state"] = credential
+    _write_checkpoint(checkpoint, payload)
+
+    result = ClaudeAdapter(service, project_root=project).handle(
+        _envelope(checkpoint_file=str(checkpoint))
+    )
+
+    encoded = json.dumps(result.as_dict())
+    registry = RegistryStore(service.vault).load_workstream("ws-1")
+    assert result.ok is False
+    assert result.block_host is False
+    assert credential not in encoded
+    assert str(checkpoint) not in encoded
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
+    assert registry.generation == 0
+    assert registry.active_heads == ()
+
+
 def test_adapter_accepts_checkpoint_under_an_explicit_configured_temp_root(
     service, project, tmp_path
 ):

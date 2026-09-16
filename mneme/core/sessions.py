@@ -40,27 +40,10 @@ from mneme.core.validation.vault import validate_identifier
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
-_CREDENTIAL_ASSIGNMENT_PREFIX = r"""
+_CREDENTIAL_ASSIGNMENT_PREFIX = re.compile(
+    r"""(?ix)
     \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
     \s*(?:=|:)\s*
-"""
-_DETECTABLE_ASSIGNMENT = re.compile(
-    rf"""(?ix)
-    {_CREDENTIAL_ASSIGNMENT_PREFIX}
-    (?:
-        "(?P<double_value>[^"\r\n]+)"
-      | '(?P<single_value>[^'\r\n]+)'
-      | (?P<bare_value>[A-Za-z0-9._~+/=-]+)
-    )
-    """
-)
-_MALFORMED_QUOTED_ASSIGNMENT = re.compile(
-    rf"""(?ix)
-    {_CREDENTIAL_ASSIGNMENT_PREFIX}
-    (?:
-        "[^"\r\n]*(?:\r|\n|\Z)
-      | '[^'\r\n]*(?:\r|\n|\Z)
-    )
     """
 )
 _DETECTABLE_SECRET_MATERIAL = re.compile(
@@ -73,6 +56,9 @@ _DETECTABLE_SECRET_MATERIAL = re.compile(
 )
 _PLACEHOLDER_SECRET_VALUES = frozenset({"redacted", "placeholder"})
 _MINIMUM_SECRET_VALUE_LENGTH = 8
+_MAX_CREDENTIAL_ASSIGNMENT_CHARS = 256 * 1024
+
+
 @dataclass(frozen=True, slots=True)
 class SessionRevisionRef:
     session: str
@@ -776,27 +762,46 @@ def _reject_detectable_secrets(
 
 
 def _contains_detectable_secret(value: str) -> bool:
-    """Match bounded assigned values while allowing exact redaction reminders."""
-    if _MALFORMED_QUOTED_ASSIGNMENT.search(value) is not None:
-        return True
-    for match in _DETECTABLE_ASSIGNMENT.finditer(value):
-        assigned = next(
-            captured
-            for captured in (
-                match["double_value"],
-                match["single_value"],
-                match["bare_value"],
-            )
-            if captured is not None
-        )
-        normalized = assigned.strip().casefold()
-        is_exact_placeholder = (
-            normalized in _PLACEHOLDER_SECRET_VALUES
-            and value[match.end():].strip() == ""
-        )
-        if len(normalized) >= _MINIMUM_SECRET_VALUE_LENGTH and not is_exact_placeholder:
+    """Inspect one complete bounded assignment remainder without backtracking."""
+    match = _CREDENTIAL_ASSIGNMENT_PREFIX.search(value)
+    if match is not None:
+        if "\r" in match[0] or "\n" in match[0]:
+            return True
+        if _assignment_remainder_contains_secret(value[match.end():]):
             return True
     return _DETECTABLE_SECRET_MATERIAL.search(value) is not None
+
+
+def _assignment_remainder_contains_secret(remainder: str) -> bool:
+    if len(remainder) > _MAX_CREDENTIAL_ASSIGNMENT_CHARS:
+        return True
+    if "\r" in remainder or "\n" in remainder:
+        return bool(remainder.strip())
+
+    assigned = remainder.strip()
+    if not assigned:
+        return False
+
+    if assigned[0] in {'"', "'"}:
+        quote = assigned[0]
+        other_quote = "'" if quote == '"' else '"'
+        if (
+            len(assigned) < 2
+            or assigned[-1] != quote
+            or assigned.count(quote) != 2
+            or other_quote in assigned[1:-1]
+        ):
+            return True
+        normalized = assigned[1:-1].strip().casefold()
+    else:
+        if '"' in assigned or "'" in assigned:
+            return True
+        normalized = assigned.casefold()
+
+    return (
+        len(normalized) >= _MINIMUM_SECRET_VALUE_LENGTH
+        and normalized not in _PLACEHOLDER_SECRET_VALUES
+    )
 
 
 def _require_text_tuple(value: object, label: str) -> None:
