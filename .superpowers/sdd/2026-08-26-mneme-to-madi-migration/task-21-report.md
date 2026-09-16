@@ -338,3 +338,73 @@ Round-4 files changed:
 Round-4 commit message: `fix: fail closed on malformed quoted credentials`.
 No unresolved round-4 concern remains.  The exact full-suite base-temp directory
 is removed after verification; no test process or captured test log remains.
+
+## Round 5: validate the complete credential assignment remainder
+
+### Finding and root cause
+
+Review of clean `7982107` found that the quote-aware expressions could accept a
+valid first quoted fragment without validating the remainder of the assignment.
+Triple quotes, an empty or short quoted fragment followed by secret material,
+nested opposite quotes, adjacent or repeated quoted fragments, and an exact
+placeholder followed by another token could therefore evade the deterministic
+guard.  Because the shared guard is the admission boundary for direct Core,
+Claude-adapter, and stdio requests, the bypass affected both portable and
+local-only Session writes.
+
+The correction retains the common bounded credential-label prefix, then parses
+the complete trimmed right-hand-side remainder in one pass.  A quoted remainder
+must contain exactly one matching outer pair, contain no opposite quote inside,
+and consume the whole remainder.  An unquoted remainder containing either quote
+fails closed.  CR/LF in the matched assignment prefix or non-empty remainder also
+fails closed.  Only the exact whole values `REDACTED` and `placeholder`, quoted or
+unquoted and case-insensitive, receive the existing reminder allowance; prefixes,
+suffixes, extra quotes, and following tokens do not.  Assignment remainders over
+256 KiB reject immediately, and all remaining operations are bounded linear
+scans.  The independent Bearer/private-key matcher and the complete serialized
+Session traversal are unchanged.
+
+### TDD and verification evidence
+
+The interrupted round-5 worker supplied the following retained TDD evidence,
+which was audited but is not represented as a fresh rerun: the initial focused
+regressions produced the expected 29/29 RED failures against `7982107`; the new
+Core slice then passed 29 tests, and the expanded Core/Claude/stdio slice passed
+35 after adding the CRLF-prefix case and representative transport coverage.
+
+Fresh verification in the replacement session:
+
+| Command/result | Outcome |
+|---|---|
+| `python -m pytest --collect-only -qq` | Exit 0; per-file collection counts total 653. |
+| `python -m pytest tests/adapters/test_claude.py tests/core/test_contracts.py tests/transports/test_mcp_stdio.py -q --basetemp .pytest-task21-r5-focused` | 155 passed in 154.05s. |
+| `python -m pytest tests/core/test_sessions.py tests/core/test_policy_staleness.py tests/core/test_storage.py -q --basetemp .pytest-task21-r5-privacy` | 94 passed in 216.83s. |
+| Full split A: Core search/filesystem, contracts, current overlay, doctor, fs, and Git sync, using `.pytest-task21-r5-split-a` | 221 passed in 1094.37s. |
+| Full split B: Core memory, policy, profile, recall, registry, reindex, resolver, Session, source, and Wiki-validation files, using `.pytest-task21-r5-split-b` | 208 passed in 399.08s. |
+| Full split C: adapter, characterization, storage, Vault, installer, migration, provider, CLI/top-level, and transport files, using `.pytest-task21-r5-split-c` | 224 passed in 129.19s. |
+
+The three explicit full-suite partitions are non-overlapping and sum to the fresh
+collection exactly: `221 + 208 + 224 = 653`.  All three retained processes
+returned exit 0, so the split is the definitive full-suite result rather than an
+inference from the earlier interrupted run.
+
+### Self-review and requirement matrix
+
+| Requirement | Evidence |
+|---|---|
+| Triple, empty-prefix, nested, adjacent, repeated, and malformed quotes cannot hide later material | Direct Core covers both storage classes; Claude and stdio cover representative complete-remainder failures. |
+| Placeholder allowance is exact and whole | Existing quoted/unquoted placeholder positives remain green; prefix, suffix, extra-quote, and token-continuation forms reject. |
+| CR/LF continuations fail closed | Existing split-value cases remain green, and the credential-prefix CRLF-before-delimiter regression rejects in both storage classes. |
+| Parsing is bounded and linear | The 256 KiB adversarial regression passes; the implementation caps before quote scans and uses no backtracking expression for the remainder. |
+| Normal prose remains valid | Existing non-assignment descriptions of both the API-key detector and quoted parser still create revisions. |
+| Rejection is central, closed, and atomic | The guard still runs before policy admission and artifact/head mutation, traverses body/reference/relation/provenance strings, and Core/adapter/stdio tests assert generic errors with no artifact or registry change. |
+
+Round-5 production/test files changed:
+
+- `mneme/core/sessions.py`
+- `tests/core/test_contracts.py`
+- `tests/adapters/test_claude.py`
+- `tests/transports/test_mcp_stdio.py`
+
+Round-5 commit message: `fix: validate complete credential assignment remainder`.
+No unresolved round-5 concern remains.
