@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import re
 from typing import Any, Final
 
-from mneme.adapters.base import AdapterResult
+from mneme.adapters.base import AdapterEnvelope, AdapterResult
 from mneme.adapters.claude import ClaudeAdapter
+from mneme.core.artifacts import StorageClass
 from mneme.core.contracts import CONTRACT_VERSION, LifecycleEvent
 from mneme.core.errors import InvalidArtifact
+from mneme.core.sessions import SessionRevisionRef, SessionStore
 
 
 SCHEMA_ID: Final = "openai-codex-hooks/pre-compact@2026-08-26+a26f1806"
@@ -32,6 +35,9 @@ _REQUIRED_NATIVE_FIELDS: Final = frozenset(
 _OPTIONAL_NATIVE_FIELDS: Final = frozenset({"agent_id", "agent_type"})
 _BINDING_FIELDS: Final = frozenset({"workstream_id"})
 _TRIGGERS: Final = frozenset({"manual", "auto"})
+_CONTINUATION_TARGET: Final = re.compile(
+    r"^(?P<session>[A-Za-z0-9][A-Za-z0-9._-]*)@(?P<revision>[0-9]{6})$"
+)
 _INVALID_ENVELOPE_WARNING: Final = (
     "Madi could not use this Codex lifecycle event; continue ordinary Codex work."
 )
@@ -75,6 +81,48 @@ class CodexAdapter(ClaudeAdapter):
     _invalid_envelope_warning = _INVALID_ENVELOPE_WARNING
     _invalid_checkpoint_warning = _INVALID_CHECKPOINT_WARNING
     _unavailable_warning = _UNAVAILABLE_WARNING
+
+    def _checkpoint_payload(self, envelope: AdapterEnvelope) -> dict[str, Any]:
+        payload = super()._checkpoint_payload(envelope)
+        if envelope.event == "agent_switched":
+            self._validate_agent_switch_checkpoint(payload)
+        return payload
+
+    def _validate_agent_switch_checkpoint(self, payload: Mapping[str, Any]) -> None:
+        """Require one real Claude revision behind a distinct Codex lineage."""
+        relations = payload.get("relations")
+        if not isinstance(relations, list):
+            raise InvalidArtifact("Codex agent switch relations are invalid")
+        continuations = tuple(
+            relation
+            for relation in relations
+            if isinstance(relation, Mapping)
+            and relation.get("kind") == "continues_from"
+        )
+        if len(continuations) != 1:
+            raise InvalidArtifact(
+                "Codex agent switch requires one continuation relation"
+            )
+        target = continuations[0].get("target")
+        if not isinstance(target, str):
+            raise InvalidArtifact("Codex agent switch continuation is invalid")
+        match = _CONTINUATION_TARGET.fullmatch(target)
+        if match is None or match["session"] == payload.get("session_id"):
+            raise InvalidArtifact("Codex agent switch must use a distinct session")
+        try:
+            storage_class = StorageClass(payload.get("storage_class"))
+            source = SessionStore(self._service.vault, storage_class).read_revision(
+                SessionRevisionRef(match["session"], match["revision"]),
+                workstream_id=payload.get("workstream_id"),
+            )
+        except Exception as exc:
+            raise InvalidArtifact(
+                "Codex agent switch continuation is unavailable"
+            ) from exc
+        if source.body.adapter_id != "claude":
+            raise InvalidArtifact(
+                "Codex agent switch must continue a Claude revision"
+            )
 
     def handle_native(
         self, native_payload: object, local_binding: object
@@ -143,6 +191,11 @@ def _native_payload(value: object) -> Mapping[str, Any]:
     transcript_path = value["transcript_path"]
     if transcript_path is not None and not isinstance(transcript_path, str):
         raise InvalidArtifact("Codex PreCompact transcript path type is invalid")
+    if any(
+        field in value and not isinstance(value[field], str)
+        for field in _OPTIONAL_NATIVE_FIELDS
+    ):
+        raise InvalidArtifact("Codex optional agent field type is invalid")
     if value["hook_event_name"] != "PreCompact":
         raise InvalidArtifact("Codex hook event is invalid")
     if value["trigger"] not in _TRIGGERS:

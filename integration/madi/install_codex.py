@@ -17,7 +17,8 @@ from typing import Any
 _KIT = Path(__file__).resolve().parent
 _BEGIN = "<!-- MADI-CODEX-ADAPTER: BEGIN -->"
 _END = "<!-- MADI-CODEX-ADAPTER: END -->"
-_HOOK_COMMAND = "python -m integration.madi.codex.pre_compact_hook"
+_HOOK_COMMAND = "python -m mneme.adapters.codex_hook"
+_LEGACY_HOOK_COMMAND = "python -m integration.madi.codex.pre_compact_hook"
 
 
 class InstallError(Exception):
@@ -139,7 +140,8 @@ def _merged_hooks(
 def _uses_madi_command(value: Mapping[str, Any]) -> bool:
     hooks = value.get("hooks")
     return isinstance(hooks, list) and any(
-        isinstance(item, Mapping) and item.get("command") == _HOOK_COMMAND
+        isinstance(item, Mapping)
+        and item.get("command") in {_HOOK_COMMAND, _LEGACY_HOOK_COMMAND}
         for item in hooks
     )
 

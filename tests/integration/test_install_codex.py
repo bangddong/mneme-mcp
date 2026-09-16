@@ -6,13 +6,16 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
 import pytest
 
 
 _REPOSITORY = Path(__file__).parents[2]
 _FIXTURES = Path(__file__).parents[1] / "fixtures" / "codex"
-_HOOK_COMMAND = "python -m integration.madi.codex.pre_compact_hook"
+_HOOK_COMMAND = "python -m mneme.adapters.codex_hook"
 _DESIRED_REGISTRATION = {
     "matcher": "manual|auto",
     "hooks": [{"type": "command", "command": _HOOK_COMMAND}],
@@ -29,7 +32,7 @@ def _read_json(path: Path) -> dict[str, object]:
 
 def test_hook_runner_reads_native_stdin_and_invokes_the_translator_once():
     """Catches the runner bypassing translation or echoing private native fields."""
-    from integration.madi.codex.pre_compact_hook import run_hook
+    from mneme.adapters.codex_hook import run_hook
     from mneme.adapters.codex import translate_pre_compact
 
     native = _fixture("pre_compact.native.json")
@@ -58,12 +61,20 @@ def test_hook_runner_reads_native_stdin_and_invokes_the_translator_once():
         "context_required": False,
         "event": "pre_compact",
         "lifecycle": expected["event"],
-        "native_metadata": expected["native_metadata"],
         "ok": True,
         "version": 1,
         "warning": None,
     }
-    for field in ("transcript_path", "cwd", "model", "agent_id", "agent_type"):
+    assert "native_metadata" not in diagnostic
+    for field in (
+        "transcript_path",
+        "cwd",
+        "model",
+        "turn_id",
+        "trigger",
+        "agent_id",
+        "agent_type",
+    ):
         assert str(native[field]) not in encoded
 
 
@@ -80,7 +91,7 @@ def test_hook_runner_returns_closed_warning_and_success_exit_for_invalid_input(
     raw_input, binding
 ):
     """Catches malformed optional hooks blocking Codex or disclosing their input."""
-    from integration.madi.codex.pre_compact_hook import run_hook
+    from mneme.adapters.codex_hook import run_hook
 
     output = StringIO()
     exit_code = run_hook(StringIO(raw_input), output, local_binding=binding)
@@ -100,7 +111,7 @@ def test_hook_runner_returns_closed_warning_and_success_exit_for_invalid_input(
 
 def test_hook_runner_closes_translator_failures_without_blocking_or_echoing():
     """Catches an unavailable integration exception escaping through the native hook."""
-    from integration.madi.codex.pre_compact_hook import run_hook
+    from mneme.adapters.codex_hook import run_hook
 
     def unavailable_translator(payload, binding):
         raise OSError("C:/private/madi-token.txt is unavailable")
@@ -125,6 +136,151 @@ def test_bundled_hook_registers_only_precompact_for_manual_or_auto():
     bundled = _read_json(_REPOSITORY / "integration" / "madi" / "codex" / "hooks.json")
 
     assert bundled == {"hooks": {"PreCompact": [_DESIRED_REGISTRATION]}}
+
+
+def test_bundled_hook_runs_from_an_installed_wheel_outside_the_checkout(tmp_path):
+    """Catches a hook command that points at source excluded from the wheel."""
+    wheel_dir = tmp_path / "wheelhouse"
+    wheel_dir.mkdir()
+    build = subprocess.run(
+        [
+            sys.executable,
+            str(_REPOSITORY / "tests" / "support" / "build_test_wheel.py"),
+            str(_REPOSITORY),
+            str(wheel_dir),
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert build.returncode == 0, build.stderr
+    wheels = tuple(wheel_dir.glob("*.whl"))
+    assert len(wheels) == 1
+
+    isolated_home = tmp_path / "home"
+    runtime_temp = tmp_path / "runtime-temp"
+    isolated_home.mkdir()
+    runtime_temp.mkdir()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(isolated_home),
+            "PIP_CACHE_DIR": str(tmp_path / "pip-cache"),
+            "PIP_CONFIG_FILE": os.devnull,
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_CACHE_DIR": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": "",
+            "TEMP": str(runtime_temp),
+            "TMP": str(runtime_temp),
+            "TMPDIR": str(runtime_temp),
+            "USERPROFILE": str(isolated_home),
+        }
+    )
+    venv_root = tmp_path / "venv"
+    created = subprocess.run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(venv_root)],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert created.returncode == 0, created.stderr
+    venv_python = (
+        venv_root / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else venv_root / "bin" / "python"
+    )
+    purelib = subprocess.run(
+        [
+            str(venv_python),
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    checkout = str(_REPOSITORY.resolve())
+    Path(purelib, "sitecustomize.py").write_text(
+        "import os, sys\n"
+        f"_checkout = os.path.normcase(os.path.realpath({checkout!r}))\n"
+        "sys.path[:] = [item for item in sys.path "
+        "if os.path.normcase(os.path.realpath(item or os.curdir)) != _checkout]\n",
+        encoding="utf-8",
+    )
+    installed = subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--ignore-installed",
+            str(wheels[0]),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stderr
+
+    with tempfile.TemporaryDirectory(
+        dir=_REPOSITORY.parent, prefix=".task22-wheel-project-"
+    ) as project_directory:
+        project = Path(project_directory)
+        bundled = _read_json(
+            _REPOSITORY / "integration" / "madi" / "codex" / "hooks.json"
+        )
+        command = bundled["hooks"]["PreCompact"][0]["hooks"][0]["command"].split()
+        assert command[:2] == ["python", "-m"]
+        environment["MADI_CODEX_WORKSTREAM_ID"] = "ws-1"
+        probe = subprocess.run(
+            [
+                str(venv_python),
+                "-c",
+                (
+                    "import json, mneme, sys; "
+                    "print(json.dumps({'module': mneme.__file__, 'path': sys.path}))"
+                ),
+            ],
+            cwd=project,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        isolation = json.loads(probe.stdout)
+        assert Path(isolation["module"]).resolve().is_relative_to(Path(purelib))
+        assert all(
+            os.path.normcase(os.path.realpath(item or project))
+            != os.path.normcase(checkout)
+            for item in isolation["path"]
+        )
+        ran = subprocess.run(
+            [str(venv_python), *command[1:]],
+            cwd=project,
+            env=environment,
+            input=json.dumps(_fixture("pre_compact.native.json")),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        assert ran.returncode == 0, ran.stderr
+        diagnostic = json.loads(ran.stdout)
+        assert diagnostic["ok"] is True
+        assert diagnostic["block_host"] is False
+        assert diagnostic["lifecycle"]["name"] == "pre_compact"
+        assert not project.resolve().is_relative_to(_REPOSITORY.resolve())
+        assert environment["PYTHONPATH"] == ""
 
 
 def test_install_codex_preserves_existing_config_hooks_and_agents_and_is_idempotent(

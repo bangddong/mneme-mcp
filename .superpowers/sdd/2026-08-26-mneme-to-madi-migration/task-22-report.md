@@ -103,3 +103,102 @@ embed its own hash in its contents.
 No unresolved implementation concern remains. Actual host attachment is
 intentionally optional and fail-open per the brief; the installed runner requires
 an explicit machine-local workstream binding and never invents one.
+
+## Fix round 1: shipped runner, closed diagnostics, and immutable adapter lineage
+
+### Verified findings and root causes
+
+| Finding | Root cause | Correction |
+| --- | --- | --- |
+| Installed hook could not start | The hook command named `integration.madi.codex.pre_compact_hook`, while the wheel target packages only `mneme`. | Production runner moved to `mneme.adapters.codex_hook`; bundled and installed commands name that shipped module. The integration module is now a thin source-tree compatibility wrapper. |
+| Successful diagnostics disclosed turn metadata | The runner copied `CodexLifecycleEvent.native_metadata` into stdout. | Both success and failure diagnostics now contain only closed status/guidance plus the normalized lifecycle event; trigger, turn, native agent, transcript, cwd, and model values are never emitted. |
+| Optional native fields accepted non-strings | The translator closed the field set but validated types only for required fields. | Present `agent_id` and `agent_type` values must now be JSON strings; absence remains valid. |
+| Codex could advance a Claude lineage | `SessionStore` checked predecessor identity but did not bind an existing session to its original adapter, and `agent_switched` treated relations as otherwise generic checkpoint data. | `SessionStore` rejects an adapter change before writing. Codex switch checkpoints require exactly one parseable, existing `continues_from` target in the same workstream/storage class, require that target to be a Claude revision, and require a distinct receiving session. Existing Codex sessions remain resumable. |
+
+All failures remain closed and nonblocking. Invalid switch material is rejected
+before a command; direct Core cross-adapter reuse is rejected before revision
+creation or Registry mutation. Preferred-head selection remains a separate
+explicit Core command.
+
+### Strict RED/GREEN evidence
+
+| Phase | Command | Result |
+| --- | --- | --- |
+| Round-1 RED | `python -m pytest tests/integration/test_install_codex.py tests/adapters/test_codex.py tests/core/test_sessions.py::test_existing_session_rejects_a_different_adapter_before_writing tests/core/test_contracts.py::test_core_rejects_cross_adapter_reuse_of_an_existing_session -q --tb=short --basetemp .pytest-task22-r1-red` | Expected RED: `24 failed, 21 passed in 50.48s`. The failures independently reproduced the missing shipped module, old hook command, all eight optional-field type cases, missing/wrong/same-session switch cases, and direct SessionStore/Core adapter reuse. |
+| First implementation GREEN | Same scope with `.pytest-task22-r1-green1` | `44 passed, 1 failed in 42.54s`; the only failure was the test harness placing its disposable project under the checkout-relative base temp, not product behavior. |
+| Isolated wheel GREEN | `python -m pytest tests/integration/test_install_codex.py::test_bundled_hook_runs_from_an_installed_wheel_outside_the_checkout -q --tb=short --basetemp .pytest-task22-r1-wheel-green` | `1 passed in 22.34s`. |
+| Fix-scope GREEN | Original RED scope with `.pytest-task22-r1-green2` | `45 passed in 42.80s`. |
+| Extended Codex switch coverage | `python -m pytest tests/adapters/test_codex.py -q --tb=short --basetemp .pytest-task22-r1-adapter-green` | `28 passed in 18.85s`, including an existing-but-non-Claude target rejection and a valid second revision in an already-Codex session. |
+
+### Wheel installation evidence
+
+`tests/support/build_test_wheel.py` is an offline, standards-compliant wheel
+builder used only by the test. It reads and asserts the repository's pinned
+Hatch wheel target (`packages = ["mneme"]`), packages that target, emits wheel
+metadata plus hashed `RECORD`, and requires no fetched build tool. The integration
+test then:
+
+1. builds the wheel in a subprocess;
+2. creates a disposable virtual environment and installs the wheel through
+   `pip --no-index --no-deps` in a subprocess;
+3. redirects home/cache/temp writes into the disposable test root;
+4. removes the checkout from runtime `sys.path`, clears `PYTHONPATH`, and proves
+   `mneme` resolves from the virtual environment;
+5. runs the command from bundled `hooks.json` with cwd in a disposable project
+   outside the checkout; and
+6. feeds the pinned native fixture over stdin and verifies exit zero plus the
+   fail-open normalized diagnostic contract.
+
+This reproduces the original `ModuleNotFoundError: integration` against an
+installed wheel during RED and proves the shipped runner starts during GREEN.
+No network, user-home installation, or real host integration was used.
+
+### Final verification
+
+| Check | Result |
+| --- | --- |
+| Task 22 + Task 21/20 + full Session boundary: `python -m pytest tests/adapters/test_codex.py tests/integration/test_install_codex.py tests/adapters/test_claude.py tests/integration/test_install_claude.py tests/core/test_contracts.py tests/core/test_sessions.py tests/transports/test_mcp_stdio.py -q --basetemp .pytest-task22-r1-boundary` | `240 passed in 203.65s` |
+| `python -m pytest --collect-only -q` | `699 tests collected in 0.49s` |
+| Definitive full suite: `python -m pytest -q --cache-clear --basetemp .pytest-task22-r1-full` | `699 passed in 1541.71s (0:25:41)` |
+| Whitespace | `git diff --check` clean before report staging. |
+
+### Round-1 requirement matrix
+
+| Requirement | Evidence |
+| --- | --- |
+| Shipped production runner | Hook and installer use `python -m mneme.adapters.codex_hook`; installed-wheel subprocess coverage proves import and execution without checkout resolution. |
+| Closed successful diagnostics | Exact success-envelope assertion omits `native_metadata` and checks all transcript/cwd/model/turn/trigger/agent sentinels are absent. Failure output remains closed and exit-zero. |
+| Pinned optional-field schema | Eight closed, nonblocking cases cover list/object/boolean/null for both optional fields; fixture strings and absent fields remain accepted. |
+| Immutable session adapter | Direct `SessionStore` and `CoreService.execute` tests prove a Claude-to-Codex adapter change cannot create `000002`, advance a head, or change generation. Normal same-adapter revision coverage remains green. |
+| Valid Claude-to-Codex switch | Codex tests reject missing, malformed, nonexistent, wrong-adapter, and same-session continuation material with no canonical change. Positive coverage creates a distinct Codex session, resumes it as Codex, and changes preference only by explicit command. |
+| Preserved privacy/confinement | The shared Claude checkpoint reader and central Session secret/policy gates are unchanged; Task 21/20 and full Session boundaries pass. The parked oversized-whitespace cap issue remains untouched and non-load-bearing. |
+
+### Files and self-review
+
+- `mneme/adapters/codex.py`
+- `mneme/adapters/codex_hook.py`
+- `mneme/core/sessions.py`
+- `integration/madi/codex/hooks.json`
+- `integration/madi/codex/pre_compact_hook.py`
+- `integration/madi/codex/README.md`
+- `integration/madi/install_codex.py`
+- `tests/adapters/test_codex.py`
+- `tests/core/test_contracts.py`
+- `tests/core/test_sessions.py`
+- `tests/integration/test_install_codex.py`
+- `tests/support/build_test_wheel.py`
+- this report
+
+Self-review found no Core dependency on Codex or native hook fields: the only
+Core change is the agent-neutral invariant that one session cannot change its
+adapter identity. The switch validator reads only an explicitly named canonical
+Session revision; it never opens the native transcript path. Hook output and
+closed errors contain no native/private values. Installer writes remain
+project-local, preservative, and idempotent for the shipped command; the legacy
+source-only command is recognized as a conflicting Madi hook rather than being
+duplicated.
+
+Round-1 commit message: `fix: ship Codex hook and protect adapter lineage`.
+The resulting commit SHA is supplied in the handoff because a commit cannot
+embed its own hash in its contents. No unresolved round-1 concern remains; the
+Task 21 breaker ruling and unrelated numeric-version minor remain outside scope.

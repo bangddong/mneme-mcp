@@ -490,6 +490,33 @@ def test_lifecycle_event_cannot_mutate_core(service):
     assert list(service.vault.root.glob("memory/*.md")) == []
 
 
+def test_core_rejects_cross_adapter_reuse_of_an_existing_session(service):
+    """Catches direct commands bypassing immutable session adapter ownership."""
+    from mneme.core.registries import RegistryStore
+
+    RegistryStore(service.vault).create_workstream(
+        "ws-1", project=None, mode="parallel"
+    )
+    first_payload = _checkpoint_payload()
+    first_payload["body"]["adapter_id"] = "claude"
+    first = service.execute(_command("create_session_revision", first_payload))
+    assert first.ok is True
+
+    second_payload = _checkpoint_payload(generation=1)
+    second_payload["expected_parent"] = {"session": "s1", "revision": "000001"}
+    second = service.execute(_command("create_session_revision", second_payload))
+
+    assert second.ok is False
+    assert second.error.code == "invalid-artifact"
+    assert not (
+        service.vault.root / "workstreams/ws-1/sessions/s1/000002.md"
+    ).exists()
+    registry = RegistryStore(service.vault).load_workstream("ws-1")
+    assert registry.generation == 1
+    assert registry.active_heads[0].session == "s1"
+    assert registry.active_heads[0].revision == "000001"
+
+
 @pytest.mark.parametrize(
     ("event_name", "checkpoint_required", "context_required"),
     [

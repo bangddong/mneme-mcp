@@ -576,6 +576,33 @@ def test_second_revision_advances_its_exact_parent_head(vault, valid_checkpoint)
     assert store.registries.load_workstream("ws-1").active_heads == (second.as_head(),)
 
 
+def test_existing_session_rejects_a_different_adapter_before_writing(
+    vault, valid_checkpoint
+):
+    """Catches one adapter taking ownership of another adapter's lineage."""
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.sessions import SessionStore
+
+    store = SessionStore(vault)
+    first_request = valid_checkpoint()
+    first = store.create_revision(first_request)
+    changed_adapter = replace(first_request.body, adapter_id="claude")
+
+    with pytest.raises(InvalidArtifact, match="adapter"):
+        store.create_revision(
+            valid_checkpoint(
+                body=changed_adapter,
+                expected_parent=first,
+                expected_registry_generation=1,
+            )
+        )
+
+    assert not (vault.root / "workstreams/ws-1/sessions/ses-1/000002.md").exists()
+    registry = store.registries.load_workstream("ws-1")
+    assert registry.generation == 1
+    assert registry.active_heads == (first.as_head(),)
+
+
 def test_revision_gap_is_rejected_without_creating_a_new_revision(vault, valid_checkpoint):
     """Catches a writer filling a gap in an immutable session lineage."""
     from mneme.core.errors import InvalidArtifact

@@ -317,7 +317,11 @@ class SessionStore:
                 raise InvalidArtifact("expected parent does not match an empty session lineage")
             return "000001"
         previous = SessionRevisionRef(request.session_id, f"{numbers[-1]:06d}")
-        self.read_revision(previous, workstream_id=request.workstream_id)
+        previous_request = self.read_revision(
+            previous, workstream_id=request.workstream_id
+        )
+        if previous_request.body.adapter_id != request.body.adapter_id:
+            raise InvalidArtifact("session adapter identity is immutable")
         if request.expected_parent != previous:
             raise InvalidArtifact("expected parent does not match current session lineage")
         return f"{numbers[-1] + 1:06d}"

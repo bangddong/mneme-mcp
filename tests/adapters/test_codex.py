@@ -50,13 +50,14 @@ def _checkpoint_payload(
     session_id: str = "codex-1",
     adapter_id: str = "codex",
     generation: int = 0,
+    expected_parent: dict[str, str] | None = None,
     relations: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "workstream_id": "ws-1",
         "session_id": session_id,
         "storage_class": "portable",
-        "expected_parent": None,
+        "expected_parent": expected_parent,
         "expected_registry_generation": generation,
         "body": {
             "adapter_id": adapter_id,
@@ -125,6 +126,34 @@ def test_optional_agent_fields_are_ignored_and_native_private_fields_are_noncano
         with_agent["agent_type"],
     ):
         assert private_value not in encoded
+
+
+@pytest.mark.parametrize("field", ["agent_id", "agent_type"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [[], {}, True, None],
+    ids=("list", "object", "boolean", "null"),
+)
+def test_optional_agent_fields_are_exact_strings_when_present(
+    service, project, field, invalid_value
+):
+    """Catches optional native fields accepting values forbidden by the pin."""
+    from mneme.adapters.codex import CodexAdapter
+
+    native = _fixture("pre_compact.native.json")
+    native[field] = invalid_value
+
+    result = CodexAdapter(service, project_root=project).handle_native(
+        native, {"workstream_id": "ws-1"}
+    )
+
+    assert result.ok is False
+    assert result.block_host is False
+    assert result.event == "unknown"
+    assert result.warning == (
+        "Madi could not use this Codex lifecycle event; continue ordinary Codex work."
+    )
+    assert list(service.vault.root.glob("workstreams/*/sessions/*/*.md")) == []
 
 
 def test_transcript_path_may_be_null_without_becoming_a_discovery_condition():
@@ -293,6 +322,172 @@ def test_codex_service_failure_is_closed_and_never_blocks_ordinary_work(project)
     assert "token" not in encoded
 
 
+def _continues_from(target: str = "claude-1@000001") -> dict[str, object]:
+    return {
+        "kind": "continues_from",
+        "target": target,
+        "purpose": "Continue the same work with Codex",
+        "required_context": "Use the selected Claude revision",
+        "next_action": "Resume in the distinct Codex session",
+        "provenance_refs": [],
+    }
+
+
+def test_agent_switch_requires_a_continues_from_relation_before_any_write(
+    service, project
+):
+    """Catches an agent switch fabricating an unrelated Codex lineage."""
+    from mneme.adapters.codex import CodexAdapter
+    from mneme.core.contracts import CoreCommand
+    from mneme.core.registries import RegistryStore
+
+    created = service.execute(
+        CoreCommand(
+            1,
+            "create_session_revision",
+            _checkpoint_payload(session_id="claude-1", adapter_id="claude"),
+        )
+    )
+    assert created.ok is True
+    before = RegistryStore(service.vault).load_workstream("ws-1")
+    checkpoint = project / ".madi" / "checkpoints" / "missing-continuation.json"
+    _write_checkpoint(checkpoint, _checkpoint_payload(generation=1))
+
+    result = CodexAdapter(service, project_root=project).handle(
+        _envelope(event="agent_switched", checkpoint_file=str(checkpoint))
+    )
+
+    assert result.ok is False
+    assert result.block_host is False
+    assert result.warning == (
+        "Madi could not use the selected checkpoint; continue ordinary Codex work."
+    )
+    assert RegistryStore(service.vault).load_workstream("ws-1") == before
+    assert not (
+        service.vault.root / "workstreams/ws-1/sessions/codex-1/000001.md"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["claude-1", "claude-1@999999", "missing-session@000001"],
+    ids=("malformed", "missing-revision", "missing-session"),
+)
+def test_agent_switch_rejects_a_wrong_continues_from_target_without_writing(
+    service, project, target
+):
+    """Catches unverified continuation text masquerading as Claude lineage."""
+    from mneme.adapters.codex import CodexAdapter
+    from mneme.core.contracts import CoreCommand
+    from mneme.core.registries import RegistryStore
+
+    created = service.execute(
+        CoreCommand(
+            1,
+            "create_session_revision",
+            _checkpoint_payload(session_id="claude-1", adapter_id="claude"),
+        )
+    )
+    assert created.ok is True
+    before = RegistryStore(service.vault).load_workstream("ws-1")
+    checkpoint = project / ".madi" / "checkpoints" / "wrong-continuation.json"
+    _write_checkpoint(
+        checkpoint,
+        _checkpoint_payload(generation=1, relations=[_continues_from(target)]),
+    )
+
+    result = CodexAdapter(service, project_root=project).handle(
+        _envelope(event="agent_switched", checkpoint_file=str(checkpoint))
+    )
+
+    assert result.ok is False
+    assert result.block_host is False
+    assert RegistryStore(service.vault).load_workstream("ws-1") == before
+    assert not (
+        service.vault.root / "workstreams/ws-1/sessions/codex-1/000001.md"
+    ).exists()
+
+
+def test_agent_switch_rejects_a_continuation_from_a_non_claude_revision(
+    service, project
+):
+    """Catches an existing but semantically wrong source satisfying the link check."""
+    from mneme.adapters.codex import CodexAdapter
+    from mneme.core.contracts import CoreCommand
+    from mneme.core.registries import RegistryStore
+
+    created = service.execute(
+        CoreCommand(
+            1,
+            "create_session_revision",
+            _checkpoint_payload(session_id="codex-source", adapter_id="codex"),
+        )
+    )
+    assert created.ok is True
+    before = RegistryStore(service.vault).load_workstream("ws-1")
+    checkpoint = project / ".madi" / "checkpoints" / "non-claude-source.json"
+    _write_checkpoint(
+        checkpoint,
+        _checkpoint_payload(
+            generation=1,
+            relations=[_continues_from("codex-source@000001")],
+        ),
+    )
+
+    result = CodexAdapter(service, project_root=project).handle(
+        _envelope(event="agent_switched", checkpoint_file=str(checkpoint))
+    )
+
+    assert result.ok is False
+    assert result.block_host is False
+    assert RegistryStore(service.vault).load_workstream("ws-1") == before
+    assert not (
+        service.vault.root / "workstreams/ws-1/sessions/codex-1/000001.md"
+    ).exists()
+
+
+def test_agent_switch_cannot_reuse_the_claude_session_id(service, project):
+    """Catches Codex advancing a Claude-owned lineage during agent switch."""
+    from mneme.adapters.codex import CodexAdapter
+    from mneme.core.contracts import CoreCommand
+    from mneme.core.registries import RegistryStore
+
+    created = service.execute(
+        CoreCommand(
+            1,
+            "create_session_revision",
+            _checkpoint_payload(session_id="claude-1", adapter_id="claude"),
+        )
+    )
+    assert created.ok is True
+    before = RegistryStore(service.vault).load_workstream("ws-1")
+    checkpoint = project / ".madi" / "checkpoints" / "reused-claude-session.json"
+    _write_checkpoint(
+        checkpoint,
+        _checkpoint_payload(
+            session_id="claude-1",
+            generation=1,
+            expected_parent={"session": "claude-1", "revision": "000001"},
+            relations=[_continues_from()],
+        ),
+    )
+
+    result = CodexAdapter(service, project_root=project).handle(
+        _envelope(
+            event="agent_switched",
+            session_id="claude-1",
+            checkpoint_file=str(checkpoint),
+        )
+    )
+
+    assert result.ok is False
+    assert result.block_host is False
+    assert RegistryStore(service.vault).load_workstream("ws-1") == before
+    assert not (
+        service.vault.root / "workstreams/ws-1/sessions/claude-1/000002.md"
+    ).exists()
+
+
 def test_agent_switch_creates_a_distinct_codex_lineage_without_implicit_preference(
     service, project
 ):
@@ -310,14 +505,7 @@ def test_agent_switch_creates_a_distinct_codex_lineage_without_implicit_preferen
         )
     )
     assert claude.ok is True
-    relation = {
-        "kind": "continues_from",
-        "target": "claude-1@000001",
-        "purpose": "Continue the same work with Codex",
-        "required_context": "Use the selected Claude revision",
-        "next_action": "Resume in the distinct Codex session",
-        "provenance_refs": [],
-    }
+    relation = _continues_from()
     checkpoint = project / ".madi" / "checkpoints" / "agent-switch.json"
     _write_checkpoint(
         checkpoint,
@@ -339,13 +527,34 @@ def test_agent_switch_creates_a_distinct_codex_lineage_without_implicit_preferen
     assert codex_revision.relations[0].kind == "continues_from"
     assert codex_revision.relations[0].target == "claude-1@000001"
 
+    resumed_checkpoint = project / ".madi" / "checkpoints" / "agent-switch-resume.json"
+    _write_checkpoint(
+        resumed_checkpoint,
+        _checkpoint_payload(
+            generation=2,
+            expected_parent={"session": "codex-1", "revision": "000001"},
+            relations=[relation],
+        ),
+    )
+    resumed = CodexAdapter(service, project_root=project).handle(
+        _envelope(event="agent_switched", checkpoint_file=str(resumed_checkpoint))
+    )
+    registry = RegistryStore(service.vault).load_workstream("ws-1")
+    assert resumed.ok is True
+    assert registry.generation == 3
+    assert {head.session: head.revision for head in registry.active_heads} == {
+        "claude-1": "000001",
+        "codex-1": "000002",
+    }
+    assert registry.preferred_head is None
+
     preferred = service.execute(
         CoreCommand(
             1,
             "set_preferred_head",
             {
-                "expected_generation": 2,
-                "preferred_head": {"session": "codex-1", "revision": "000001"},
+                "expected_generation": 3,
+                "preferred_head": {"session": "codex-1", "revision": "000002"},
                 "storage_class": "portable",
                 "workstream_id": "ws-1",
             },
@@ -356,3 +565,4 @@ def test_agent_switch_creates_a_distinct_codex_lineage_without_implicit_preferen
     assert preferred.ok is True
     assert preferred.domain_events[0].name == "preferred_head_changed"
     assert selected.preferred_head.session == "codex-1"
+    assert selected.preferred_head.revision == "000002"

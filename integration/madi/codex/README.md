@@ -20,16 +20,17 @@ must not be treated as released behavior.
 The pinned payload requires exactly these seven fields:
 `session_id: string`, `transcript_path: string|null`, `cwd: string`,
 `hook_event_name: "PreCompact"`, `model: string`, `turn_id: string`, and
-`trigger: "manual"|"auto"`. It also permits optional `agent_id` and
-`agent_type` fields, which this adapter ignores.
+`trigger: "manual"|"auto"`. It also permits optional string `agent_id` and
+`agent_type` fields, which this adapter validates and then ignores.
 
 ## Boundary
 
-`transcript_path`, `cwd`, `model`, and optional agent fields are never opened or
-copied into Core commands or canonical artifacts. Trigger and turn ID remain
-adapter-local diagnostic metadata. Session-to-workstream association comes only
-from the machine-local `MADI_CODEX_WORKSTREAM_ID` binding; the native payload
-does not define a workstream.
+`transcript_path`, `cwd`, `model`, trigger, turn ID, and optional agent fields are
+never opened or copied into Core commands, hook diagnostics, or canonical
+artifacts. Trigger and turn ID exist only inside the native translator boundary.
+Session-to-workstream association comes only from the machine-local
+`MADI_CODEX_WORKSTREAM_ID` binding; the native payload does not define a
+workstream.
 
 The command hook normalizes stdin and exits successfully even when translation
 fails. A bare event requests a semantic checkpoint but writes nothing. Only a
