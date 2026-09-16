@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m integration.madi.codex.pre_compact_hook"
+          }
+        ]
+      }
+    ]
+  }
+}

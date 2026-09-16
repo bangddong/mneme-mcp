@@ -1,0 +1,13 @@
+{
+  "event": {
+    "adapter": "codex",
+    "name": "pre_compact",
+    "session_id": "codex-1",
+    "version": 1,
+    "workstream_id": "ws-1"
+  },
+  "native_metadata": {
+    "trigger": "auto",
+    "turn_id": "turn-private-007"
+  }
+}

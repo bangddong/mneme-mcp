@@ -46,6 +46,11 @@ _UNAVAILABLE_WARNING = "Madi is unavailable; continue ordinary Claude work."
 class ClaudeAdapter:
     """Translate Claude lifecycle input into Task 20 contracts without blocking Claude."""
 
+    _adapter_id = "claude"
+    _invalid_envelope_warning = _INVALID_ENVELOPE_WARNING
+    _invalid_checkpoint_warning = _INVALID_CHECKPOINT_WARNING
+    _unavailable_warning = _UNAVAILABLE_WARNING
+
     def __init__(
         self,
         service: object,
@@ -61,17 +66,17 @@ class ClaudeAdapter:
         """Observe one lifecycle boundary and optionally persist an explicit checkpoint."""
         try:
             normalized = AdapterEnvelope.from_mapping(envelope)
-            if normalized.adapter != "claude":
+            if normalized.adapter != self._adapter_id:
                 raise InvalidArtifact("adapter identity is invalid")
         except Exception:
-            return self._failure("unknown", _INVALID_ENVELOPE_WARNING)
+            return self._failure("unknown", self._invalid_envelope_warning)
 
         try:
             observation = self._service.observe(normalized.as_lifecycle_event())
             if not isinstance(observation, ObservationResult):
                 raise TypeError("adapter service returned an invalid observation")
         except Exception:
-            return self._failure(normalized.event, _UNAVAILABLE_WARNING)
+            return self._failure(normalized.event, self._unavailable_warning)
 
         if normalized.checkpoint_file is None:
             return AdapterResult(
@@ -89,7 +94,7 @@ class ClaudeAdapter:
         except Exception:
             return self._failure(
                 normalized.event,
-                _INVALID_CHECKPOINT_WARNING,
+                self._invalid_checkpoint_warning,
                 checkpoint_required=observation.checkpoint_required,
                 context_required=observation.context_required,
             )
@@ -101,7 +106,7 @@ class ClaudeAdapter:
         except Exception:
             return self._failure(
                 normalized.event,
-                _UNAVAILABLE_WARNING,
+                self._unavailable_warning,
                 checkpoint_required=observation.checkpoint_required,
                 context_required=observation.context_required,
             )
@@ -138,7 +143,7 @@ class ClaudeAdapter:
         ):
             raise InvalidArtifact("checkpoint does not belong to lifecycle envelope")
         body = payload["body"]
-        if not isinstance(body, Mapping) or body.get("adapter_id") != "claude":
+        if not isinstance(body, Mapping) or body.get("adapter_id") != self._adapter_id:
             raise InvalidArtifact("checkpoint adapter identity is invalid")
         return dict(payload)
 

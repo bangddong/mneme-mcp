@@ -10,7 +10,9 @@ from mneme.core.contracts import (
     CONTRACT_VERSION,
     LIFECYCLE_NAMES,
     CommandResult,
+    DomainEvent,
     LifecycleEvent,
+    OperationalEvent,
 )
 from mneme.core.errors import InvalidArtifact
 
@@ -122,6 +124,19 @@ class AdapterResult:
             "version": self.version,
             "warning": self.warning,
         }
+
+    @property
+    def domain_events(self) -> tuple[DomainEvent, ...]:
+        """Expose successful mutation facts without widening the adapter envelope."""
+        if self.command_result is None:
+            return ()
+        return self.command_result.domain_events
+
+    @property
+    def operational_events(self) -> tuple[OperationalEvent, ...]:
+        if self.command_result is None:
+            return ()
+        return self.command_result.operational_events
 
 
 __all__ = ["AdapterEnvelope", "AdapterResult"]

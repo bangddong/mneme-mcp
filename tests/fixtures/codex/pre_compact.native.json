@@ -1,0 +1,11 @@
+{
+  "session_id": "codex-1",
+  "transcript_path": "C:/private-codex-transcripts/session-codex-1.jsonl",
+  "cwd": "C:/private-codex-project",
+  "hook_event_name": "PreCompact",
+  "model": "private-model-sentinel",
+  "turn_id": "turn-private-007",
+  "trigger": "auto",
+  "agent_id": "private-agent-sentinel",
+  "agent_type": "worker"
+}

@@ -1,0 +1,10 @@
+<!-- MADI-CODEX-ADAPTER: BEGIN -->
+## Optional Madi continuity
+
+- Use Madi only when this project and a machine-local workstream binding have been explicitly configured.
+- The `PreCompact` hook only observes the lifecycle boundary. It does not save a revision by itself and must never open or summarize a transcript.
+- Before compaction or an agent switch, select and sanitize semantic continuity yourself. Do not include raw conversation text, tool output, native paths, model data, or agent identity.
+- Submit only that host-composed checkpoint through the explicit Madi checkpoint command. A receiving agent uses a distinct session linked with `continues_from`; select its head only with an explicit Core command.
+- If translation, checkpointing, or Madi itself fails, continue ordinary Codex work and retry a manual checkpoint later.
+
+<!-- MADI-CODEX-ADAPTER: END -->
