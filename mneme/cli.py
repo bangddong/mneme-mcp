@@ -55,6 +55,7 @@ from mneme.core.sessions import (
     session_semantic_hash,
 )
 from mneme.core.vault import Vault
+from mneme.migration.legacy import LegacyInspectionError, inspect_legacy_db, stage_legacy
 
 
 _COMMANDS = frozenset(
@@ -66,6 +67,7 @@ _COMMANDS = frozenset(
         "remember",
         "checkpoint",
         "project",
+        "migrate",
         "reindex",
         "sync",
     }
@@ -164,6 +166,22 @@ def _parser() -> argparse.ArgumentParser:
         default=StorageClass.PORTABLE.value,
     )
 
+    migrate = commands.add_parser(
+        "migrate", help="inspect or locally stage legacy Mneme state"
+    )
+    migrate_commands = migrate.add_subparsers(
+        dest="migrate_command", required=True, parser_class=_JsonParser
+    )
+    migrate_inspect = migrate_commands.add_parser(
+        "inspect", help="read-only inventory of a closed legacy SQLite database"
+    )
+    migrate_inspect.add_argument("--db-path", required=True, type=Path)
+    migrate_stage = migrate_commands.add_parser(
+        "stage", help="create a confidential machine-local review bundle"
+    )
+    migrate_stage.add_argument("--db-path", required=True, type=Path)
+    migrate_stage.add_argument("--wiki-path", required=True, type=Path)
+
     commands.add_parser("reindex", help="rebuild disposable local recall state")
 
     sync = commands.add_parser("sync", help="run one explicit non-merging Git action")
@@ -247,6 +265,8 @@ def _dispatch(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[st
             "locator": project.locator,
             "storage_class": storage_class.value,
         }
+    if arguments.command == "migrate":
+        return _migrate(vault, arguments)
     if arguments.command == "reindex":
         report = CoreService(vault).reindex()
         return report.status, {
@@ -257,6 +277,44 @@ def _dispatch(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[st
     if arguments.command == "sync":
         return _sync(vault, arguments)
     raise _CliUsageError(f"unknown command: {arguments.command}")
+
+
+def _migrate(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[str, Any]]:
+    if arguments.migrate_command == "inspect":
+        inventory = inspect_legacy_db(arguments.db_path)
+        blocking_tables = sorted(
+            table.name
+            for table in inventory.tables.values()
+            if table.classification == "needs-review"
+        )
+        return "needs-review", {
+            "blocking_tables": blocking_tables,
+            "database_sha256": inventory.sha256,
+            "portable_action": "blocked" if blocking_tables else "requires-review",
+            "tables": [
+                {
+                    "classification": table.classification,
+                    "name": table.name,
+                    "row_count": table.row_count,
+                }
+                for table in inventory.tables.values()
+            ],
+        }
+    if arguments.migrate_command == "stage":
+        report = stage_legacy(
+            arguments.db_path,
+            arguments.wiki_path,
+            vault,
+            vault.local_root / "pending",
+        )
+        return "needs-review", {
+            "blocking_tables": list(report.blocking_tables),
+            "bundle_path": str(report.bundle_path),
+            "database_sha256": report.database_sha256,
+            "portable_action": report.portable_action,
+            "wiki_sha256": report.wiki_sha256,
+        }
+    raise _CliUsageError("unknown migrate command")
 
 
 def _sync(vault: Vault, arguments: argparse.Namespace) -> tuple[str, dict[str, Any]]:
@@ -675,6 +733,12 @@ def _error_envelope(command: str, error: Exception) -> dict[str, Any]:
         message = (
             "The request or Vault artifact failed validation; run doctor and retry "
             "with valid input."
+        )
+    elif isinstance(error, LegacyInspectionError):
+        code = "migration-error"
+        message = (
+            "Legacy inspection or staging failed safely; close legacy writers, "
+            "review the source, and retry."
         )
     elif isinstance(error, MadiError):
         code = "core-error"

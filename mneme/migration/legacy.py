@@ -6,10 +6,23 @@ it never calls its initializer, which could create or migrate a legacy database.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from hashlib import sha256
+import json
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+from typing import Any
+from uuid import uuid4
+
+from mneme.core.errors import ArtifactExists, InvalidArtifact, UnsafePath
+from mneme.core.fs import (
+    exclusive_file_lock,
+    is_symlink_or_reparse,
+    validate_path_chain,
+)
 
 
 class LegacyInspectionError(RuntimeError):
@@ -26,6 +39,10 @@ class LegacyDatabaseNotSQLiteError(LegacyInspectionError):
 
 class LegacyDatabaseChangedError(LegacyInspectionError):
     """The database changed while its read-only inventory was being collected."""
+
+
+class LegacyStagingError(LegacyInspectionError):
+    """A lossless local staging bundle could not be published safely."""
 
 
 @dataclass(frozen=True)
@@ -61,9 +78,35 @@ class LegacyInventory:
 
 
 @dataclass(frozen=True)
+class MigrationReport:
+    """Local-only result of staging one closed legacy database and external Wiki."""
+
+    bundle_path: Path
+    database_sha256: str
+    wiki_sha256: str
+    portable_action: str
+    blocking_tables: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _FileSnapshot:
     size: int
     mtime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _WikiFileSnapshot:
+    path: str
+    size: int
+    mtime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _WikiSnapshot:
+    root: Path
+    files: tuple[_WikiFileSnapshot, ...]
     sha256: str
 
 
@@ -138,6 +181,131 @@ _KNOWN_PRIMARY_KEYS = {
 }
 
 
+def stage_legacy(
+    db_path: Path,
+    wiki_path: Path,
+    vault: object,
+    local_pending: Path,
+) -> MigrationReport:
+    """Publish a lossless, confidential staging bundle below local ``pending``.
+
+    The legacy database and Wiki remain external authorities.  This operation
+    reads them without SQLite recovery/checkpoint behavior, copies only the
+    database bytes into a temporary local directory, exports typed review JSON,
+    and renames the completed directory into place as the final publication
+    step.  It never writes a portable registry, memory, or session artifact.
+    """
+    pending = _validate_local_pending(vault, local_pending)
+    database = _resolve_legacy_path(Path(db_path))
+    wiki = _resolve_wiki_path(Path(wiki_path))
+    database_before = _snapshot(database)
+    inventory = inspect_legacy_db(database)
+    database_after_inventory = _snapshot_after_inspection(database)
+    if database_after_inventory != database_before or inventory.sha256 != database_before.sha256:
+        raise LegacyDatabaseChangedError(
+            f"legacy database changed before staging: {database}"
+        )
+    wiki_before = _snapshot_wiki(wiki)
+
+    legacy_root = pending / "legacy"
+    bundle = legacy_root / database_before.sha256
+    lock_path = Path(vault.local_root) / "locks" / "legacy-migration.lock"
+    staging: Path | None = None
+    published = False
+
+    try:
+        with exclusive_file_lock(lock_path):
+            pending = _validate_local_pending(vault, pending)
+            validate_path_chain(legacy_root, allow_missing=True)
+            if is_symlink_or_reparse(legacy_root):
+                raise UnsafePath("legacy staging root cannot be a link or reparse point")
+            legacy_root.mkdir(parents=False, exist_ok=True)
+            validate_path_chain(legacy_root, allow_missing=False)
+            if bundle.exists() or is_symlink_or_reparse(bundle):
+                raise ArtifactExists("legacy staging bundle already exists")
+
+            staging = legacy_root / f".{uuid4().hex}.staging"
+            validate_path_chain(staging, allow_missing=True)
+            staging.mkdir(exist_ok=False)
+            validate_path_chain(staging, allow_missing=False)
+            source_directory = staging / "source"
+            table_directory = staging / "tables"
+            source_directory.mkdir()
+            table_directory.mkdir()
+            validate_path_chain(source_directory, allow_missing=False)
+            validate_path_chain(table_directory, allow_missing=False)
+
+            database_snapshot = source_directory / "state.db"
+            _copy_database_snapshot(database, database_snapshot)
+            snapshot_digest = _sha256_file(database_snapshot)
+            database_after_copy = _snapshot_after_inspection(database)
+            _require_no_sidecars(database, phase="after snapshot copy")
+            if (
+                database_after_copy != database_before
+                or snapshot_digest != database_before.sha256
+            ):
+                raise LegacyDatabaseChangedError(
+                    f"legacy database changed during snapshot: {database}"
+                )
+
+            snapshot_inventory = inspect_legacy_db(database_snapshot)
+            if snapshot_inventory.sha256 != database_before.sha256:
+                raise LegacyStagingError("staged database snapshot is not byte-identical")
+            table_manifests = _export_tables(
+                database_snapshot, snapshot_inventory, table_directory
+            )
+
+            database_final = _snapshot_after_inspection(database)
+            _require_no_sidecars(database, phase="before staging publication")
+            wiki_final = _snapshot_wiki(wiki)
+            if database_final != database_before:
+                raise LegacyDatabaseChangedError(
+                    f"legacy database changed during staging: {database}"
+                )
+            if wiki_final != wiki_before:
+                raise LegacyStagingError("legacy Wiki changed during staging")
+
+            blocking_tables = tuple(
+                item["name"]
+                for item in table_manifests
+                if item["classification"] == "needs-review"
+            )
+            portable_action = "blocked" if blocking_tables else "requires-review"
+            manifest = _migration_manifest(
+                database,
+                database_before.sha256,
+                snapshot_digest,
+                wiki_before,
+                table_manifests,
+                portable_action,
+                blocking_tables,
+            )
+            _write_json_document(staging / "manifest.json", manifest)
+
+            _validate_local_pending(vault, pending)
+            validate_path_chain(staging, allow_missing=False)
+            validate_path_chain(bundle, allow_missing=True)
+            if bundle.exists() or is_symlink_or_reparse(bundle):
+                raise ArtifactExists("legacy staging bundle appeared during publication")
+            staging.rename(bundle)
+            published = True
+    except (LegacyInspectionError, InvalidArtifact, ArtifactExists):
+        raise
+    except Exception as error:
+        raise LegacyStagingError("legacy staging failed before publication") from error
+    finally:
+        if staging is not None and not published and staging.exists():
+            _remove_owned_staging_tree(staging, legacy_root)
+
+    return MigrationReport(
+        bundle_path=bundle,
+        database_sha256=database_before.sha256,
+        wiki_sha256=wiki_before.sha256,
+        portable_action=portable_action,
+        blocking_tables=blocking_tables,
+    )
+
+
 def inspect_legacy_db(path: Path) -> LegacyInventory:
     """Return a fail-closed, read-only inventory of ``path``.
 
@@ -173,6 +341,412 @@ def inspect_legacy_db(path: Path) -> LegacyInventory:
         )
 
     return LegacyInventory(db_path=db_path, tables=tables, sha256=after.sha256)
+
+
+def _validate_local_pending(vault: object, local_pending: Path) -> Path:
+    try:
+        local_root_value = Path(vault.local_root)
+        state_home_value = Path(vault.state_home)
+        vault_root_value = Path(vault.root)
+    except (AttributeError, TypeError) as error:
+        raise UnsafePath("legacy staging requires an initialized Vault") from error
+
+    local_root = validate_path_chain(local_root_value, allow_missing=False).resolve(
+        strict=True
+    )
+    state_home = validate_path_chain(state_home_value, allow_missing=False).resolve(
+        strict=True
+    )
+    vault_root = validate_path_chain(vault_root_value, allow_missing=False).resolve(
+        strict=True
+    )
+    expected = validate_path_chain(local_root / "pending", allow_missing=False).resolve(
+        strict=True
+    )
+    supplied = validate_path_chain(Path(local_pending), allow_missing=True).resolve(
+        strict=False
+    )
+    if supplied != expected:
+        raise UnsafePath("legacy staging must use the Vault's exact local pending root")
+    if not expected.is_relative_to(local_root) or not expected.is_relative_to(state_home):
+        raise UnsafePath("legacy staging pending root is outside MADI_STATE_HOME")
+    if expected.is_relative_to(vault_root) or vault_root.is_relative_to(expected):
+        raise UnsafePath("legacy staging pending root overlaps the portable Vault")
+    if not expected.is_dir() or is_symlink_or_reparse(expected):
+        raise UnsafePath("legacy staging pending root is unsafe")
+    validate_path_chain(expected / "legacy", allow_missing=True)
+    return expected
+
+
+def _resolve_wiki_path(path: Path) -> Path:
+    try:
+        requested = validate_path_chain(path, allow_missing=False)
+        resolved = requested.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise LegacyStagingError("legacy Wiki is unavailable") from error
+    if is_symlink_or_reparse(requested) or not resolved.is_dir():
+        raise LegacyStagingError("legacy Wiki must be a regular directory")
+    return resolved
+
+
+def _snapshot_wiki(root: Path) -> _WikiSnapshot:
+    validate_path_chain(root, allow_missing=False)
+    files: list[_WikiFileSnapshot] = []
+
+    def visit(directory: Path) -> None:
+        validate_path_chain(directory, allow_missing=False)
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise LegacyStagingError("legacy Wiki cannot be read consistently") from error
+        for entry in entries:
+            entry_path = Path(entry.path)
+            if is_symlink_or_reparse(entry_path):
+                raise LegacyStagingError("legacy Wiki contains a link or reparse point")
+            validate_path_chain(entry_path, allow_missing=False)
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    visit(entry_path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    raise LegacyStagingError(
+                        "legacy Wiki contains an unsupported filesystem entry"
+                    )
+                before = entry.stat(follow_symlinks=False)
+                digest = _sha256_file(entry_path)
+                after = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise LegacyStagingError(
+                    "legacy Wiki changed or became unavailable during hashing"
+                ) from error
+            if (before.st_size, before.st_mtime_ns) != (
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise LegacyStagingError("legacy Wiki changed during hashing")
+            files.append(
+                _WikiFileSnapshot(
+                    path=entry_path.relative_to(root).as_posix(),
+                    size=after.st_size,
+                    mtime_ns=after.st_mtime_ns,
+                    sha256=digest,
+                )
+            )
+
+    visit(root)
+    ordered = tuple(sorted(files, key=lambda item: item.path))
+    public_files = [
+        {"path": item.path, "sha256": item.sha256, "size": item.size}
+        for item in ordered
+    ]
+    return _WikiSnapshot(
+        root=root,
+        files=ordered,
+        sha256=sha256(_json_bytes({"files": public_files})).hexdigest(),
+    )
+
+
+def _copy_database_snapshot(source: Path, target: Path) -> None:
+    validate_path_chain(source, allow_missing=False)
+    validate_path_chain(target, allow_missing=True)
+    validate_path_chain(target.parent, allow_missing=False)
+    try:
+        with source.open("rb") as reader, target.open("xb") as writer:
+            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+            writer.flush()
+            os.fsync(writer.fileno())
+    except OSError as error:
+        raise LegacyStagingError("legacy database snapshot copy failed") from error
+    validate_path_chain(target, allow_missing=False)
+
+
+def _export_tables(
+    database_snapshot: Path,
+    inventory: LegacyInventory,
+    table_directory: Path,
+) -> list[dict[str, Any]]:
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(_readonly_uri(database_snapshot), uri=True)
+        connection.text_factory = bytes
+        connection.execute("BEGIN")
+        manifests: list[dict[str, Any]] = []
+        for ordinal, table_name in enumerate(sorted(inventory.tables), start=1):
+            table = inventory.tables[table_name]
+            rows = _read_typed_rows(connection, table)
+            if len(rows) != table.row_count:
+                raise LegacyStagingError(
+                    "staged table row count differs from the inspected snapshot"
+                )
+            document = {
+                "format": "madi.legacy-sqlite-table.v1",
+                "rows": rows,
+                "table": {
+                    "classification": table.classification,
+                    "columns": [
+                        {
+                            "declared_type": column.declared_type,
+                            "default": column.default,
+                            "name": column.name,
+                            "not_null": column.not_null,
+                            "primary_key_position": column.primary_key_position,
+                        }
+                        for column in table.columns
+                    ],
+                    "name": table.name,
+                    "row_count": table.row_count,
+                    "schema_sql": table.schema,
+                },
+            }
+            export_name = f"{ordinal:06d}.json"
+            export_path = table_directory / export_name
+            _write_json_document(export_path, document)
+            semantics = _staging_semantics(table.classification)
+            manifests.append(
+                {
+                    "classification": table.classification,
+                    "export_path": f"tables/{export_name}",
+                    "name": table.name,
+                    "reason": table.reason,
+                    "row_count": table.row_count,
+                    "sha256": _sha256_file(export_path),
+                    **semantics,
+                }
+            )
+        return manifests
+    except sqlite3.DatabaseError as error:
+        raise LegacyStagingError("staged database could not be exported losslessly") from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _read_typed_rows(
+    connection: sqlite3.Connection, table: LegacyTable
+) -> list[dict[str, Any]]:
+    escaped_table = table.name.replace('"', '""')
+    primary_key_indexes = tuple(
+        index
+        for index, _column in sorted(
+            enumerate(table.columns),
+            key=lambda item: item[1].primary_key_position or len(table.columns) + 1,
+        )
+        if table.columns[index].primary_key_position > 0
+    )
+    can_use_rowid = not primary_key_indexes and not {
+        column.name.casefold() for column in table.columns
+    }.intersection({"rowid", "_rowid_", "oid"})
+
+    selectors: list[str] = []
+    if can_use_rowid:
+        selectors.extend(("rowid", "typeof(rowid)"))
+    for column in table.columns:
+        escaped_column = column.name.replace('"', '""')
+        identifier = f'"{escaped_column}"'
+        selectors.extend((identifier, f"typeof({identifier})"))
+    query = f'SELECT {", ".join(selectors)} FROM "{escaped_table}"'
+    try:
+        raw_rows = connection.execute(query).fetchall()
+    except sqlite3.DatabaseError:
+        if not can_use_rowid:
+            raise
+        can_use_rowid = False
+        selectors = []
+        for column in table.columns:
+            escaped_column = column.name.replace('"', '""')
+            identifier = f'"{escaped_column}"'
+            selectors.extend((identifier, f"typeof({identifier})"))
+        query = f'SELECT {", ".join(selectors)} FROM "{escaped_table}"'
+        raw_rows = connection.execute(query).fetchall()
+
+    prepared: list[tuple[bytes, dict[str, Any]]] = []
+    for raw_row in raw_rows:
+        offset = 0
+        rowid_value: dict[str, Any] | None = None
+        if can_use_rowid:
+            rowid_value = _typed_value("rowid", raw_row[1], raw_row[0])
+            offset = 2
+        values = [
+            _typed_value(
+                column.name,
+                raw_row[offset + index * 2 + 1],
+                raw_row[offset + index * 2],
+            )
+            for index, column in enumerate(table.columns)
+        ]
+        if primary_key_indexes:
+            locator = {
+                "kind": "primary-key",
+                "values": [values[index] for index in primary_key_indexes],
+            }
+            sort_key = _json_bytes(locator)
+        elif rowid_value is not None:
+            locator = {"kind": "rowid", "value": rowid_value}
+            sort_key = _json_bytes(locator)
+        else:
+            locator = {"kind": "ordinal"}
+            sort_key = _json_bytes(values)
+        prepared.append((sort_key, {"locator": locator, "values": values}))
+
+    prepared.sort(key=lambda item: item[0])
+    rows: list[dict[str, Any]] = []
+    for ordinal, (_sort_key, row) in enumerate(prepared, start=1):
+        if row["locator"]["kind"] == "ordinal":
+            row["locator"]["value"] = ordinal
+        rows.append({"ordinal": ordinal, **row})
+    return rows
+
+
+def _typed_value(column: str, sqlite_type: object, value: object) -> dict[str, Any]:
+    if isinstance(sqlite_type, bytes):
+        try:
+            sqlite_type = sqlite_type.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise LegacyStagingError("SQLite returned an invalid storage class") from error
+    if not isinstance(sqlite_type, str):
+        raise LegacyStagingError("SQLite returned an invalid storage class")
+    storage_class = sqlite_type.upper()
+    encoded: dict[str, Any] = {"column": column, "storage_class": storage_class}
+    if storage_class == "NULL":
+        encoded["value"] = None
+    elif storage_class == "INTEGER":
+        encoded.update(encoding="decimal", value=str(value))
+    elif storage_class == "REAL":
+        encoded.update(encoding="float.hex", value=float(value).hex())
+    elif storage_class == "TEXT":
+        if isinstance(value, str):
+            encoded["value"] = value
+        elif isinstance(value, bytes):
+            try:
+                encoded["value"] = value.decode("utf-8")
+            except UnicodeDecodeError:
+                encoded.update(
+                    encoding="base64",
+                    value=base64.b64encode(value).decode("ascii"),
+                )
+        else:
+            raise LegacyStagingError("SQLite TEXT value could not be decoded losslessly")
+    elif storage_class == "BLOB":
+        try:
+            raw = bytes(value)
+        except (TypeError, ValueError) as error:
+            raise LegacyStagingError("SQLite BLOB value could not be encoded") from error
+        encoded.update(encoding="base64", value=base64.b64encode(raw).decode("ascii"))
+    else:
+        raise LegacyStagingError("SQLite returned an unknown storage class")
+    return encoded
+
+
+def _staging_semantics(classification: str) -> dict[str, Any]:
+    common = {
+        "accepted": False,
+        "blocks_portable_action": False,
+        "durable_markdown_exported": False,
+        "portable": False,
+        "rebuildable": False,
+    }
+    if classification == "candidate-durable-local":
+        return {**common, "destination": "local-review", "review_status": "needs-review"}
+    if classification == "growth-local":
+        return {**common, "destination": "growth-lab-local", "review_status": "local-only"}
+    if classification == "generated":
+        return {
+            **common,
+            "destination": "generated-rebuildable",
+            "rebuildable": True,
+            "review_status": "rebuildable",
+        }
+    if classification == "local-transient":
+        return {**common, "destination": "local-transient", "review_status": "local-only"}
+    return {
+        **common,
+        "blocks_portable_action": True,
+        "destination": "local-review",
+        "review_status": "needs-review",
+    }
+
+
+def _migration_manifest(
+    database: Path,
+    database_sha256: str,
+    snapshot_sha256: str,
+    wiki: _WikiSnapshot,
+    tables: list[dict[str, Any]],
+    portable_action: str,
+    blocking_tables: tuple[str, ...],
+) -> dict[str, Any]:
+    action_reason = (
+        "unknown legacy tables require explicit human classification"
+        if blocking_tables
+        else "staging never authorizes portable registration or promotion"
+    )
+    return {
+        "confidential": True,
+        "format": "madi.legacy-staging-manifest.v1",
+        "portable_action": {
+            "blocking_tables": list(blocking_tables),
+            "reason": action_reason,
+            "status": portable_action,
+        },
+        "source": {
+            "database": {
+                "authority": "legacy-runtime",
+                "copied": True,
+                "path": str(database),
+                "sha256": database_sha256,
+                "snapshot_sha256": snapshot_sha256,
+            },
+            "wiki": {
+                "authority": "external-source",
+                "copied": False,
+                "files": [
+                    {"path": item.path, "sha256": item.sha256, "size": item.size}
+                    for item in wiki.files
+                ],
+                "path": str(wiki.root),
+                "registration": {
+                    "binding": "machine-local",
+                    "read_only": True,
+                    "registry_storage_class": "local-only",
+                    "status": "requires-authorized-core-api",
+                },
+                "sha256": wiki.sha256,
+            },
+        },
+        "storage_class": "local-only",
+        "tables": tables,
+    }
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def _write_json_document(path: Path, value: dict[str, Any]) -> None:
+    target = validate_path_chain(path, allow_missing=True)
+    validate_path_chain(target.parent, allow_missing=False)
+    encoded = _json_bytes(value)
+    try:
+        with target.open("xb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        raise LegacyStagingError("legacy staging JSON write failed") from error
+    validate_path_chain(target, allow_missing=False)
+
+
+def _remove_owned_staging_tree(staging: Path, legacy_root: Path) -> None:
+    root = validate_path_chain(legacy_root, allow_missing=False).resolve(strict=True)
+    target = validate_path_chain(staging, allow_missing=False).resolve(strict=True)
+    if target.parent != root or not target.name.startswith(".") or not target.name.endswith(
+        ".staging"
+    ):
+        raise LegacyStagingError("refusing to clean an unowned staging path")
+    shutil.rmtree(target)
 
 
 def _resolve_legacy_path(path: Path) -> Path:
