@@ -64,6 +64,16 @@ def test_self_model_assess_without_generation_is_graceful_and_persists_shape(
 ):
     from mneme import llm, self_model
 
+    conn = legacy_growth_runtime.get_connection()
+    with conn:
+        conn.execute(
+            """INSERT INTO episodes
+               (session_id, agent, tool, query, result_summary, success, score)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("legacy-growth", "tester", "episode_reflect", "task", "outcome", 1, 0.75),
+        )
+    conn.close()
+
     monkeypatch.setattr(llm, "is_available", lambda: False)
     monkeypatch.setattr(
         llm,
@@ -75,8 +85,8 @@ def test_self_model_assess_without_generation_is_graceful_and_persists_shape(
 
     assert result == {
         "ran": True,
-        "episodes_seen": 0,
-        "success_rate": 0.0,
+        "episodes_seen": 1,
+        "success_rate": 1.0,
         "growth_rate": 0.0,
         "calibration_error": None,
         "difficulty": 0.6,
@@ -98,8 +108,30 @@ def test_self_model_assess_without_generation_is_graceful_and_persists_shape(
         "curriculum",
         "notes",
     }
-    assert row["calibration_error"] is None
-    assert row["curriculum"] == "[]"
+    assert row["id"] == 1
+    assert row["assessed_at"]
+    assert {
+        key: row[key]
+        for key in (
+            "episodes_seen",
+            "success_rate",
+            "growth_rate",
+            "calibration_error",
+            "difficulty",
+            "regulation",
+            "curriculum",
+            "notes",
+        )
+    } == {
+        "episodes_seen": 1,
+        "success_rate": 1.0,
+        "growth_rate": 0.0,
+        "calibration_error": None,
+        "difficulty": 0.6,
+        "regulation": "healthy",
+        "curriculum": "[]",
+        "notes": None,
+    }
 
 
 def test_growth_db_log_and_legacy_mcp_growth_response_shapes(legacy_growth_runtime):
