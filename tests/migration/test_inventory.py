@@ -106,6 +106,7 @@ def legacy_db(tmp_path: Path) -> Path:
             );
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE future_durable_data (entry_id TEXT PRIMARY KEY, payload BLOB);
+            CREATE TABLE sqlitex_private (entry_id TEXT PRIMARY KEY, payload TEXT);
             INSERT INTO wiki_fts(path, content) VALUES ('wiki/example.md', 'indexed text');
             INSERT INTO facts(content) VALUES ('A potentially durable fact');
             INSERT INTO episodes(session_id, success) VALUES ('session-1', 1);
@@ -116,6 +117,10 @@ def legacy_db(tmp_path: Path) -> Path:
             INSERT INTO growth_actions(kind, severity) VALUES ('calibration', 'warn');
             INSERT INTO meta(key, value) VALUES ('schema_version', '2');
             INSERT INTO future_durable_data(entry_id, payload) VALUES ('unknown-1', X'CAFE');
+            INSERT INTO sqlitex_private(entry_id, payload) VALUES (
+                'private-1', 'must not be omitted'
+            );
+            ANALYZE;
             """
         )
         conn.commit()
@@ -133,10 +138,22 @@ def test_inventory_is_read_only_and_classifies_mixed_state(legacy_db: Path):
 
     report = inspect_legacy_db(legacy_db)
 
+    connection = sqlite3.connect(legacy_db)
+    try:
+        sqlite_master_tables = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        }
+    finally:
+        connection.close()
+
     assert legacy_db.read_bytes() == before_bytes
     assert legacy_db.stat().st_mtime_ns == before_mtime
     assert report.db_path == legacy_db.resolve()
     assert report.sha256 == sha256(before_bytes).hexdigest()
+    assert set(report.tables) == sqlite_master_tables
 
     assert report.tables["wiki_fts"].classification == "generated"
     assert report.tables["wiki_index"].classification == "generated"
@@ -148,6 +165,9 @@ def test_inventory_is_read_only_and_classifies_mixed_state(legacy_db: Path):
     assert report.tables["loop_cycles"].classification == "growth-local"
     assert report.tables["self_model"].classification == "growth-local"
     assert report.tables["growth_actions"].classification == "growth-local"
+    assert report.tables["sqlite_sequence"].classification == "local-transient"
+    assert report.tables["sqlite_stat1"].classification == "generated"
+    assert report.tables["sqlitex_private"].classification == "needs-review"
 
     fts_internal_tables = {
         "wiki_fts_data",

@@ -13,6 +13,12 @@ server, watcher, scheduler, and ad-hoc SQLite clients. A closed database must ha
 no adjacent `-wal`, `-shm`, or `-journal` file. Inspection and staging fail closed
 when a sidecar is present or the database changes while it is being read.
 
+The V1 staging boundary assumes source writers and filesystem actors are trusted
+and quiescent, or cooperate with the staging command. Repeated source snapshots
+detect deterministic and cooperative changes; they are not an operating-system
+snapshot or a defense against a malicious process that can rewrite paths between
+checks.
+
 Keep the external Wiki in place. Madi treats it as a read-only external source,
 not project truth to copy into the personal Vault.
 
@@ -61,28 +67,51 @@ Wiki is not copied. Its external path, aggregate digest, and per-file digests ar
 recorded only in the confidential local manifest. Nothing in the bundle is
 written beneath the portable Vault checkout.
 
-The command builds the bundle in a private sibling temporary directory and
-renames it into place only after all checks succeed. A database/Wiki mutation,
-unsafe path, export error, or publication conflict removes the temporary bundle
-and leaves no partial `<db-sha256>` directory. An existing bundle is never
+The command rejects either direction of canonical overlap between the Wiki and
+the local pending root before it creates a lock or output directory. It builds
+the bundle in a private sibling temporary directory, writes the manifest, then
+revalidates both sources immediately before renaming the directory into place. A
+detected database/Wiki mutation, unsafe path, export error, or cooperative
+publication conflict removes the temporary bundle and leaves no partial
+`<db-sha256>` directory. Existing bundles are checked and refused without being
 overwritten.
+
+The machine-local lock serializes cooperating Madi staging commands. Current
+cross-platform Python/filesystem primitives do not provide both handle-relative
+path traversal and an atomic rename-if-absent operation for directories. There
+is therefore a residual check/use window between the final path/source checks
+and rename if an untrusted local process can mutate the filesystem. Do not run
+staging in a directory writable by an adversarial process; the V1 contract does
+not claim protection from that actor.
 
 ## Lossless typed export format
 
-`manifest.json` uses `madi.legacy-staging-manifest.v1`. Every SQLite table,
-including generated FTS shadow tables and unknown future tables, has one local
-`madi.legacy-sqlite-table.v1` JSON export. Each export records:
+`manifest.json` uses `madi.legacy-staging-manifest.v1`. Every table returned by
+`sqlite_master`, including recognized SQLite internal tables, generated FTS
+shadow tables, user tables whose names resemble `sqlite_*`, and unknown future
+tables, has one local `madi.legacy-sqlite-table.v1` JSON export. Each export
+records:
 
 - the exact `sqlite_master` schema SQL;
-- every column's name, declared type, nullability, default, and primary-key
-  position;
+- every `pragma_table_xinfo` column's `cid`, name, declared type, nullability,
+  default, primary-key position, hidden code, and generated kind;
 - the inspected and exported row count;
-- a deterministic ordinal and a primary-key, `rowid`, or ordinal locator;
-- every value with its SQLite storage class;
+- a deterministic ordinal and, in priority order, a hidden `rowid`, guaranteed
+  non-null/unique primary key, or full-row deterministic fallback locator;
+- every directly selectable visible, generated, and virtual hidden value with
+  its SQLite storage class; a virtual-table hidden column that a module refuses
+  to select remains present with an explicit unavailable marker rather than
+  being silently omitted;
 - integers as decimal strings, reals as `float.hex`, valid UTF-8 text as JSON
   text, undecodable `TEXT` bytes as tagged base64 while retaining storage class
   `TEXT`, `NULL` as `null`, and BLOBs as tagged base64;
 - a SHA-256 digest of the canonical typed JSON in the manifest.
+
+FTS5's table-named hidden control column is directly selectable, but SQLite
+returns a query-context cursor token rather than stored row content. The export
+records the observed typed control value and keeps the byte-identical database
+snapshot as the durable authority; reviewers must not interpret that token as a
+portable datum.
 
 These JSON files are review material. They are not durable Markdown and are not
 accepted memory.
@@ -94,6 +123,8 @@ accepted memory.
 | `facts`, `episodes` | `candidate-durable-local` / `needs-review` | Confidential local review only; never accepted or portable automatically |
 | `skills`, `loop_cycles`, `self_model`, `growth_actions` | `growth-local` | Optional local Growth Lab review |
 | Wiki/FTS generated tables | `generated` | Preserved in the snapshot/export but reported rebuildable; no durable Markdown |
+| SQLite planner statistics | `generated` | Preserved locally and reported rebuildable |
+| SQLite AUTOINCREMENT sequence state | `local-transient` | Preserved locally; no automatic promotion |
 | `working`, `meta` with known schema | `local-transient` | Preserved locally; no automatic promotion |
 | Any unknown or schema-lookalike table | `needs-review` | Preserved losslessly and blocks portable registration/promotion |
 

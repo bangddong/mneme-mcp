@@ -117,6 +117,16 @@ def legacy_sources(tmp_path: Path) -> tuple[Path, Path]:
             );
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE future_durable_data (entry_id TEXT PRIMARY KEY, payload BLOB);
+            CREATE TABLE sqlitex_private (entry_id TEXT PRIMARY KEY, payload TEXT);
+            CREATE TABLE generated_values (
+                base INTEGER,
+                virtual_value INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL,
+                stored_value TEXT GENERATED ALWAYS AS ('stored-' || base) STORED
+            );
+            CREATE TABLE nullable_primary_key (
+                external_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL
+            );
             INSERT INTO wiki_fts(path, content) VALUES ('wiki/example.md', 'indexed text');
             INSERT INTO wiki_index VALUES (
                 'wiki/example.md', 'summary', '["migration"]', 'abc',
@@ -175,6 +185,12 @@ def legacy_sources(tmp_path: Path) -> tuple[Path, Path]:
             );
             INSERT INTO meta VALUES ('schema_version', '2');
             INSERT INTO future_durable_data VALUES ('unknown-1', X'CAFE');
+            INSERT INTO sqlitex_private VALUES ('private-1', 'must not be omitted');
+            INSERT INTO generated_values(base) VALUES (7);
+            INSERT INTO nullable_primary_key VALUES (NULL, 'zeta');
+            INSERT INTO nullable_primary_key VALUES (NULL, 'alpha');
+            INSERT INTO nullable_primary_key VALUES ('known', 'middle');
+            ANALYZE;
             """
         )
         connection.commit()
@@ -194,6 +210,33 @@ def _file_state(root: Path) -> dict[str, tuple[bytes, int]]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _tree_state(root: Path) -> tuple[tuple[str, str, bytes | None], ...]:
+    return tuple(
+        (
+            path.relative_to(root).as_posix(),
+            "directory" if path.is_dir() else "file",
+            None if path.is_dir() else path.read_bytes(),
+        )
+        for path in sorted(root.rglob("*"))
+    )
+
+
+def _sqlite_master_tables(db_path: Path) -> dict[str, str | None]:
+    connection = sqlite3.connect(db_path)
+    try:
+        return dict(
+            connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            ).fetchall()
+        )
+    finally:
+        connection.close()
+
+
+def _generated_kind(hidden: int) -> str | None:
+    return {2: "virtual", 3: "stored"}.get(hidden)
 
 
 def _load_table(bundle: Path, manifest: dict, table_name: str) -> tuple[dict, dict]:
@@ -277,6 +320,7 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
     before_db = db_path.read_bytes()
     before_db_mtime = db_path.stat().st_mtime_ns
     before_wiki = _file_state(wiki_path)
+    source_tables = _sqlite_master_tables(db_path)
     inventory = inspect_legacy_db(db_path)
 
     report = stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
@@ -285,7 +329,7 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
     assert db_path.stat().st_mtime_ns == before_db_mtime
     assert _file_state(wiki_path) == before_wiki
     assert db_path.exists() and wiki_path.exists()
-    assert set(inspect_legacy_db(db_path).tables) == set(inventory.tables)
+    assert set(inspect_legacy_db(db_path).tables) == set(source_tables)
 
     db_digest = sha256(before_db).hexdigest()
     bundle = vault.local_root / "pending" / "legacy" / db_digest
@@ -318,7 +362,7 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
     ).hexdigest()
     assert report.wiki_sha256 == manifest["source"]["wiki"]["sha256"]
 
-    assert {item["name"] for item in manifest["tables"]} == set(inventory.tables)
+    assert {item["name"] for item in manifest["tables"]} == set(source_tables)
     connection = sqlite3.connect(db_path)
     connection.text_factory = lambda raw: (
         raw.decode("utf-8")
@@ -326,7 +370,8 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
         else raw
     )
     try:
-        for table_name, inspected in inventory.tables.items():
+        for table_name in source_tables:
+            inspected = inventory.tables[table_name]
             table_manifest, exported = _load_table(bundle, manifest, table_name)
             assert table_manifest["row_count"] == inspected.row_count
             assert exported["format"] == "madi.legacy-sqlite-table.v1"
@@ -335,19 +380,30 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
             assert exported["table"]["row_count"] == inspected.row_count
 
             source_columns = connection.execute(
-                'SELECT name, type, "notnull", dflt_value, pk '
-                "FROM pragma_table_info(?) ORDER BY cid",
+                'SELECT cid, name, type, "notnull", dflt_value, pk, hidden '
+                "FROM pragma_table_xinfo(?) ORDER BY cid",
                 (table_name,),
             ).fetchall()
             assert exported["table"]["columns"] == [
                 {
+                    "cid": cid,
                     "name": name,
                     "declared_type": declared_type,
                     "not_null": bool(not_null),
                     "default": default,
                     "primary_key_position": primary_key_position,
+                    "hidden": hidden,
+                    "generated": _generated_kind(hidden),
                 }
-                for name, declared_type, not_null, default, primary_key_position in source_columns
+                for (
+                    cid,
+                    name,
+                    declared_type,
+                    not_null,
+                    default,
+                    primary_key_position,
+                    hidden,
+                ) in source_columns
             ]
             assert len(exported["rows"]) == inspected.row_count
             assert [row["ordinal"] for row in exported["rows"]] == list(
@@ -359,13 +415,34 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
             )
 
             escaped_name = table_name.replace('"', '""')
-            source_rows = connection.execute(f'SELECT * FROM "{escaped_name}"').fetchall()
+            column_selectors = ", ".join(
+                f'"{name.replace(chr(34), chr(34) * 2)}"'
+                for _cid, name, *_rest in source_columns
+            )
+            source_rows = connection.execute(
+                f'SELECT {column_selectors} FROM "{escaped_name}"'
+            ).fetchall()
             exported_rows = [
                 tuple(_decode_typed_value(item) for item in row["values"])
                 for row in exported["rows"]
             ]
-            assert sorted(exported_rows, key=_sortable_row) == sorted(
-                source_rows, key=_sortable_row
+            # FTS5's table-named hidden control column returns a per-query
+            # cursor token (1, 2, ...), not stored row data.  Its presence and
+            # storage class are asserted independently below; compare every
+            # stable accessible value here.
+            stable_indexes = [
+                index
+                for index, (_cid, name, *_metadata) in enumerate(source_columns)
+                if not (table_name == "wiki_fts" and name == table_name)
+            ]
+            stable_exported_rows = [
+                tuple(row[index] for index in stable_indexes) for row in exported_rows
+            ]
+            stable_source_rows = [
+                tuple(row[index] for index in stable_indexes) for row in source_rows
+            ]
+            assert sorted(stable_exported_rows, key=_sortable_row) == sorted(
+                stable_source_rows, key=_sortable_row
             )
     finally:
         connection.close()
@@ -398,7 +475,7 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
         "storage_class": "BLOB",
         "value": base64.b64encode(b"\x00\xff\x10").decode("ascii"),
     }
-    assert episodes["rows"][0]["locator"]["kind"] == "primary-key"
+    assert episodes["rows"][0]["locator"]["kind"] == "rowid"
     invalid_text_row = next(
         row
         for row in episodes["rows"]
@@ -414,6 +491,40 @@ def test_stage_preserves_sources_and_exports_every_sqlite_value_losslessly(
         "storage_class": "TEXT",
         "value": base64.b64encode(b"\x80\xff").decode("ascii"),
     }
+
+    _generated_manifest, generated = _load_table(
+        bundle, manifest, "generated_values"
+    )
+    generated_columns = {
+        column["name"]: column for column in generated["table"]["columns"]
+    }
+    assert generated_columns["virtual_value"]["hidden"] == 2
+    assert generated_columns["virtual_value"]["generated"] == "virtual"
+    assert generated_columns["stored_value"]["hidden"] == 3
+    assert generated_columns["stored_value"]["generated"] == "stored"
+    generated_values = {
+        item["column"]: _decode_typed_value(item)
+        for item in generated["rows"][0]["values"]
+    }
+    assert generated_values == {
+        "base": 7,
+        "virtual_value": 14,
+        "stored_value": "stored-7",
+    }
+
+    _fts_manifest, fts = _load_table(bundle, manifest, "wiki_fts")
+    fts_columns = {column["name"]: column for column in fts["table"]["columns"]}
+    assert fts_columns["wiki_fts"]["hidden"] == 1
+    assert fts_columns["wiki_fts"]["generated"] is None
+    assert fts_columns["rank"]["hidden"] == 1
+    fts_typed_values = {
+        item["column"]: item for item in fts["rows"][0]["values"]
+    }
+    assert _decode_typed_value(fts_typed_values["path"]) == "wiki/example.md"
+    assert _decode_typed_value(fts_typed_values["content"]) == "indexed text"
+    assert fts_typed_values["wiki_fts"]["storage_class"] == "INTEGER"
+    assert isinstance(_decode_typed_value(fts_typed_values["wiki_fts"]), int)
+    assert _decode_typed_value(fts_typed_values["rank"]) is None
 
     from mneme.core.vault import Vault
 
@@ -446,11 +557,17 @@ def test_stage_classifies_every_destination_and_blocks_unknown_portable_action(
         (report.bundle_path / "manifest.json").read_text(encoding="utf-8")
     )
     tables = {item["name"]: item for item in manifest["tables"]}
+    expected_blockers = (
+        "future_durable_data",
+        "generated_values",
+        "nullable_primary_key",
+        "sqlitex_private",
+    )
 
     assert report.portable_action == "blocked"
-    assert report.blocking_tables == ("future_durable_data",)
+    assert report.blocking_tables == expected_blockers
     assert manifest["portable_action"] == {
-        "blocking_tables": ["future_durable_data"],
+        "blocking_tables": list(expected_blockers),
         "reason": "unknown legacy tables require explicit human classification",
         "status": "blocked",
     }
@@ -472,6 +589,9 @@ def test_stage_classifies_every_destination_and_blocks_unknown_portable_action(
     assert all(item["destination"] == "generated-rebuildable" for item in generated)
     assert all(item["rebuildable"] is True for item in generated)
     assert all(item["durable_markdown_exported"] is False for item in generated)
+    assert tables["sqlite_stat1"]["classification"] == "generated"
+    assert tables["sqlite_sequence"]["classification"] == "local-transient"
+    assert tables["sqlitex_private"]["classification"] == "needs-review"
 
     unknown = tables["future_durable_data"]
     assert unknown["classification"] == "needs-review"
@@ -532,6 +652,97 @@ def test_stage_detects_database_mutation_and_publishes_no_partial_bundle(
     assert _file_state(vault.root) == portable_before
 
 
+def test_typed_rows_use_hidden_rowid_and_ignore_unordered_scan_direction(
+    legacy_sources: tuple[Path, Path],
+):
+    """Nullable declared PKs must not collide or inherit SQLite scan order."""
+    import mneme.migration.legacy as legacy
+
+    db_path, _wiki_path = legacy_sources
+    table = legacy.inspect_legacy_db(db_path).tables["nullable_primary_key"]
+    forward = sqlite3.connect(db_path)
+    reverse = sqlite3.connect(db_path)
+    try:
+        reverse.execute("PRAGMA reverse_unordered_selects = ON")
+        forward_rows = legacy._read_typed_rows(forward, table)
+        reverse_rows = legacy._read_typed_rows(reverse, table)
+    finally:
+        forward.close()
+        reverse.close()
+
+    assert reverse_rows == forward_rows
+    assert [row["ordinal"] for row in forward_rows] == [1, 2, 3]
+    assert {row["locator"]["kind"] for row in forward_rows} == {"rowid"}
+    rowids = [
+        _decode_typed_value(row["locator"]["value"]) for row in forward_rows
+    ]
+    assert rowids == [1, 2, 3]
+    assert len(set(rowids)) == len(forward_rows)
+
+
+def test_stage_revalidates_database_after_manifest_before_publication(
+    vault,
+    legacy_sources: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A writer racing the last JSON write must invalidate the whole bundle."""
+    import mneme.migration.legacy as legacy
+
+    db_path, wiki_path = legacy_sources
+    original_digest = sha256(db_path.read_bytes()).hexdigest()
+    original_write = legacy._write_json_document
+
+    def write_manifest_then_mutate(path: Path, value: dict) -> None:
+        original_write(path, value)
+        if path.name == "manifest.json":
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.execute(
+                    "INSERT INTO facts(content) VALUES ('late concurrent mutation')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+    monkeypatch.setattr(legacy, "_write_json_document", write_manifest_then_mutate)
+
+    with pytest.raises(legacy.LegacyDatabaseChangedError, match="changed"):
+        legacy.stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
+
+    legacy_root = vault.local_root / "pending" / "legacy"
+    assert not (legacy_root / original_digest).exists()
+    assert not legacy_root.exists() or list(legacy_root.iterdir()) == []
+
+
+def test_stage_revalidates_wiki_after_manifest_before_publication(
+    vault,
+    legacy_sources: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A late Wiki edit must not leave a stale manifest or published bundle."""
+    import mneme.migration.legacy as legacy
+
+    db_path, wiki_path = legacy_sources
+    original_digest = sha256(db_path.read_bytes()).hexdigest()
+    original_write = legacy._write_json_document
+
+    def write_manifest_then_mutate(path: Path, value: dict) -> None:
+        original_write(path, value)
+        if path.name == "manifest.json":
+            (wiki_path / "Home.md").write_text(
+                "# Changed after manifest\n", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(legacy, "_write_json_document", write_manifest_then_mutate)
+
+    with pytest.raises(legacy.LegacyStagingError, match="Wiki changed"):
+        legacy.stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
+
+    legacy_root = vault.local_root / "pending" / "legacy"
+    assert not (legacy_root / original_digest).exists()
+    assert not legacy_root.exists() or list(legacy_root.iterdir()) == []
+
+
 def test_stage_cleans_temporary_bundle_when_export_fails(
     vault,
     legacy_sources: tuple[Path, Path],
@@ -555,6 +766,58 @@ def test_stage_cleans_temporary_bundle_when_export_fails(
 
     legacy_root = vault.local_root / "pending" / "legacy"
     assert not legacy_root.exists() or list(legacy_root.iterdir()) == []
+
+
+def test_stage_refuses_existing_bundle_without_overwriting_any_byte(
+    vault, legacy_sources: tuple[Path, Path]
+):
+    """Content-address collision handling must be create-only and fail closed."""
+    from mneme.core.errors import ArtifactExists
+    from mneme.migration.legacy import stage_legacy
+
+    db_path, wiki_path = legacy_sources
+    first = stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
+    bundle_before = _tree_state(first.bundle_path)
+
+    with pytest.raises(ArtifactExists):
+        stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
+
+    assert _tree_state(first.bundle_path) == bundle_before
+    assert list(first.bundle_path.parent.iterdir()) == [first.bundle_path]
+
+
+@pytest.mark.parametrize(
+    "overlap",
+    ["same", "wiki-contains-pending", "pending-contains-wiki"],
+)
+def test_stage_rejects_wiki_overlapping_pending_before_lock_or_output_creation(
+    vault, legacy_sources: tuple[Path, Path], overlap: str
+):
+    """Either direction of canonical overlap must be rejected without writes."""
+    from mneme.core.errors import UnsafePath
+    from mneme.migration.legacy import stage_legacy
+
+    db_path, _external_wiki = legacy_sources
+    pending = vault.local_root / "pending"
+    if overlap == "same":
+        wiki_path = pending
+    elif overlap == "wiki-contains-pending":
+        wiki_path = vault.local_root
+    else:
+        wiki_path = pending / "source-wiki"
+        wiki_path.mkdir()
+        (wiki_path / "Home.md").write_text("# Still external\n", encoding="utf-8")
+    lock_path = vault.local_root / "locks" / "legacy-migration.lock"
+    database_before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
+    wiki_before = _tree_state(wiki_path)
+
+    with pytest.raises(UnsafePath, match="overlap"):
+        stage_legacy(db_path, wiki_path, vault, pending)
+
+    assert _tree_state(wiki_path) == wiki_before
+    assert (db_path.read_bytes(), db_path.stat().st_mtime_ns) == database_before
+    assert not lock_path.exists()
+    assert not (pending / "legacy").exists()
 
 
 @pytest.mark.parametrize("unsafe_location", ["outside", "portable", "cache"])
@@ -664,6 +927,8 @@ def test_migrate_cli_inspects_then_stages_without_promoting_source_payloads(
         "facts",
         "episodes",
         "future_durable_data",
+        "sqlite_sequence",
+        "sqlitex_private",
     }
     assert not list((vault.local_root / "pending").iterdir())
     assert _file_state(vault.root) == portable_before
@@ -686,7 +951,12 @@ def test_migrate_cli_inspects_then_stages_without_promoting_source_payloads(
     assert staged["command"] == "migrate"
     assert staged["status"] == "needs-review"
     assert staged["result"]["portable_action"] == "blocked"
-    assert staged["result"]["blocking_tables"] == ["future_durable_data"]
+    assert staged["result"]["blocking_tables"] == [
+        "future_durable_data",
+        "generated_values",
+        "nullable_primary_key",
+        "sqlitex_private",
+    ]
     assert Path(staged["result"]["bundle_path"]).is_relative_to(vault.local_root)
     assert (db_path.read_bytes(), _file_state(wiki_path)) == source_before
     assert _file_state(vault.root) == portable_before

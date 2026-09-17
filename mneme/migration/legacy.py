@@ -49,11 +49,14 @@ class LegacyStagingError(LegacyInspectionError):
 class LegacyColumn:
     """Column metadata preserved for later, offline migration review."""
 
+    cid: int
     name: str
     declared_type: str
     not_null: bool
     default: str | None
     primary_key_position: int
+    hidden: int
+    generated: str | None
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,9 @@ class _WikiSnapshot:
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _FTS5_INTERNAL_SUFFIXES = frozenset({"data", "idx", "content", "docsize", "config"})
+_SQLITE_PLANNER_TABLES = frozenset(
+    {"sqlite_stat1", "sqlite_stat2", "sqlite_stat3", "sqlite_stat4"}
+)
 
 _KNOWN_COLUMN_NAMES = {
     "wiki_index": (
@@ -194,10 +200,17 @@ def stage_legacy(
     database bytes into a temporary local directory, exports typed review JSON,
     and renames the completed directory into place as the final publication
     step.  It never writes a portable registry, memory, or session artifact.
+
+    Source writers and other staging processes are expected to be quiescent or
+    cooperative.  Repeated byte/directory snapshots and the local staging lock
+    detect deterministic/cooperative changes, but portable Python filesystem
+    primitives cannot provide handle-relative traversal or an atomic,
+    cross-platform rename-if-absent against an adversarial local process.
     """
     pending = _validate_local_pending(vault, local_pending)
     database = _resolve_legacy_path(Path(db_path))
     wiki = _resolve_wiki_path(Path(wiki_path))
+    _require_wiki_outside_pending(wiki, pending)
     database_before = _snapshot(database)
     inventory = inspect_legacy_db(database)
     database_after_inventory = _snapshot_after_inspection(database)
@@ -255,15 +268,13 @@ def stage_legacy(
                 database_snapshot, snapshot_inventory, table_directory
             )
 
-            database_final = _snapshot_after_inspection(database)
-            _require_no_sidecars(database, phase="before staging publication")
-            wiki_final = _snapshot_wiki(wiki)
-            if database_final != database_before:
-                raise LegacyDatabaseChangedError(
-                    f"legacy database changed during staging: {database}"
-                )
-            if wiki_final != wiki_before:
-                raise LegacyStagingError("legacy Wiki changed during staging")
+            _require_sources_unchanged(
+                database,
+                database_before,
+                wiki,
+                wiki_before,
+                phase="before manifest construction",
+            )
 
             blocking_tables = tuple(
                 item["name"]
@@ -282,12 +293,28 @@ def stage_legacy(
             )
             _write_json_document(staging / "manifest.json", manifest)
 
+            # This is intentionally after the last bundle write and immediately
+            # before publication.  A source change during manifest construction
+            # must invalidate the temporary bundle rather than publish stale
+            # review metadata.
+            _require_sources_unchanged(
+                database,
+                database_before,
+                wiki,
+                wiki_before,
+                phase="immediately before staging publication",
+            )
             _validate_local_pending(vault, pending)
             validate_path_chain(staging, allow_missing=False)
             validate_path_chain(bundle, allow_missing=True)
             if bundle.exists() or is_symlink_or_reparse(bundle):
                 raise ArtifactExists("legacy staging bundle appeared during publication")
-            staging.rename(bundle)
+            try:
+                staging.rename(bundle)
+            except FileExistsError as error:
+                raise ArtifactExists(
+                    "legacy staging bundle appeared during publication"
+                ) from error
             published = True
     except (LegacyInspectionError, InvalidArtifact, ArtifactExists):
         raise
@@ -389,6 +416,35 @@ def _resolve_wiki_path(path: Path) -> Path:
     return resolved
 
 
+def _require_wiki_outside_pending(wiki: Path, pending: Path) -> None:
+    """Reject either direction of canonical Wiki/output containment."""
+    if (
+        wiki == pending
+        or wiki.is_relative_to(pending)
+        or pending.is_relative_to(wiki)
+    ):
+        raise UnsafePath("legacy Wiki and local pending output must not overlap")
+
+
+def _require_sources_unchanged(
+    database: Path,
+    database_before: _FileSnapshot,
+    wiki: Path,
+    wiki_before: _WikiSnapshot,
+    *,
+    phase: str,
+) -> None:
+    database_after = _snapshot_after_inspection(database)
+    _require_no_sidecars(database, phase=phase)
+    wiki_after = _snapshot_wiki(wiki)
+    if database_after != database_before:
+        raise LegacyDatabaseChangedError(
+            f"legacy database changed during staging: {database}"
+        )
+    if wiki_after != wiki_before:
+        raise LegacyStagingError("legacy Wiki changed during staging")
+
+
 def _snapshot_wiki(root: Path) -> _WikiSnapshot:
     validate_path_chain(root, allow_missing=False)
     files: list[_WikiFileSnapshot] = []
@@ -485,8 +541,11 @@ def _export_tables(
                     "classification": table.classification,
                     "columns": [
                         {
+                            "cid": column.cid,
                             "declared_type": column.declared_type,
                             "default": column.default,
+                            "generated": column.generated,
+                            "hidden": column.hidden,
                             "name": column.name,
                             "not_null": column.not_null,
                             "primary_key_position": column.primary_key_position,
@@ -525,67 +584,78 @@ def _read_typed_rows(
     connection: sqlite3.Connection, table: LegacyTable
 ) -> list[dict[str, Any]]:
     escaped_table = table.name.replace('"', '""')
-    primary_key_indexes = tuple(
-        index
-        for index, _column in sorted(
-            enumerate(table.columns),
-            key=lambda item: item[1].primary_key_position or len(table.columns) + 1,
-        )
-        if table.columns[index].primary_key_position > 0
-    )
-    can_use_rowid = not primary_key_indexes and not {
-        column.name.casefold() for column in table.columns
-    }.intersection({"rowid", "_rowid_", "oid"})
+    table_identifier = f'"{escaped_table}"'
+    rowid_alias = _accessible_rowid_alias(connection, table_identifier, table.columns)
+    primary_key_indexes = _guaranteed_primary_key_indexes(table.columns)
 
-    selectors: list[str] = []
-    if can_use_rowid:
-        selectors.extend(("rowid", "typeof(rowid)"))
-    for column in table.columns:
+    selectable_columns: list[tuple[int, LegacyColumn, str]] = []
+    unavailable_hidden_columns: set[int] = set()
+    for index, column in enumerate(table.columns):
         escaped_column = column.name.replace('"', '""')
         identifier = f'"{escaped_column}"'
+        probe = (
+            f"SELECT {identifier}, typeof({identifier}) "
+            f"FROM {table_identifier} LIMIT 1"
+        )
+        try:
+            connection.execute(probe).fetchall()
+        except sqlite3.DatabaseError:
+            # Some virtual-table modules expose xinfo-only hidden columns that
+            # cannot be selected.  Preserve the metadata and an explicit marker
+            # rather than silently dropping the column.  Ordinary and generated
+            # columns must remain readable or the export fails closed.
+            if column.hidden != 1:
+                raise
+            unavailable_hidden_columns.add(index)
+        else:
+            selectable_columns.append((index, column, identifier))
+
+    selectors: list[str] = []
+    if rowid_alias is not None:
+        selectors.extend((rowid_alias, f"typeof({rowid_alias})"))
+    for _index, _column, identifier in selectable_columns:
         selectors.extend((identifier, f"typeof({identifier})"))
-    query = f'SELECT {", ".join(selectors)} FROM "{escaped_table}"'
-    try:
-        raw_rows = connection.execute(query).fetchall()
-    except sqlite3.DatabaseError:
-        if not can_use_rowid:
-            raise
-        can_use_rowid = False
-        selectors = []
-        for column in table.columns:
-            escaped_column = column.name.replace('"', '""')
-            identifier = f'"{escaped_column}"'
-            selectors.extend((identifier, f"typeof({identifier})"))
-        query = f'SELECT {", ".join(selectors)} FROM "{escaped_table}"'
-        raw_rows = connection.execute(query).fetchall()
+    if not selectors:
+        selectors.append("1")
+    query = f'SELECT {", ".join(selectors)} FROM {table_identifier}'
+    raw_rows = connection.execute(query).fetchall()
 
     prepared: list[tuple[bytes, dict[str, Any]]] = []
     for raw_row in raw_rows:
         offset = 0
         rowid_value: dict[str, Any] | None = None
-        if can_use_rowid:
+        if rowid_alias is not None:
             rowid_value = _typed_value("rowid", raw_row[1], raw_row[0])
             offset = 2
-        values = [
-            _typed_value(
+        selected_values: dict[int, dict[str, Any]] = {}
+        for selected_ordinal, (index, column, _identifier) in enumerate(
+            selectable_columns
+        ):
+            value_offset = offset + selected_ordinal * 2
+            selected_values[index] = _typed_value(
                 column.name,
-                raw_row[offset + index * 2 + 1],
-                raw_row[offset + index * 2],
+                raw_row[value_offset + 1],
+                raw_row[value_offset],
             )
+        values = [
+            selected_values[index]
+            if index not in unavailable_hidden_columns
+            else _unavailable_hidden_value(column.name)
             for index, column in enumerate(table.columns)
         ]
-        if primary_key_indexes:
+        if rowid_value is not None:
+            locator = {"kind": "rowid", "value": rowid_value}
+        elif primary_key_indexes:
             locator = {
                 "kind": "primary-key",
                 "values": [values[index] for index in primary_key_indexes],
             }
-            sort_key = _json_bytes(locator)
-        elif rowid_value is not None:
-            locator = {"kind": "rowid", "value": rowid_value}
-            sort_key = _json_bytes(locator)
         else:
             locator = {"kind": "ordinal"}
-            sort_key = _json_bytes(values)
+        # Include the complete typed row as a tie-breaker.  This makes output
+        # independent of SQLite's unspecified scan order even when a declared
+        # primary key permits duplicate NULL values or no unique locator exists.
+        sort_key = _json_bytes({"locator": locator, "values": values})
         prepared.append((sort_key, {"locator": locator, "values": values}))
 
     prepared.sort(key=lambda item: item[0])
@@ -595,6 +665,59 @@ def _read_typed_rows(
             row["locator"]["value"] = ordinal
         rows.append({"ordinal": ordinal, **row})
     return rows
+
+
+def _accessible_rowid_alias(
+    connection: sqlite3.Connection,
+    table_identifier: str,
+    columns: tuple[LegacyColumn, ...],
+) -> str | None:
+    declared_names = {column.name.casefold() for column in columns}
+    for alias in ("_rowid_", "rowid", "oid"):
+        if alias in declared_names:
+            continue
+        try:
+            connection.execute(
+                f"SELECT {alias}, typeof({alias}) FROM {table_identifier} LIMIT 1"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            continue
+        return alias
+    return None
+
+
+def _guaranteed_primary_key_indexes(
+    columns: tuple[LegacyColumn, ...],
+) -> tuple[int, ...]:
+    indexes = tuple(
+        index
+        for index, column in sorted(
+            enumerate(columns),
+            key=lambda item: (
+                item[1].primary_key_position or len(columns) + 1,
+                item[0],
+            ),
+        )
+        if column.primary_key_position > 0
+    )
+    if not indexes:
+        return ()
+    if all(columns[index].not_null for index in indexes):
+        return indexes
+    if (
+        len(indexes) == 1
+        and columns[indexes[0]].declared_type.strip().casefold() == "integer"
+    ):
+        return indexes
+    return ()
+
+
+def _unavailable_hidden_value(column: str) -> dict[str, Any]:
+    return {
+        "accessible": False,
+        "column": column,
+        "reason": "virtual-table hidden column is not directly selectable",
+    }
 
 
 def _typed_value(column: str, sqlite_type: object, value: object) -> dict[str, Any]:
@@ -833,7 +956,7 @@ def _read_tables(connection: sqlite3.Connection) -> dict[str, LegacyTable]:
         """
         SELECT name, sql
         FROM sqlite_master
-        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        WHERE type = 'table'
         ORDER BY name
         """
     ).fetchall()
@@ -864,21 +987,32 @@ def _read_tables(connection: sqlite3.Connection) -> dict[str, LegacyTable]:
 def _read_columns(connection: sqlite3.Connection, table_name: str) -> tuple[LegacyColumn, ...]:
     rows = connection.execute(
         """
-        SELECT name, type, "notnull", dflt_value, pk
-        FROM pragma_table_info(?)
+        SELECT cid, name, type, "notnull", dflt_value, pk, hidden
+        FROM pragma_table_xinfo(?)
         ORDER BY cid
         """,
         (table_name,),
     ).fetchall()
     return tuple(
         LegacyColumn(
+            cid=cid,
             name=name,
             declared_type=declared_type,
             not_null=bool(not_null),
             default=default,
             primary_key_position=primary_key_position,
+            hidden=hidden,
+            generated={2: "virtual", 3: "stored"}.get(hidden),
         )
-        for name, declared_type, not_null, default, primary_key_position in rows
+        for (
+            cid,
+            name,
+            declared_type,
+            not_null,
+            default,
+            primary_key_position,
+            hidden,
+        ) in rows
     )
 
 
@@ -896,7 +1030,7 @@ def _is_recognized_wiki_fts(
         return (
             schema is not None
             and "using fts5" in schema.casefold()
-            and _column_names(columns) == ("path", "content")
+            and _visible_column_names(columns) == ("path", "content")
         )
     return False
 
@@ -907,6 +1041,18 @@ def _classify_table(
     columns: tuple[LegacyColumn, ...],
     recognized_fts: bool,
 ) -> tuple[str, str]:
+    if name == "sqlite_sequence":
+        return (
+            "local-transient",
+            "SQLite AUTOINCREMENT runtime metadata; preserve locally without promotion",
+        )
+
+    if name in _SQLITE_PLANNER_TABLES:
+        return (
+            "generated",
+            "SQLite query-planner statistics; preserved in the snapshot and rebuildable",
+        )
+
     if name == "wiki_fts" and recognized_fts:
         return "generated", "recognized Mneme FTS5 index; rebuildable generated search state"
 
@@ -950,6 +1096,10 @@ def _has_known_columns(name: str, columns: tuple[LegacyColumn, ...]) -> bool:
 
 def _column_names(columns: tuple[LegacyColumn, ...]) -> tuple[str, ...]:
     return tuple(column.name for column in columns)
+
+
+def _visible_column_names(columns: tuple[LegacyColumn, ...]) -> tuple[str, ...]:
+    return tuple(column.name for column in columns if column.hidden == 0)
 
 
 def _safe_sqlite_error(path: Path, error: sqlite3.DatabaseError) -> LegacyInspectionError:
