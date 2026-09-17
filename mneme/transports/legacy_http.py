@@ -12,14 +12,14 @@ from mneme.wiki import read_file, write_file, list_md_files
 from mneme import wiki as wiki_mod
 from mneme import index as idx
 from mneme import llm
-from mneme import skills as skill_layer
+from mneme.growth_lab import skills as skill_layer
 from mneme import lint as wiki_lint_mod
-from mneme import outer_loop
-from mneme import self_model as self_model_mod
-from mneme import log as access_log
-from mneme import growth
+from mneme.growth_lab import outer_loop
+from mneme.growth_lab import self_model as self_model_mod
+from mneme.growth_lab import log as access_log
+from mneme.growth_lab import growth
 from mneme.watcher import start_watcher, stop_watcher
-from mneme.scheduler import start_scheduler, stop_scheduler
+from mneme.growth_lab.scheduler import start_scheduler, stop_scheduler
 
 def _build_auth():
     """MCP_AUTH_TOKEN이 설정되면 bearer 정적 토큰 인증을 켠다.

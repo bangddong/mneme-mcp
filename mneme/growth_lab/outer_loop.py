@@ -14,7 +14,7 @@ import json
 from mneme.memory import get_connection
 from mneme import llm
 from mneme.growth_lab import constitution
-from mneme import notify
+from mneme.growth_lab import notify
 
 # ── 트리거 ──────────────────────────────────────────────
 CYCLE_EPISODES = 20      # 직전 정산 이후 이만큼 새 에피소드가 쌓여야 실행 (force=False)
