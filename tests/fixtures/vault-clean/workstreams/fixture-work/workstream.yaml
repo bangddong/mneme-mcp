@@ -1,0 +1,12 @@
+active_heads:
+- revision: '000003'
+  session: fixture-session
+generation: 3
+id: fixture-work
+policy_refs: []
+project: fixture-project
+resolution:
+  mode: single
+  preferred_head: null
+schema: madi.workstream-registry.v1
+status: active

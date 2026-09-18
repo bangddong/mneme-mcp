@@ -125,3 +125,55 @@ CreateObject("WScript.Shell").Run """D:\dev\mneme-mcp\mneme-start.bat""", 0, Fal
 
 > **코드·위키를 원격에 올려두는 것(0단계)이 이사의 90%입니다.** 새 PC에선 clone →
 > deps·모델 설치 → `.env`·런처 **경로만 새 위치로** 고치면 그대로 이어집니다.
+
+---
+
+## 8. Opt-in Vault bootstrap on another PC
+
+This is additional to the legacy setup above. Clone the portable Vault, then
+create its empty machine-local directory skeleton outside the Vault. Do not copy
+another machine's generated DB, views, bindings, overlays, evidence, caches,
+locks, or logs into portable Git.
+
+In PowerShell, choose separate roots and bootstrap the local skeleton from the
+portable Vault ID:
+
+```powershell
+$VaultRoot = (Resolve-Path .\madi-vault).Path
+$StateHome = Join-Path $env:LOCALAPPDATA "madi-state"
+
+@'
+from pathlib import Path
+import sys
+import yaml
+
+vault_root = Path(sys.argv[1])
+state_home = Path(sys.argv[2])
+vault_id = yaml.safe_load((vault_root / ".madi" / "vault.yaml").read_text(encoding="utf-8"))["id"]
+local_root = state_home / "vaults" / vault_id
+for name in ("bindings", "overlays", "evidence", "pending", "views", "index", "cache", "locks", "logs"):
+    (local_root / name).mkdir(parents=True, exist_ok=True)
+'@ | python - $VaultRoot $StateHome
+```
+
+Then use the actual parser order—global flags before the command—and name a
+workstream for context:
+
+```powershell
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome doctor
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome reindex
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome context --workstream <workstream-id> --mode portable
+```
+
+With an editable/package install, `mneme-vault` is the equivalent provisional
+entry point. For a brand-new Vault rather than a clone, use the implemented API
+`Vault.initialize(Path(<vault>), Path(<state>), <owner-id>)`; it creates both
+roots and the default policy atomically. A clone intentionally does not carry
+machine-local source bindings, so missing optional mounts may make doctor,
+reindex, or context `degraded` without making the Vault invalid.
+
+The legacy `state.db` copy instructions above remain unchanged. Opting out or
+rolling back means stopping the optional Madi adapters and continuing
+`mneme.server` with the existing Wiki, DB, watcher, scheduler, and Growth paths.
+This procedure neither renames the repository/package nor claims deletion of
+legacy durable data.

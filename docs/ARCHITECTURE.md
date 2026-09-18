@@ -95,3 +95,48 @@ E:/development/wiki/      # ★ 지식 베이스 (mneme 레포 바깥, 별도 �
 | `self_model` | L5 자기 지표 시계열 |
 
 `memory/` 디렉터리는 git 추적에서 제외되며, `state.db`는 서버 최초 기동 시 자동 생성됩니다.
+
+---
+
+## 6. Opt-in Madi Vault architecture
+
+The Madi path coexists with the legacy architecture above. It adds a portable
+current-tree model without making the HTTP server, a daemon, Growth, or a
+generation provider a Core requirement.
+
+```text
+<vault>/                              canonical and syncable
+├── .madi/{vault.yaml,policy-index.yaml,policies/}
+├── projects/                         narrow registries
+├── sources/                          authority metadata, never required paths
+├── workstreams/                      registry plus immutable Session revisions
+└── memory/                           immutable semantic records and successors
+
+<state-home>/vaults/<vault-id>/       confidential and machine-local
+├── bindings/ overlays/ evidence/ pending/
+└── views/ index/ cache/ locks/ logs/
+```
+
+Portable artifacts are complete in the current tree: a clean or shallow clone
+does not need Git history to recover active Session heads, handoffs, accepted
+Memory, supersession, or policy receipts. `CURRENT.md`, `PROFILE.md`, and the
+SQLite recall index are disposable local projections. Deleting them and running
+`reindex` rebuilds them from canonical Markdown plus currently available,
+read-only source mounts. Missing optional mounts produce `degraded`, deliberate
+parallel heads produce `divergent`, and structural or policy corruption produces
+`invalid`.
+
+Every Session checkpoint writes a new immutable revision before a generation-
+checked registry update. The only automatic conflict retry is a bounded
+structural union of proven disjoint head additions. It cannot overwrite a
+Session lineage, choose a preferred head, alter lifecycle or policy fields, or
+semantically merge prose. Local overlays may refer to portable state; portable
+artifacts may not reveal local IDs, paths, hashes, counts, or existence.
+
+Policy admission receipts record the decision at write time, but every recall,
+CURRENT, PROFILE, export, and sync preflight re-evaluates current policy. Madi
+cannot guarantee retroactive deletion of information already copied into Git
+commits, reflogs, clones, forks, mirrors, backups, caches, or third-party storage.
+Person ownership does not create technical authority over every propagated copy.
+This is a product invariant, not merely an operational caveat. History rewrite
+may reduce future exposure but is never described as guaranteed erasure.

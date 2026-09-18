@@ -4,7 +4,7 @@
 > 매 작업 시작·완료 시 갱신한다.
 > ⚠️ 이 파일은 public repo에 포함된다 — 개인 상황·일정 맥락은 적지 않는다 (개인 위키로).
 
-**최종 갱신**: 2026-08-08 (한국어 질의 정규화 — 조사·음차 간극 해소)
+**최종 갱신**: 2026-09-18 (opt-in Madi 로컬 릴리스 게이트)
 
 ---
 
@@ -136,6 +136,22 @@ LLM 가중치를 건드리지 않고 외부 레이어(기억·스킬·가치)만
 - [x] **bearer 인증**: `MCP_AUTH_TOKEN` env → fastmcp `StaticTokenVerifier`(비우면 무인증=기존 동일,
   `이름:토큰` 복수 지원). 격리 인스턴스 검증: 무토큰 401 / 오토큰 401 / 유효 200.
   ※ 라이브 서버는 재시작해야 반영 (07-07 wiki_inject 게이트 변경도 동일)
+
+### 2026-09-18 세션 (opt-in Madi 로컬 릴리스 게이트)
+
+- [x] **clean/shallow clone 복원**: 생성 DB·view와 로컬 overlay 없이 현재 트리의 정책,
+  Memory supersession, Session 3 revisions를 복원하고 doctor/reindex/context를 검증.
+- [x] **장기 세션·동시성**: Claude 3회 PreCompact, handoff, Codex 전환/명시적 preferred
+  head, clone/resume를 검증. disjoint head만 bounded structural retry로 보존하고,
+  preferred-head 및 같은 lineage 충돌은 명시적으로 거부하며 semantic auto-merge하지 않음.
+- [x] **privacy·migration 경계**: 공식 CAS policy API로 tightening 후 stale index 상태에서도
+  recall/CURRENT/PROFILE/export/sync를 차단. legacy DB/Wiki 원본을 바꾸지 않고 lossless local
+  review bundle로 staging하며, 검토된 명시적 promotion 전에는 portable Memory를 만들지 않음.
+- [x] **공존성**: legacy HTTP MCP, Wiki, DB, watcher, scheduler, Growth 경로와 optional
+  Claude/Codex fail-open adapter를 함께 검증. repository/package rename이나 legacy durable-data
+  deletion은 하지 않음.
+- [ ] **외부 통합 게이트**: GitHub PR 생성과 hosted Ubuntu/Windows × Python 3.11/3.13
+  `test` matrix 및 aggregate `ci-ok` 실행은 로컬 변경 범위 밖이며 별도 승인된 원격 단계에서 수행.
 
 ---
 

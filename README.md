@@ -89,3 +89,32 @@ docker compose exec ollama ollama pull qwen2.5:7b
 
 Obsidian 등으로 직접 편집해도 watchdog이 자동으로 FTS5 인덱스를 갱신합니다.
 지식 베이스는 mneme 레포 바깥(`E:/development/wiki/`)에서 별도로 관리됩니다.
+
+## Opt-in Madi Vault path (provisional)
+
+The Madi Vault is an incremental, opt-in path. It does not rename this repository
+or package, replace the `mneme.server` HTTP MCP endpoint, or delete legacy Wiki,
+SQLite, watcher, scheduler, or Growth data. A portable Vault contains canonical,
+deterministic Markdown and registry YAML. Generated indexes, rendered views,
+source bindings, evidence, caches, locks, and logs live under a separate
+machine-local state root and are not synced.
+
+After creating the external local-state layout described in
+[the new-PC guide](docs/SETUP-NEW-PC.md#8-opt-in-vault-bootstrap-on-another-pc),
+the provisional CLI uses global path flags before its subcommand:
+
+```powershell
+python -m mneme.cli --vault-root <vault> --state-home <state> doctor
+python -m mneme.cli --vault-root <vault> --state-home <state> reindex
+python -m mneme.cli --vault-root <vault> --state-home <state> context --workstream <workstream-id> --mode portable
+```
+
+An editable install also exposes the equivalent provisional `mneme-vault`
+command. `doctor` reports missing optional source mounts as `degraded`; it must
+reserve `invalid` for structural or policy corruption. Reindexing never requires
+a generation provider.
+
+Rollback is operationally simple: stop installing or invoking the optional Madi
+adapters and continue using the untouched legacy `mneme.server`, Wiki, database,
+watcher, scheduler, and Growth paths. This coexistence release makes no claim
+that legacy durable data was migrated, renamed, or deleted.
