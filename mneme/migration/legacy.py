@@ -210,7 +210,13 @@ def stage_legacy(
     pending = _validate_local_pending(vault, local_pending)
     database = _resolve_legacy_path(Path(db_path))
     wiki = _resolve_wiki_path(Path(wiki_path))
-    _require_wiki_outside_pending(wiki, pending)
+    legacy_root = pending / "legacy"
+    lock_path = pending.parent / "locks" / "legacy-migration.lock"
+    _require_wiki_outside_owned_writes(
+        wiki,
+        writable_parents=(lock_path.parent, legacy_root),
+        exact_targets=(lock_path,),
+    )
     database_before = _snapshot(database)
     inventory = inspect_legacy_db(database)
     database_after_inventory = _snapshot_after_inspection(database)
@@ -220,10 +226,13 @@ def stage_legacy(
         )
     wiki_before = _snapshot_wiki(wiki)
 
-    legacy_root = pending / "legacy"
     bundle = legacy_root / database_before.sha256
-    lock_path = Path(vault.local_root) / "locks" / "legacy-migration.lock"
-    staging: Path | None = None
+    staging = legacy_root / f".{uuid4().hex}.staging"
+    _require_wiki_outside_owned_writes(
+        wiki,
+        writable_parents=(),
+        exact_targets=(bundle, staging),
+    )
     published = False
 
     try:
@@ -237,7 +246,6 @@ def stage_legacy(
             if bundle.exists() or is_symlink_or_reparse(bundle):
                 raise ArtifactExists("legacy staging bundle already exists")
 
-            staging = legacy_root / f".{uuid4().hex}.staging"
             validate_path_chain(staging, allow_missing=True)
             staging.mkdir(exist_ok=False)
             validate_path_chain(staging, allow_missing=False)
@@ -416,14 +424,20 @@ def _resolve_wiki_path(path: Path) -> Path:
     return resolved
 
 
-def _require_wiki_outside_pending(wiki: Path, pending: Path) -> None:
-    """Reject either direction of canonical Wiki/output containment."""
-    if (
-        wiki == pending
-        or wiki.is_relative_to(pending)
-        or pending.is_relative_to(wiki)
-    ):
-        raise UnsafePath("legacy Wiki and local pending output must not overlap")
+def _require_wiki_outside_owned_writes(
+    wiki: Path,
+    *,
+    writable_parents: tuple[Path, ...],
+    exact_targets: tuple[Path, ...],
+) -> None:
+    """Reject canonical overlap with every path this migration can mutate."""
+    parent_inside_wiki = any(parent.is_relative_to(wiki) for parent in writable_parents)
+    exact_overlap = any(
+        target.is_relative_to(wiki) or wiki.is_relative_to(target)
+        for target in exact_targets
+    )
+    if parent_inside_wiki or exact_overlap:
+        raise UnsafePath("legacy Wiki and migration-owned write paths must not overlap")
 
 
 def _require_sources_unchanged(

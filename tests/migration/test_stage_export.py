@@ -788,36 +788,149 @@ def test_stage_refuses_existing_bundle_without_overwriting_any_byte(
 
 @pytest.mark.parametrize(
     "overlap",
-    ["same", "wiki-contains-pending", "pending-contains-wiki"],
+    [
+        "wiki-contains-output-root",
+        "same-output-root",
+        "same-bundle",
+        "bundle-contains-wiki",
+    ],
 )
-def test_stage_rejects_wiki_overlapping_pending_before_lock_or_output_creation(
+def test_stage_rejects_wiki_overlapping_owned_output_before_lock_or_output_creation(
     vault, legacy_sources: tuple[Path, Path], overlap: str
 ):
-    """Either direction of canonical overlap must be rejected without writes."""
+    """Owned output paths must not equal, contain, or be contained by the Wiki."""
     from mneme.core.errors import UnsafePath
     from mneme.migration.legacy import stage_legacy
 
     db_path, _external_wiki = legacy_sources
     pending = vault.local_root / "pending"
-    if overlap == "same":
+    legacy_root = pending / "legacy"
+    bundle = legacy_root / sha256(db_path.read_bytes()).hexdigest()
+    if overlap == "wiki-contains-output-root":
         wiki_path = pending
-    elif overlap == "wiki-contains-pending":
-        wiki_path = vault.local_root
+    elif overlap == "same-output-root":
+        wiki_path = legacy_root
+    elif overlap == "same-bundle":
+        wiki_path = bundle
     else:
-        wiki_path = pending / "source-wiki"
-        wiki_path.mkdir()
-        (wiki_path / "Home.md").write_text("# Still external\n", encoding="utf-8")
+        wiki_path = bundle / "source-wiki"
+    wiki_path.mkdir(parents=True, exist_ok=True)
+    (wiki_path / "Home.md").write_text("# Still external\n", encoding="utf-8")
     lock_path = vault.local_root / "locks" / "legacy-migration.lock"
     database_before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
     wiki_before = _tree_state(wiki_path)
+    wiki_mtime_before = wiki_path.stat().st_mtime_ns
 
     with pytest.raises(UnsafePath, match="overlap"):
         stage_legacy(db_path, wiki_path, vault, pending)
 
     assert _tree_state(wiki_path) == wiki_before
+    assert wiki_path.stat().st_mtime_ns == wiki_mtime_before
     assert (db_path.read_bytes(), db_path.stat().st_mtime_ns) == database_before
     assert not lock_path.exists()
+
+
+@pytest.mark.parametrize(
+    "overlap", ["lock-parent", "same-lock-path", "lock-path-contains-wiki"]
+)
+def test_stage_rejects_wiki_overlapping_lock_before_creating_lock_or_output(
+    vault, legacy_sources: tuple[Path, Path], overlap: str
+):
+    """The migration lock must never equal, contain, or be inside the Wiki."""
+    from mneme.core.errors import UnsafePath
+    from mneme.migration.legacy import stage_legacy
+
+    db_path, _external_wiki = legacy_sources
+    lock_parent = vault.local_root / "locks"
+    lock_path = lock_parent / "legacy-migration.lock"
+    if overlap == "lock-parent":
+        wiki_path = lock_parent
+    elif overlap == "same-lock-path":
+        wiki_path = lock_path
+    else:
+        wiki_path = lock_path / "source-wiki"
+    wiki_path.mkdir(parents=True, exist_ok=True)
+    (wiki_path / "Home.md").write_text("# Lock-root Wiki\n", encoding="utf-8")
+    pending = vault.local_root / "pending"
+    database_before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
+    wiki_tree_before = _tree_state(wiki_path)
+    wiki_files_before = _file_state(wiki_path)
+    wiki_mtime_before = wiki_path.stat().st_mtime_ns
+
+    caught: Exception | None = None
+    try:
+        stage_legacy(db_path, wiki_path, vault, pending)
+    except Exception as error:
+        caught = error
+
+    assert _tree_state(wiki_path) == wiki_tree_before
+    assert _file_state(wiki_path) == wiki_files_before
+    assert wiki_path.stat().st_mtime_ns == wiki_mtime_before
+    assert (db_path.read_bytes(), db_path.stat().st_mtime_ns) == database_before
+    assert not lock_path.is_file()
     assert not (pending / "legacy").exists()
+    assert isinstance(caught, UnsafePath)
+    assert "overlap" in str(caught)
+
+
+@pytest.mark.parametrize("sibling", ["lock", "output"])
+def test_stage_allows_wiki_in_unrelated_local_output_siblings(
+    vault, legacy_sources: tuple[Path, Path], sibling: str
+):
+    """Broad parent guards must not reject siblings the migration never writes."""
+    from mneme.migration.legacy import stage_legacy
+
+    db_path, _external_wiki = legacy_sources
+    if sibling == "lock":
+        wiki_path = vault.local_root / "locks" / "source-wiki"
+    else:
+        wiki_path = vault.local_root / "pending" / "legacy" / "source-wiki"
+        wiki_path.parent.mkdir()
+    wiki_path.mkdir()
+    (wiki_path / "Home.md").write_text("# Safe sibling Wiki\n", encoding="utf-8")
+    wiki_before = _tree_state(wiki_path)
+    wiki_mtime_before = wiki_path.stat().st_mtime_ns
+
+    report = stage_legacy(db_path, wiki_path, vault, vault.local_root / "pending")
+
+    assert report.bundle_path.is_dir()
+    assert _tree_state(wiki_path) == wiki_before
+    assert wiki_path.stat().st_mtime_ns == wiki_mtime_before
+
+
+@pytest.mark.parametrize("overlap", ["same-temp", "temp-contains-wiki"])
+def test_stage_rejects_wiki_overlapping_generated_temporary_bundle_before_writes(
+    vault,
+    legacy_sources: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    overlap: str,
+):
+    """The generated temporary tree is an owned write target, not Wiki space."""
+    from mneme.core.errors import UnsafePath
+    import mneme.migration.legacy as legacy
+
+    class FixedUuid:
+        hex = "1" * 32
+
+    monkeypatch.setattr(legacy, "uuid4", lambda: FixedUuid())
+    db_path, _external_wiki = legacy_sources
+    pending = vault.local_root / "pending"
+    staging = pending / "legacy" / f".{FixedUuid.hex}.staging"
+    wiki_path = staging if overlap == "same-temp" else staging / "source-wiki"
+    wiki_path.mkdir(parents=True)
+    (wiki_path / "Home.md").write_text("# Temporary-path Wiki\n", encoding="utf-8")
+    lock_path = vault.local_root / "locks" / "legacy-migration.lock"
+    database_before = (db_path.read_bytes(), db_path.stat().st_mtime_ns)
+    wiki_before = _tree_state(wiki_path)
+    wiki_mtime_before = wiki_path.stat().st_mtime_ns
+
+    with pytest.raises(UnsafePath, match="overlap"):
+        legacy.stage_legacy(db_path, wiki_path, vault, pending)
+
+    assert _tree_state(wiki_path) == wiki_before
+    assert wiki_path.stat().st_mtime_ns == wiki_mtime_before
+    assert (db_path.read_bytes(), db_path.stat().st_mtime_ns) == database_before
+    assert not lock_path.exists()
 
 
 @pytest.mark.parametrize("unsafe_location", ["outside", "portable", "cache"])
