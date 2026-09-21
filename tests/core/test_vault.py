@@ -64,6 +64,14 @@ def _relative_entries(root: Path) -> tuple[set[str], set[str]]:
     return directories, files
 
 
+def _portable_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def test_initialize_creates_exact_portable_and_local_layout(tmp_path):
     from mneme.core.fs import read_yaml
     from mneme.core.vault import Vault
@@ -199,6 +207,118 @@ def test_open_rejects_missing_local_state_instead_of_creating_it(tmp_path):
     with pytest.raises(InvalidArtifact):
         Vault.open(initialized.root, missing_state_home)
     assert not missing_state_home.exists()
+
+
+@pytest.mark.parametrize("precreate_state_home", [False, True])
+def test_open_or_bootstrap_local_creates_only_exact_local_layout_without_portable_writes(
+    tmp_path, precreate_state_home
+):
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state-a", "person-01")
+    portable_before = _portable_files(initialized.root)
+    new_state_home = tmp_path / "state-b"
+    if precreate_state_home:
+        new_state_home.mkdir()
+
+    opened = Vault.open_or_bootstrap_local(initialized.root, new_state_home)
+
+    assert opened.local_root == new_state_home / "vaults" / initialized.id
+    assert _relative_entries(opened.local_root) == (LOCAL_DIRECTORIES, set())
+    assert _portable_files(initialized.root) == portable_before
+    assert Vault.open(initialized.root, new_state_home).id == initialized.id
+    assert (
+        Vault.open_or_bootstrap_local(initialized.root, new_state_home).id
+        == initialized.id
+    )
+    assert _relative_entries(opened.local_root) == (LOCAL_DIRECTORIES, set())
+
+
+def test_open_or_bootstrap_local_validates_portable_vault_before_local_writes(tmp_path):
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.fs import dump_yaml
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state-a", "person-01")
+    (initialized.root / ".madi/policy-index.yaml").write_text(
+        dump_yaml({"schema": "madi.policy-index.v1", "generation": 1, "policies": []}),
+        encoding="utf-8",
+    )
+    new_state_home = tmp_path / "state-b"
+
+    with pytest.raises(InvalidArtifact):
+        Vault.open_or_bootstrap_local(initialized.root, new_state_home)
+
+    assert not new_state_home.exists()
+
+
+def test_open_or_bootstrap_local_rejects_existing_partial_local_root(tmp_path):
+    from mneme.core.errors import InvalidArtifact
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state-a", "person-01")
+    new_state_home = tmp_path / "state-b"
+    local_root = new_state_home / "vaults" / initialized.id
+    (local_root / "bindings").mkdir(parents=True)
+
+    with pytest.raises(InvalidArtifact):
+        Vault.open_or_bootstrap_local(initialized.root, new_state_home)
+
+    assert _relative_entries(local_root) == ({"bindings"}, set())
+
+
+def test_open_or_bootstrap_local_cleans_failed_stage(tmp_path, monkeypatch):
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state-a", "person-01")
+    new_state_home = tmp_path / "state-b"
+    real_mkdir = Path.mkdir
+
+    def fail_on_staged_evidence(path, *args, **kwargs):
+        if path.name == "evidence" and any(
+            part.endswith(".bootstrapping") for part in path.parts
+        ):
+            raise OSError("injected local bootstrap failure")
+        return real_mkdir(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "mkdir", fail_on_staged_evidence)
+        with pytest.raises(OSError, match="injected local bootstrap failure"):
+            Vault.open_or_bootstrap_local(initialized.root, new_state_home)
+
+    vaults_root = new_state_home / "vaults"
+    assert vaults_root.is_dir()
+    assert list(vaults_root.iterdir()) == []
+
+
+def test_open_or_bootstrap_local_converges_when_cooperative_publisher_wins(
+    tmp_path, monkeypatch
+):
+    from mneme.core.vault import Vault
+
+    initialized = Vault.initialize(tmp_path / "vault", tmp_path / "state-a", "person-01")
+    new_state_home = tmp_path / "state-b"
+    real_mkdir = Path.mkdir
+    real_rename = Path.rename
+
+    def publish_first(path, target):
+        if path.name.endswith(".bootstrapping"):
+            real_mkdir(target)
+            for relative in LOCAL_DIRECTORIES:
+                real_mkdir(target / relative)
+            raise FileExistsError("cooperative publisher won")
+        return real_rename(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rename", publish_first)
+        opened = Vault.open_or_bootstrap_local(initialized.root, new_state_home)
+
+    assert opened.local_root == new_state_home / "vaults" / initialized.id
+    assert _relative_entries(opened.local_root) == (LOCAL_DIRECTORIES, set())
+    assert not any(
+        path.name.endswith(".bootstrapping")
+        for path in (new_state_home / "vaults").iterdir()
+    )
 
 
 @pytest.mark.parametrize(

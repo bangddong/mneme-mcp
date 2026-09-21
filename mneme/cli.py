@@ -94,7 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(raw_arguments)
         command = arguments.command
-        vault = Vault.open(arguments.vault_root, arguments.state_home)
+        vault = Vault.open_or_bootstrap_local(
+            arguments.vault_root, arguments.state_home
+        )
         status, result = _dispatch(vault, arguments)
     except Exception as exc:
         _write_json(sys.stderr, _error_envelope(command, exc))

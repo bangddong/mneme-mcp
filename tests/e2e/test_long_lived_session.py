@@ -9,19 +9,6 @@ from pathlib import Path
 import subprocess
 
 
-_LOCAL_DIRECTORIES = (
-    "bindings",
-    "overlays",
-    "evidence",
-    "pending",
-    "views",
-    "index",
-    "cache",
-    "locks",
-    "logs",
-)
-
-
 def _git(cwd: Path, *arguments: str) -> str:
     completed = _git_result(cwd, *arguments)
     completed.check_returncode()
@@ -47,15 +34,6 @@ def _git_result(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         errors="strict",
         env=environment,
     )
-
-
-def _prepare_state_home(vault_root: Path, state_home: Path) -> None:
-    from mneme.core.fs import read_yaml
-
-    vault_id = read_yaml(vault_root / ".madi" / "vault.yaml")["id"]
-    local_root = state_home / "vaults" / vault_id
-    for relative in _LOCAL_DIRECTORIES:
-        (local_root / relative).mkdir(parents=True, exist_ok=True)
 
 
 def _checkpoint_payload(
@@ -356,8 +334,7 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     )
 
     second_state = tmp_path / "second-state"
-    _prepare_state_home(clone, second_state)
-    second_vault = Vault.open(clone, second_state)
+    second_vault = Vault.open_or_bootstrap_local(clone, second_state)
     second_service = CoreService(second_vault)
     second_service.reindex()
     observed = second_service.observe(

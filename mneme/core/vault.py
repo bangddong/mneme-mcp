@@ -65,6 +65,59 @@ class Vault:
 
     @classmethod
     def open(cls, root: Path, state_home: Path) -> Vault:
+        vault, policy_index = cls._validated_candidate(root, state_home)
+        _require_directories(vault.local_root, _LOCAL_DIRECTORIES, "machine-local")
+        cls._validate_portable_policies(vault, policy_index)
+        return vault
+
+    @classmethod
+    def open_or_bootstrap_local(cls, root: Path, state_home: Path) -> Vault:
+        """Open a Vault, atomically creating an absent machine-local layout.
+
+        An existing local root remains subject to the strict ``open`` contract:
+        missing or unsafe entries are corruption, not an invitation to repair it.
+        Portable artifacts are fully validated before any local path is created.
+        """
+        vault, policy_index = cls._validated_candidate(root, state_home)
+        cls._validate_portable_policies(vault, policy_index)
+        local_root = vault.local_root
+        if local_root.exists() or is_symlink_or_reparse(local_root):
+            return cls.open(vault.root, vault.state_home)
+
+        local_parent = vault.state_home / "vaults"
+        local_stage = local_parent / f".{vault.id}.{uuid4().hex}.bootstrapping"
+        validate_path_chain(local_parent, allow_missing=True)
+        validate_path_chain(local_stage, allow_missing=True)
+        local_parent.mkdir(parents=True, exist_ok=True)
+        validate_path_chain(local_parent, allow_missing=False)
+        stage_owned = False
+        try:
+            validate_path_chain(local_stage, allow_missing=True)
+            local_stage.mkdir(exist_ok=False)
+            stage_owned = True
+            validate_path_chain(local_stage, allow_missing=False)
+            _create_directories(local_stage, _LOCAL_DIRECTORIES)
+
+            validate_path_chain(local_stage, allow_missing=False)
+            validate_path_chain(local_root, allow_missing=True)
+            if local_root.exists() or is_symlink_or_reparse(local_root):
+                return cls.open(vault.root, vault.state_home)
+            try:
+                local_stage.rename(local_root)
+            except OSError:
+                if not (local_root.exists() or is_symlink_or_reparse(local_root)):
+                    raise
+                return cls.open(vault.root, vault.state_home)
+            stage_owned = False
+            return cls.open(vault.root, vault.state_home)
+        finally:
+            if stage_owned:
+                _remove_owned_tree(local_stage)
+
+    @classmethod
+    def _validated_candidate(
+        cls, root: Path, state_home: Path
+    ) -> tuple[Vault, dict[str, object]]:
         requested_root = validate_path_chain(root, allow_missing=True)
         requested_state_home = validate_path_chain(state_home, allow_missing=True)
         portable_root = requested_root.resolve(strict=False)
@@ -112,16 +165,21 @@ class Vault:
         local_root = local_state_home / "vaults" / vault_id
         validate_path_chain(local_root, allow_missing=True)
         validate_separate_roots(portable_root, local_root)
-        _require_directories(local_root, _LOCAL_DIRECTORIES, "machine-local")
         vault = cls(portable_root, local_state_home, vault_id, dict(owner), local_root)
+        return vault, policy_index
+
+    @staticmethod
+    def _validate_portable_policies(
+        vault: Vault, policy_index: dict[str, object]
+    ) -> None:
         from mneme.core.policy import PolicyStore, parse_policy_index
 
         index = parse_policy_index(policy_index, StorageClass.PORTABLE)
         store = PolicyStore(vault)
         for policy_id, ref in index.policies.items():
             _require_file(
-                portable_root,
-                portable_root
+                vault.root,
+                vault.root
                 / ".madi"
                 / "policies"
                 / policy_id
@@ -129,7 +187,6 @@ class Vault:
                 "active policy revision",
             )
             store.load_active(policy_id, StorageClass.PORTABLE)
-        return vault
 
     @classmethod
     def initialize(cls, root: Path, state_home: Path, owner_id: str) -> Vault:

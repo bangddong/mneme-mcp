@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "vault-clean"
-_LOCAL_DIRECTORIES = (
+_LOCAL_DIRECTORIES = {
     "bindings",
     "overlays",
     "evidence",
@@ -19,7 +21,7 @@ _LOCAL_DIRECTORIES = (
     "cache",
     "locks",
     "logs",
-)
+}
 
 
 def _git(cwd: Path, *arguments: str) -> str:
@@ -49,13 +51,34 @@ def _git_result(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _prepare_state_home(vault_root: Path, state_home: Path) -> None:
-    from mneme.core.fs import read_yaml
+def _cli(vault_root: Path, state_home: Path, *arguments: str) -> dict[str, object]:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mneme.cli",
+            "--vault-root",
+            str(vault_root),
+            "--state-home",
+            str(state_home),
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        errors="strict",
+        cwd=Path(__file__).parents[2],
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout)
 
-    vault_id = read_yaml(vault_root / ".madi" / "vault.yaml")["id"]
-    local_root = state_home / "vaults" / vault_id
-    for relative in _LOCAL_DIRECTORIES:
-        (local_root / relative).mkdir(parents=True, exist_ok=True)
+
+def _portable_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.parts
+    }
 
 
 def _remove_generated_state(vault) -> None:
@@ -119,8 +142,7 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
     parent_commit = _git(source, "rev-parse", "HEAD")
     shutil.copytree(FIXTURE, source, dirs_exist_ok=True)
     source_state = tmp_path / "source-state"
-    _prepare_state_home(source, source_state)
-    source_vault = Vault.open(source, source_state)
+    source_vault = Vault.open_or_bootstrap_local(source, source_state)
 
     RegistryStore(source_vault, StorageClass.LOCAL_ONLY).create_workstream(
         "source-overlay", project=None, mode="parallel"
@@ -163,11 +185,36 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
     assert _git(clone, "rev-list", "--count", "HEAD") == "1"
 
     clone_state = tmp_path / "clone-state"
-    _prepare_state_home(clone, clone_state)
+    portable_before = _portable_files(clone)
+    doctor_result = _cli(clone, clone_state, "doctor")
+    assert doctor_result["ok"] is True
+    assert doctor_result["status"] != "invalid"
+    assert not any(
+        issue["code"] == "session-orphan"
+        for issue in doctor_result["result"]["issues"]
+    )
+    from mneme.core.fs import read_yaml
+
+    vault_id = read_yaml(clone / ".madi" / "vault.yaml")["id"]
+    fresh_local_root = clone_state / "vaults" / vault_id
+    assert {
+        path.relative_to(fresh_local_root).as_posix()
+        for path in fresh_local_root.rglob("*")
+        if path.is_dir()
+    } == _LOCAL_DIRECTORIES
+    assert not any(path.is_file() for path in fresh_local_root.rglob("*"))
+    reindex_result = _cli(clone, clone_state, "reindex")
+    assert reindex_result["ok"] is True
+    context_result = _cli(
+        clone, clone_state, "context", "--workstream", "fixture-work"
+    )
+    assert context_result["ok"] is True
+    assert (
+        "Portable checkpoint 3 is current-tree state."
+        in context_result["result"]["text"]
+    )
+    assert _portable_files(clone) == portable_before
     cloned_vault = Vault.open(clone, clone_state)
-    assert not any(cloned_vault.local_root.rglob("*.db"))
-    assert not any(cloned_vault.local_root.rglob("CURRENT.md"))
-    assert not any(cloned_vault.local_root.rglob("PROFILE.md"))
     assert not any(
         "source-overlay" in path.read_text(encoding="utf-8")
         for root in (clone, cloned_vault.local_root)

@@ -31,6 +31,14 @@ def _invoke(capsys, arguments: list[str]):
     return exit_code, stdout, stderr
 
 
+def _portable_files(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 def _checkpoint_payload(path: Path, *, generation: int = 0) -> None:
     path.write_text(
         json.dumps(
@@ -85,6 +93,48 @@ def test_doctor_is_a_successful_diagnosis_even_when_state_is_invalid(vault, caps
     assert stdout["command"] == "doctor"
     assert stdout["status"] == "invalid"
     assert any(issue["code"] == "canonical-artifact-invalid" for issue in stdout["result"]["issues"])
+
+
+def test_doctor_bootstraps_fresh_machine_local_state_without_portable_writes(
+    vault, tmp_path, capsys
+):
+    new_state_home = tmp_path / "new-machine-state"
+    new_state_home.mkdir()
+    portable_before = _portable_files(vault.root)
+
+    exit_code, stdout, stderr = _invoke(
+        capsys,
+        [
+            "--vault-root",
+            str(vault.root),
+            "--state-home",
+            str(new_state_home),
+            "doctor",
+        ],
+    )
+
+    assert exit_code == 0
+    assert stderr is None
+    assert stdout["ok"] is True
+    assert stdout["command"] == "doctor"
+    assert _portable_files(vault.root) == portable_before
+    local_root = new_state_home / "vaults" / vault.id
+    assert {
+        path.relative_to(local_root).as_posix()
+        for path in local_root.rglob("*")
+        if path.is_dir()
+    } == {
+        "bindings",
+        "overlays",
+        "evidence",
+        "pending",
+        "views",
+        "index",
+        "cache",
+        "locks",
+        "logs",
+    }
+    assert not any(path.is_file() for path in local_root.rglob("*"))
 
 
 def test_context_keeps_valid_canonical_state_usable_when_source_is_unavailable(
