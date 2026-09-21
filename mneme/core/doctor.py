@@ -23,7 +23,7 @@ from mneme.core.memories import MemoryStore
 from mneme.core.policy import PolicyRef, PolicyStore, reevaluate_portability
 from mneme.core.registries import HeadRef, RegistryStore, WorkstreamRegistry
 from mneme.core.search.index import GeneratedIndex, validate_generated_index_target
-from mneme.core.sessions import SessionRevisionRef, SessionStore
+from mneme.core.sessions import CheckpointRequest, SessionRevisionRef, SessionStore
 from mneme.core.sources.filesystem import FileSystemSource
 from mneme.core.sources.registry import SourceBindingStore
 from mneme.core.validation.vault import validate_identifier
@@ -248,7 +248,7 @@ class Doctor:
         issues: list[DoctorIssue],
     ) -> None:
         sessions_root = self._vault.root / "workstreams" / workstream_id / "sessions"
-        valid: dict[HeadRef, object] = {}
+        valid: dict[HeadRef, CheckpointRequest] = {}
         sessions = SessionStore(self._vault)
         for session_directory in _directories(sessions_root):
             for path in _files(session_directory, ".md"):
@@ -275,7 +275,17 @@ class Doctor:
         for head in active_heads:
             if head not in valid:
                 issues.append(_issue("missing-active-head", "invalid", f"workstream:{_safe_id(workstream_id)}"))
-        reachable = _reachable_session_heads(active_heads, valid)
+        reachable, invalid_lineage = _reachable_session_heads(active_heads, valid)
+        for ref in sorted(
+            invalid_lineage, key=lambda item: (item.session, item.revision)
+        ):
+            issues.append(
+                _issue(
+                    "canonical-artifact-invalid",
+                    "invalid",
+                    f"session:{_safe_id(workstream_id)}:{ref.session}:{ref.revision}",
+                )
+            )
         for ref in sorted(set(valid) - reachable, key=lambda item: (item.session, item.revision)):
             issues.append(
                 _issue(
@@ -399,8 +409,14 @@ def _issue(code: str, severity: str, artifact: str) -> DoctorIssue:
 
 
 def _reachable_session_heads(
-    active_heads: tuple[HeadRef, ...], revisions: dict[HeadRef, object]
-) -> set[HeadRef]:
+    active_heads: tuple[HeadRef, ...],
+    revisions: dict[HeadRef, CheckpointRequest],
+) -> tuple[set[HeadRef], set[HeadRef]]:
+    invalid_lineage = {
+        ref
+        for ref, request in revisions.items()
+        if not _has_contiguous_parent(ref, request.expected_parent)
+    }
     reachable: set[HeadRef] = set()
     pending = list(active_heads)
     while pending:
@@ -408,10 +424,25 @@ def _reachable_session_heads(
         if head in reachable or head not in revisions:
             continue
         reachable.add(head)
-        parent = getattr(revisions[head], "expected_parent", None)
+        if head in invalid_lineage:
+            continue
+        parent = revisions[head].expected_parent
         if parent is not None:
             pending.append(parent.as_head())
-    return reachable
+    return reachable, invalid_lineage
+
+
+def _has_contiguous_parent(
+    ref: HeadRef, parent: SessionRevisionRef | None
+) -> bool:
+    revision_number = int(ref.revision)
+    if revision_number == 1:
+        return parent is None
+    if revision_number < 1 or parent is None:
+        return False
+    return parent.as_head() == HeadRef(
+        ref.session, f"{revision_number - 1:06d}"
+    )
 
 
 def _status(issues: Iterable[DoctorIssue]) -> str:

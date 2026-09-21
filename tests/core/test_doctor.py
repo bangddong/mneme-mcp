@@ -45,6 +45,26 @@ def _workstream(vault):
     RegistryStore(vault).create_workstream("ws-01", project=None, mode="single")
 
 
+def _replace_session_parent(vault, revision, parent_revision):
+    from mneme.core.fs import dump_frontmatter, read_frontmatter
+
+    path = (
+        vault.root
+        / "workstreams"
+        / "ws-01"
+        / "sessions"
+        / "ses-01"
+        / f"{revision}.md"
+    )
+    metadata, body = read_frontmatter(path)
+    metadata["parent"] = {
+        "session": "ses-01",
+        "revision": parent_revision,
+    }
+    path.write_text(dump_frontmatter(metadata, body), encoding="utf-8")
+    return path
+
+
 def _create_directory_link(link: Path, target: Path, *, junction: bool) -> None:
     if junction:
         result = subprocess.run(
@@ -92,6 +112,96 @@ def test_doctor_keeps_reachable_session_ancestors_out_of_orphans(vault):
         third.as_head(),
     )
     assert not any(issue.code == "session-orphan" for issue in report.issues)
+
+
+def test_doctor_rejects_forward_parent_without_hiding_later_orphan(vault):
+    """Catches a forward edge making a later interrupted revision reachable."""
+    from mneme.core.doctor import Doctor
+    from mneme.core.registries import RegistryStore
+
+    _workstream(vault)
+    first = _checkpoint(vault)
+    _checkpoint(vault, parent=first, generation=1)
+    registries = RegistryStore(vault)
+    current = registries.load_workstream("ws-01")
+    registries.update_workstream(
+        replace(current, active_heads=(first.as_head(),)),
+        expected_generation=current.generation,
+    )
+    corrupted = _replace_session_parent(vault, "000001", "000002")
+    before = corrupted.read_bytes()
+
+    report = Doctor(vault).run()
+
+    issues = {
+        (issue.code, issue.severity, issue.artifact) for issue in report.issues
+    }
+    assert report.status == "invalid"
+    assert (
+        "canonical-artifact-invalid",
+        "invalid",
+        "session:ws-01:ses-01:000001",
+    ) in issues
+    assert (
+        "session-orphan",
+        "degraded",
+        "session:ws-01:ses-01:000002",
+    ) in issues
+    assert registries.load_workstream("ws-01").active_heads == (first.as_head(),)
+    assert corrupted.read_bytes() == before
+
+
+def test_doctor_rejects_self_parent_without_mutating_revision(vault):
+    """Catches a self-cycle being accepted as a complete active lineage."""
+    from mneme.core.doctor import Doctor
+    from mneme.core.registries import RegistryStore
+
+    _workstream(vault)
+    first = _checkpoint(vault)
+    corrupted = _replace_session_parent(vault, "000001", "000001")
+    before = corrupted.read_bytes()
+
+    report = Doctor(vault).run()
+
+    assert report.status == "invalid"
+    assert (
+        "canonical-artifact-invalid",
+        "invalid",
+        "session:ws-01:ses-01:000001",
+    ) in {
+        (issue.code, issue.severity, issue.artifact) for issue in report.issues
+    }
+    assert RegistryStore(vault).load_workstream("ws-01").active_heads == (
+        first.as_head(),
+    )
+    assert corrupted.read_bytes() == before
+
+
+def test_doctor_rejects_skipped_parent_without_following_the_edge(vault):
+    """Catches a non-contiguous edge blessing an older revision as reachable."""
+    from mneme.core.doctor import Doctor
+
+    _workstream(vault)
+    first = _checkpoint(vault)
+    second = _checkpoint(vault, parent=first, generation=1)
+    _checkpoint(vault, parent=second, generation=2)
+    _replace_session_parent(vault, "000003", "000001")
+
+    report = Doctor(vault).run()
+
+    issues = {
+        (issue.code, issue.severity, issue.artifact) for issue in report.issues
+    }
+    assert (
+        "canonical-artifact-invalid",
+        "invalid",
+        "session:ws-01:ses-01:000003",
+    ) in issues
+    assert (
+        "session-orphan",
+        "degraded",
+        "session:ws-01:ses-01:000001",
+    ) in issues
 
 
 def test_doctor_reports_orphan_without_changing_the_declared_head(vault):
