@@ -278,3 +278,48 @@ def test_legacy_http_wiki_db_watcher_scheduler_and_growth_still_run(
     assert response["updated_at"]
     assert response["updated_by"] == "unknown"
     assert callable(server.main)
+
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_PORT", "0")
+    boundary_calls: list[object] = []
+    monkeypatch.setattr(server, "init_db", lambda: boundary_calls.append("init"))
+    monkeypatch.setattr(
+        server.idx, "reindex_all", lambda: boundary_calls.append("reindex")
+    )
+    monkeypatch.setattr(
+        server, "start_watcher", lambda: boundary_calls.append("watcher-start")
+    )
+    monkeypatch.setattr(
+        server, "start_scheduler", lambda: boundary_calls.append("scheduler-start")
+    )
+    monkeypatch.setattr(
+        server, "stop_scheduler", lambda: boundary_calls.append("scheduler-stop")
+    )
+    monkeypatch.setattr(
+        server, "stop_watcher", lambda: boundary_calls.append("watcher-stop")
+    )
+
+    def stop_at_transport_boundary(**kwargs):
+        boundary_calls.append(("run", kwargs))
+        raise RuntimeError("stop legacy http boundary")
+
+    monkeypatch.setattr(server.mcp, "run", stop_at_transport_boundary)
+    with pytest.raises(RuntimeError, match="stop legacy http boundary"):
+        server.main()
+
+    assert boundary_calls == [
+        "init",
+        "reindex",
+        "watcher-start",
+        "scheduler-start",
+        (
+            "run",
+            {
+                "transport": "streamable-http",
+                "host": "127.0.0.1",
+                "port": 0,
+            },
+        ),
+        "scheduler-stop",
+        "watcher-stop",
+    ]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,12 @@ _LOCAL_DIRECTORIES = (
 
 
 def _git(cwd: Path, *arguments: str) -> str:
+    completed = _git_result(cwd, *arguments)
+    completed.check_returncode()
+    return completed.stdout.strip()
+
+
+def _git_result(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.update(
         {
@@ -31,16 +38,15 @@ def _git(cwd: Path, *arguments: str) -> str:
             "GIT_COMMITTER_NAME": "Madi continuity gate",
         }
     )
-    completed = subprocess.run(
+    return subprocess.run(
         ["git", *arguments],
         cwd=cwd,
-        check=True,
+        check=False,
         capture_output=True,
         encoding="utf-8",
         errors="strict",
         env=environment,
     )
-    return completed.stdout.strip()
 
 
 def _prepare_state_home(vault_root: Path, state_home: Path) -> None:
@@ -103,6 +109,23 @@ def _envelope(
     }
 
 
+def _session_revision_path(vault_root: Path, revision: str) -> Path:
+    return (
+        vault_root
+        / "workstreams/long-lived/sessions/claude-main"
+        / f"{revision}.md"
+    )
+
+
+def _revision_hash(vault_root: Path, revision: str) -> str:
+    return sha256(_session_revision_path(vault_root, revision).read_bytes()).hexdigest()
+
+
+def _assert_revision_hashes(vault_root: Path, expected: dict[str, str]) -> None:
+    for revision, digest in expected.items():
+        assert _revision_hash(vault_root, revision) == digest
+
+
 def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     """Losing revisions, inferring preference, or requiring history breaks continuity."""
     from mneme.adapters.claude import ClaudeAdapter
@@ -122,10 +145,23 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     registries.create_workstream(
         "long-lived", project=project_registry.id, mode="parallel"
     )
+    (vault.root / ".gitattributes").write_text(
+        ".madi/** text eol=lf\n"
+        "projects/** text eol=lf\n"
+        "sources/** text eol=lf\n"
+        "workstreams/** text eol=lf\n"
+        "memory/** text eol=lf\n",
+        encoding="utf-8",
+    )
+    _git(vault.root, "init", "-b", "main")
+    _git(vault.root, "add", ".")
+    _git(vault.root, "commit", "-m", "checkpoint: parent portable skeleton")
+    parent_commit = _git(vault.root, "rev-parse", "HEAD")
     project = tmp_path / "project"
     project.mkdir()
     service = CoreService(vault)
     claude = ClaudeAdapter(service, project_root=project)
+    claude_hashes: dict[str, str] = {}
 
     first_path = project / ".madi" / "checkpoints" / "claude-000001.json"
     _write_checkpoint(
@@ -143,6 +179,13 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     )
     assert first.ok is True
     assert first.command_result.result["revision"] == "000001"
+    first_revision = SessionStore(vault).read_revision(
+        SessionRevisionRef("claude-main", "000001"),
+        workstream_id="long-lived",
+    )
+    assert first_revision.expected_parent is None
+    assert first_revision.body.current_state == "Claude revision 000001 before any compact."
+    claude_hashes["000001"] = _revision_hash(vault.root, "000001")
 
     compact_results = []
     for number in range(2, 5):
@@ -177,6 +220,19 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
         )
         assert result.ok is True
         assert result.block_host is False
+        _assert_revision_hashes(vault.root, claude_hashes)
+        revision = f"{number:06d}"
+        parsed = SessionStore(vault).read_revision(
+            SessionRevisionRef("claude-main", revision),
+            workstream_id="long-lived",
+        )
+        assert parsed.expected_parent == SessionRevisionRef(
+            "claude-main", f"{number - 1:06d}"
+        )
+        assert parsed.body.current_state == (
+            f"Claude revision {number:06d} after compact {number - 1}."
+        )
+        claude_hashes[revision] = _revision_hash(vault.root, revision)
         compact_results.append(result)
 
     assert [result.event for result in compact_results] == ["pre_compact"] * 3
@@ -211,6 +267,7 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     )
     assert switched.ok is True
     assert switched.block_host is False
+    _assert_revision_hashes(vault.root, claude_hashes)
 
     before_preference = RegistryStore(vault).load_workstream("long-lived")
     assert before_preference.mode == "parallel"
@@ -280,16 +337,7 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     assert codex_first.relations[0].kind == "continues_from"
     assert codex_first.relations[0].target == "claude-main@000004"
 
-    (vault.root / ".gitattributes").write_text(
-        ".madi/** text eol=lf\n"
-        "projects/** text eol=lf\n"
-        "sources/** text eol=lf\n"
-        "workstreams/** text eol=lf\n"
-        "memory/** text eol=lf\n",
-        encoding="utf-8",
-    )
-    _git(vault.root, "init", "-b", "main")
-    _git(vault.root, "add", ".")
+    _git(vault.root, "add", "-A")
     _git(vault.root, "commit", "-m", "checkpoint: synced portable continuity")
     remote = tmp_path / "continuity.git"
     _git(tmp_path, "init", "--bare", str(remote))
@@ -338,6 +386,28 @@ def test_three_compacts_handoff_and_clone_resume_without_session_end(tmp_path):
     )
 
     assert _git(clone, "rev-list", "--count", "HEAD") == "1"
+    assert _git(clone, "rev-parse", "--is-shallow-repository") == "true"
+    assert (
+        _git_result(clone, "cat-file", "-e", f"{parent_commit}^{{commit}}").returncode
+        != 0
+    )
+    _assert_revision_hashes(clone, claude_hashes)
+    cloned_sessions = SessionStore(second_vault)
+    expected_states = {
+        "000001": ("Claude revision 000001 before any compact.", None),
+        "000002": ("Claude revision 000002 after compact 1.", "000001"),
+        "000003": ("Claude revision 000003 after compact 2.", "000002"),
+        "000004": ("Claude revision 000004 after compact 3.", "000003"),
+    }
+    for revision, (state, parent) in expected_states.items():
+        parsed = cloned_sessions.read_revision(
+            SessionRevisionRef("claude-main", revision),
+            workstream_id="long-lived",
+        )
+        assert parsed.body.current_state == state
+        assert (
+            None if parsed.expected_parent is None else parsed.expected_parent.revision
+        ) == parent
     assert observed.context_required is True
     assert observed.checkpoint_required is False
     assert resumed.ok is True

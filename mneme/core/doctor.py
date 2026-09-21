@@ -248,7 +248,7 @@ class Doctor:
         issues: list[DoctorIssue],
     ) -> None:
         sessions_root = self._vault.root / "workstreams" / workstream_id / "sessions"
-        valid: set[HeadRef] = set()
+        valid: dict[HeadRef, object] = {}
         sessions = SessionStore(self._vault)
         for session_directory in _directories(sessions_root):
             for path in _files(session_directory, ".md"):
@@ -262,7 +262,7 @@ class Doctor:
                 except Exception:
                     issues.append(_issue("canonical-artifact-invalid", "invalid", artifact))
                     continue
-                valid.add(ref.as_head())
+                valid[ref.as_head()] = request
                 self._scan_receipt(request.policy_evaluation, policies, artifact, issues)
                 if registry is not None:
                     try:
@@ -275,7 +275,8 @@ class Doctor:
         for head in active_heads:
             if head not in valid:
                 issues.append(_issue("missing-active-head", "invalid", f"workstream:{_safe_id(workstream_id)}"))
-        for ref in sorted(valid - set(active_heads), key=lambda item: (item.session, item.revision)):
+        reachable = _reachable_session_heads(active_heads, valid)
+        for ref in sorted(set(valid) - reachable, key=lambda item: (item.session, item.revision)):
             issues.append(
                 _issue(
                     "session-orphan",
@@ -389,12 +390,28 @@ def _issue(code: str, severity: str, artifact: str) -> DoctorIssue:
         "policy-reevaluation-failed": "current policy reevaluation failed",
         "policy-reevaluation-noncompliant": "current policy reevaluation no longer permits the artifact",
         "portable-local-reference": "portable canonical artifact contains a local-only reference",
-        "session-orphan": "immutable revision is not declared as an active head",
+        "session-orphan": "immutable revision is not reachable from an active head",
         "source-markdown-unreadable": "mounted Markdown could not be read as UTF-8",
         "source-unavailable": "optional source mount is unavailable",
         "stale-local-lock": "local lock is older than the configured safe threshold",
     }
     return DoctorIssue(code, severity, artifact, details[code])
+
+
+def _reachable_session_heads(
+    active_heads: tuple[HeadRef, ...], revisions: dict[HeadRef, object]
+) -> set[HeadRef]:
+    reachable: set[HeadRef] = set()
+    pending = list(active_heads)
+    while pending:
+        head = pending.pop()
+        if head in reachable or head not in revisions:
+            continue
+        reachable.add(head)
+        parent = getattr(revisions[head], "expected_parent", None)
+        if parent is not None:
+            pending.append(parent.as_head())
+    return reachable
 
 
 def _status(issues: Iterable[DoctorIssue]) -> str:

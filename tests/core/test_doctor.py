@@ -76,6 +76,24 @@ def _relocate_directory(source: Path, target: Path) -> None:
     source.rmdir()
 
 
+def test_doctor_keeps_reachable_session_ancestors_out_of_orphans(vault):
+    """Catches treating valid ancestors of the active head as interruption orphans."""
+    from mneme.core.doctor import Doctor
+    from mneme.core.registries import RegistryStore
+
+    _workstream(vault)
+    first = _checkpoint(vault)
+    second = _checkpoint(vault, parent=first, generation=1)
+    third = _checkpoint(vault, parent=second, generation=2)
+
+    report = Doctor(vault).run()
+
+    assert RegistryStore(vault).load_workstream("ws-01").active_heads == (
+        third.as_head(),
+    )
+    assert not any(issue.code == "session-orphan" for issue in report.issues)
+
+
 def test_doctor_reports_orphan_without_changing_the_declared_head(vault):
     """Catches Doctor attaching an otherwise valid orphan revision automatically."""
     from mneme.core.doctor import Doctor
@@ -97,6 +115,28 @@ def test_doctor_reports_orphan_without_changing_the_declared_head(vault):
     ]
     assert RegistryStore(vault).load_workstream("ws-01").active_heads == (first.as_head(),)
     assert (vault.root / "workstreams" / "ws-01" / "sessions" / "ses-01" / f"{second.revision}.md").exists()
+
+
+def test_doctor_reports_unregistered_session_revision_as_orphan(vault):
+    """Catches hiding a disconnected revision whose session is no longer registered."""
+    from mneme.core.doctor import Doctor
+    from mneme.core.registries import RegistryStore
+
+    RegistryStore(vault).create_workstream("ws-01", project=None, mode="parallel")
+    first = _checkpoint(vault)
+    disconnected = _checkpoint(vault, session_id="ses-disconnected", generation=1)
+    registries = RegistryStore(vault)
+    current = registries.load_workstream("ws-01")
+    registries.update_workstream(
+        replace(current, active_heads=(first.as_head(),)),
+        expected_generation=current.generation,
+    )
+
+    report = Doctor(vault).run()
+
+    assert ("session-orphan", "degraded", f"session:ws-01:ses-disconnected:{disconnected.revision}") in [
+        (issue.code, issue.severity, issue.artifact) for issue in report.issues
+    ]
 
 
 def test_doctor_marks_a_missing_active_head_invalid(vault):

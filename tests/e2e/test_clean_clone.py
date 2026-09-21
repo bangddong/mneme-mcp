@@ -23,6 +23,12 @@ _LOCAL_DIRECTORIES = (
 
 
 def _git(cwd: Path, *arguments: str) -> str:
+    result = _git_result(cwd, *arguments)
+    result.check_returncode()
+    return result.stdout.strip()
+
+
+def _git_result(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment.update(
         {
@@ -32,16 +38,15 @@ def _git(cwd: Path, *arguments: str) -> str:
             "GIT_COMMITTER_NAME": "Madi release gate",
         }
     )
-    result = subprocess.run(
+    return subprocess.run(
         ["git", *arguments],
         cwd=cwd,
-        check=True,
+        check=False,
         capture_output=True,
         encoding="utf-8",
         errors="strict",
         env=environment,
     )
-    return result.stdout.strip()
 
 
 def _prepare_state_home(vault_root: Path, state_home: Path) -> None:
@@ -104,7 +109,15 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
     assert not any("overlays" in path.parts for path in fixture_files)
 
     source = tmp_path / "source"
-    shutil.copytree(FIXTURE, source)
+    source.mkdir()
+    _git(source, "init", "-b", "main")
+    (source / "README.md").write_text(
+        "Parent commit before the portable fixture state.\n", encoding="utf-8"
+    )
+    _git(source, "add", ".")
+    _git(source, "commit", "-m", "fixture: parent before portable state")
+    parent_commit = _git(source, "rev-parse", "HEAD")
+    shutil.copytree(FIXTURE, source, dirs_exist_ok=True)
     source_state = tmp_path / "source-state"
     _prepare_state_home(source, source_state)
     source_vault = Vault.open(source, source_state)
@@ -120,6 +133,8 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
         "source-overlay" in path.read_text(encoding="utf-8")
         for path in source.rglob("*")
         if path.is_file()
+        and ".git" not in path.parts
+        and path.suffix in {".md", ".yaml"}
     )
 
     _remove_generated_state(source_vault)
@@ -127,7 +142,6 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
     assert source_doctor.status != "invalid"
     source_semantics = _portable_semantics(source_vault)
 
-    _git(source, "init", "-b", "main")
     _git(source, "add", ".")
     _git(source, "commit", "-m", "fixture: portable current tree")
     remote = tmp_path / "remote.git"
@@ -163,12 +177,19 @@ def test_shallow_clone_rebuilds_portable_semantics_without_source_overlay(tmp_pa
 
     clone_doctor = Doctor(cloned_vault).run()
     assert clone_doctor.status != "invalid"
+    assert not any(issue.code == "session-orphan" for issue in source_doctor.issues)
+    assert not any(issue.code == "session-orphan" for issue in clone_doctor.issues)
     clone_semantics = _portable_semantics(cloned_vault)
 
     assert clone_semantics == source_semantics
+    assert _git(clone, "rev-parse", "--is-shallow-repository") == "true"
     assert "Portable checkpoint 3 is current-tree state." in clone_semantics["current"]
     assert "Prefer deterministic, inspectable release evidence." in clone_semantics["profile"]
     assert "Prefer deterministic release evidence." not in clone_semantics["profile"]
     assert len(list(clone.glob("workstreams/*/sessions/*/*.md"))) == 3
     assert len(list(clone.glob("memory/*.md"))) == 2
     assert (clone / ".madi/policies/fixture-policy/2.yaml").is_file()
+    assert (
+        _git_result(clone, "cat-file", "-e", f"{parent_commit}^{{commit}}").returncode
+        != 0
+    )
