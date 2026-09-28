@@ -173,6 +173,8 @@ class MemoryRecord:
         if not isinstance(self.receipt_history, tuple) or not all(isinstance(item, PolicyEvaluation) for item in self.receipt_history):
             raise InvalidArtifact("memory receipt history is invalid")
         if self.retired_at is None:
+            if self.status is MemoryStatus.RETIRED:
+                raise InvalidArtifact("retired memory requires a retirement envelope")
             if self.retirement_reason is not None:
                 raise InvalidArtifact("active memory cannot have a retirement reason")
         else:
@@ -358,7 +360,7 @@ class MemoryStore:
                 authority: MemoryAuthority | str, portability: Portability | str, body: str, rationale: str,
                 provenance: tuple[ArtifactReference, ...], supersedes: str | None, generation: int,
                 receipt: PolicyEvaluation, accepted_semantic_hash: str | None, history: tuple[PolicyEvaluation, ...], retired_at: datetime | None,
-                retirement_reason: str | None) -> MemoryRecord:
+                retirement_reason: str | None, *, preserve_provenance: bool = False) -> MemoryRecord:
         try:
             parsed_kind = kind if isinstance(kind, MemoryKind) else MemoryKind(kind)
             parsed_authority = authority if isinstance(authority, MemoryAuthority) else MemoryAuthority(authority)
@@ -366,8 +368,10 @@ class MemoryStore:
         except (TypeError, ValueError) as exc:
             raise InvalidArtifact("memory axis value is invalid") from exc
         parsed_scope = MemoryScope.parse(scope)
+        if not preserve_provenance:
+            provenance = _typed_memory_provenance(provenance)
         body = normalize_text(body)
-        semantic = memory_semantic_hash(id=memory_id, kind=parsed_kind, scope=parsed_scope, authority=parsed_authority,
+        semantic = _hash_semantic_fields(kind=parsed_kind, scope=parsed_scope, authority=parsed_authority,
                                         portability=parsed_portability, body=body, rationale=rationale, provenance=provenance,
                                         supersedes=supersedes)
         return MemoryRecord(memory_id, parsed_kind, status, parsed_scope, parsed_authority, parsed_portability, body,
@@ -411,10 +415,7 @@ class MemoryStore:
         for reference in record.provenance:
             if reference.kind is not ReferenceKind.ID or not isinstance(reference.value, str):
                 continue
-            try:
-                source = registries.load_source(reference.value)
-            except InvalidArtifact:
-                continue
+            source = RegistryStore(self.vault, reference.storage_class).load_source(reference.value)
             if source.policy_ref is not None:
                 refs.append(source.policy_ref)
             if source.project is not None:
@@ -452,7 +453,8 @@ class MemoryStore:
             record = self._record(memory_id, metadata["kind"], MemoryStatus(metadata["status"]), metadata["scope"], metadata["authority"], metadata["portability"],
                 document.body, metadata["rationale"], _references(metadata["provenance"]), metadata["supersedes"], metadata["generation"],
                 _parse_receipt(metadata["policy_receipt"]), metadata["accepted_semantic_hash"], tuple(_parse_receipt(item) for item in _list(metadata["receipt_history"], "receipt history")),
-                None if metadata["retired_at"] is None else _parse_timestamp(metadata["retired_at"]), metadata["retirement_reason"])
+                None if metadata["retired_at"] is None else _parse_timestamp(metadata["retired_at"]), metadata["retirement_reason"],
+                preserve_provenance=True)
         except (TypeError, ValueError) as exc:
             raise InvalidArtifact("memory record has invalid values") from exc
         if record.semantic_hash != metadata["semantic_hash"]:
@@ -500,8 +502,18 @@ def memory_semantic_hash(*, body: str, id: str = "", kind: MemoryKind | str = Me
         parsed_portability = portability if isinstance(portability, Portability) else Portability(portability)
     except (TypeError, ValueError) as exc:
         raise InvalidArtifact("memory axis value is invalid") from exc
-    payload = {"kind": parsed_kind.value, "scope": parsed_scope.as_dict(), "authority": parsed_authority.value,
-               "portability": parsed_portability.value, "body": normalize_text(body), "rationale": rationale,
+    provenance = _typed_memory_provenance(provenance)
+    return _hash_semantic_fields(kind=parsed_kind, scope=parsed_scope, authority=parsed_authority,
+        portability=parsed_portability, body=body, rationale=rationale, provenance=provenance, supersedes=supersedes)
+
+
+def _hash_semantic_fields(*, kind: MemoryKind, scope: MemoryScope, authority: MemoryAuthority,
+                         portability: Portability, body: str, rationale: str,
+                         provenance: tuple[ArtifactReference, ...], supersedes: str | None) -> str:
+    # Decode preserves the exact v1 provenance representation. Adding family
+    # metadata to an accepted legacy record would alter its immutable semantics.
+    payload = {"kind": kind.value, "scope": scope.as_dict(), "authority": authority.value,
+               "portability": portability.value, "body": normalize_text(body), "rationale": rationale,
                "provenance": [_reference_dict(item) for item in provenance], "supersedes": supersedes}
     return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -646,7 +658,25 @@ def _parse_timestamp(value: object) -> datetime:
 def _reference_dict(reference: ArtifactReference) -> dict[str, Any]:
     if not isinstance(reference, ArtifactReference):
         raise InvalidArtifact("memory provenance must be typed artifact references")
-    return {"kind": reference.kind.value, "storage_class": reference.storage_class.value, "value": reference.value}
+    result = {"kind": reference.kind.value, "storage_class": reference.storage_class.value, "value": reference.value}
+    if reference.target_family is not None:
+        result["target_family"] = reference.target_family
+    return result
+
+
+def _typed_memory_provenance(
+    provenance: tuple[ArtifactReference, ...],
+) -> tuple[ArtifactReference, ...]:
+    if not isinstance(provenance, tuple) or not all(
+        isinstance(reference, ArtifactReference) for reference in provenance
+    ):
+        raise InvalidArtifact("memory provenance must be typed artifact references")
+    return tuple(
+        replace(reference, target_family="source")
+        if reference.kind is ReferenceKind.ID and reference.target_family is None
+        else reference
+        for reference in provenance
+    )
 
 
 def _references(value: object) -> tuple[ArtifactReference, ...]:
@@ -654,8 +684,8 @@ def _references(value: object) -> tuple[ArtifactReference, ...]:
         raise InvalidArtifact("memory provenance must be a list")
     from mneme.core.artifacts import ReferenceKind
     try:
-        parsed = tuple(ArtifactReference(ReferenceKind(item["kind"]), StorageClass(item["storage_class"]), item["value"])
-                     for item in value if isinstance(item, dict) and set(item) == {"kind", "storage_class", "value"})
+        parsed = tuple(ArtifactReference(ReferenceKind(item["kind"]), StorageClass(item["storage_class"]), item["value"], item.get("target_family"))
+                     for item in value if isinstance(item, dict) and set(item) in ({"kind", "storage_class", "value"}, {"kind", "storage_class", "value", "target_family"}))
     except (KeyError, TypeError, ValueError) as exc:
         raise InvalidArtifact("memory provenance is invalid") from exc
     if len(parsed) != len(value):

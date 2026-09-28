@@ -372,7 +372,7 @@ class ObservationResult:
 
 
 def _validate_version(version: object) -> None:
-    if version != CONTRACT_VERSION or isinstance(version, bool):
+    if type(version) is not int or version != CONTRACT_VERSION:
         raise InvalidArtifact(f"contract version must be {CONTRACT_VERSION}")
 
 

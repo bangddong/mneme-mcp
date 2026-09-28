@@ -27,8 +27,8 @@ def create_app(service: CoreService) -> FastMCP:
     app = FastMCP("madi")
 
     @app.tool(name="madi_context")
-    def madi_context(workstream_id: str, mode: str = "portable") -> dict[str, object]:
-        """Return current bounded context for an explicit workstream."""
+    def madi_context(workstream_id: str | None = None, mode: str = "portable") -> dict[str, object]:
+        """Return bounded context for an explicit or deterministic workstream selection."""
         return _execute(
             service,
             "get_context",

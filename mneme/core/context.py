@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
+import json
 
 from mneme.core.registries import HeadRef, WorkstreamRegistry
 from mneme.core.resolver import (
@@ -36,6 +37,7 @@ class ContextReaders:
     load_overlay_revision: Callable[[str, HeadRef], object] | None = None
     portable_optional_inputs: Callable[[str], Sequence[object]] | None = None
     authorize_revision: Callable[[str, HeadRef, StorageClass], bool] | None = None
+    load_accepted_memories: Callable[[str, StorageClass], Sequence[object]] | None = None
 
     def __post_init__(self) -> None:
         if not callable(self.load_portable_workstream) or not callable(self.load_portable_revision):
@@ -87,6 +89,8 @@ def render_current(
 
     portable = _resolve_portable(readers, workstream_id)
     portable_text = _render_layer("Current", portable)
+    if portable.state is not ResolutionState.INVALID:
+        portable_text += _render_memories(readers, workstream_id, StorageClass.PORTABLE)
     if mode == "portable":
         return ContextView(
             workstream_id, mode, portable_text, portable, None, portable.state, None, portable.state
@@ -95,6 +99,10 @@ def render_current(
     overlay = _resolve_overlay(readers, workstream_id)
     effective = _effective_state(portable.state, overlay.state if overlay is not None else ResolutionState.DEGRADED)
     text = _render_effective(portable, overlay, effective)
+    if portable.state is not ResolutionState.INVALID:
+        text += _render_memories(readers, workstream_id, StorageClass.PORTABLE)
+        if overlay is not None and overlay.registry is not None and overlay.state is not ResolutionState.INVALID:
+            text += _render_memories(readers, overlay.registry.id, StorageClass.LOCAL_ONLY)
     return ContextView(
         workstream_id,
         mode,
@@ -241,12 +249,19 @@ def _render_layer(label: str, resolved: ResolvedWorkstream) -> str:
     if resolved.state is ResolutionState.INVALID:
         lines.append("The selected canonical state requires repair.")
         return "\n".join(lines)
+    if resolved.registry is not None:
+        lines.append(f"workstream: {resolved.registry.id}; project: {resolved.registry.project or 'none'}")
+    if resolved.diagnostics:
+        lines.extend(f"diagnostic: {_bounded(item)}" for item in resolved.diagnostics[:8])
     if not resolved.revisions:
         lines.append("No active heads.")
         return "\n".join(lines)
-    for head, revision in resolved.revisions:
+    ordered = sorted(resolved.revisions, key=lambda pair: (pair[0] != resolved.selected_head, pair[0].session, pair[0].revision))
+    for head, revision in ordered[:4]:
         role = "selected" if head == resolved.selected_head else "alternative"
-        lines.extend(("", f"## {role} head", _revision_text(revision)))
+        lines.extend(("", f"## {role} head: {head.session}@{head.revision}", _revision_text(revision)))
+    if len(ordered) > 4:
+        lines.append("Additional declared heads omitted from bounded CURRENT; inspect the registry.")
     return "\n".join(lines)
 
 
@@ -254,4 +269,51 @@ def _revision_text(revision: object) -> str:
     if not isinstance(revision, SessionRevision):
         return "Validated revision content is unavailable."
     body = revision.body
-    return f"Objective: {body.objective}\n\nCurrent state: {body.current_state}"
+    request = revision.request
+    lines = [f"session: {request.session_id}; workstream: {request.workstream_id}; revision: {revision.head.revision}",
+        f"adapter: {body.adapter_id}; timestamp: {request.revision_timestamp.isoformat()}",
+        f"predecessor: {request.expected_parent}",
+        f"Objective: {_bounded(body.objective)}", f"Current state: {_bounded(body.current_state)}"]
+    for label, values in (("Verified facts / decisions", body.verified_facts), ("Completed work / verification", body.completed_work),
+                          ("Blockers / risks", body.blockers), ("Next actions", body.next_actions)):
+        lines.append(f"### {label}")
+        lines.extend(f"- {_bounded(value)}" for value in values[:4])
+        if not values:
+            lines.append("- none")
+        elif len(values) > 4:
+            lines.append("- additional items available in the revision")
+    from mneme.core.sessions import _serialize_reference, _serialize_relation
+    lines.append("### Source references")
+    lines.extend(_bounded(json.dumps(_serialize_reference(item), sort_keys=True)) for item in body.source_refs[:4])
+    lines.append("### Relations / handoffs")
+    for relation in request.relations[:4]:
+        # Bound individual fields so next actions remain visible after long context.
+        for key, value in _serialize_relation(relation).items():
+            lines.append(f"{key}: {_bounded(str(value))}")
+    lines.append(_receipt_text(request.policy_evaluation))
+    return "\n".join(lines)
+
+
+def _bounded(value: str) -> str:
+    return value if len(value) <= 256 else value[:256] + " … [bounded; inspect artifact]"
+
+
+def _receipt_text(receipt: object) -> str:
+    from mneme.core.memories import _profile_receipt
+
+    return "provenance / policy_receipt: " + _bounded(_profile_receipt(receipt))
+
+
+def _render_memories(readers: ContextReaders, workstream_id: str, storage_class: StorageClass) -> str:
+    if readers.load_accepted_memories is None:
+        return ""
+    try:
+        records = readers.load_accepted_memories(workstream_id, storage_class)
+        lines = ["", f"## Accepted memories ({storage_class.value})"]
+        from mneme.core.memories import _profile_provenance
+        for record in records[:5]:
+            lines.extend((f"### {record.id} ({record.kind.value}; {record.authority.value})", _bounded(record.body),
+                "provenance: " + _bounded(_profile_provenance(record.provenance)), _receipt_text(record.policy_receipt)))
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return "\nAccepted memories unavailable.\n"

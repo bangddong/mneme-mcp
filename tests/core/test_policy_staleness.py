@@ -366,7 +366,7 @@ def test_tampered_memory_receipt_cannot_change_actual_portable_authorization(
     assert service.authorize_export(PolicyArtifactRef.memory(memory.id)).allowed is False
 
 
-def test_service_view_cache_uses_all_parallel_current_heads(admitted_artifacts):
+def test_service_view_cache_uses_all_parallel_current_heads(admitted_artifacts, monkeypatch):
     """Catches CURRENT cache validation using one head's policy inputs for many heads."""
     from mneme.core.artifacts import ArtifactReference, ReferenceKind, StorageClass
     from mneme.core.policy import PolicyStore, Portability, evaluate_portability
@@ -409,6 +409,15 @@ def test_service_view_cache_uses_all_parallel_current_heads(admitted_artifacts):
         "CURRENT.md", "one-head cache body", authorization_fingerprint=single.authorization_fingerprint
     )
 
+    bound_decisions = []
+    original_cache = service._cache_view
+
+    def capture_projection_decision(name, view, decision):
+        bound_decisions.append(decision)
+        return original_cache(name, view, decision)
+
+    monkeypatch.setattr(service, "_cache_view", capture_projection_decision)
+
     view = service.context("ws-01")
 
     assert aggregate.allowed is True
@@ -418,7 +427,11 @@ def test_service_view_cache_uses_all_parallel_current_heads(admitted_artifacts):
     assert "parallel-session-body" in view.text
     assert vault.views.load(
         "CURRENT.md", authorization_fingerprint=aggregate.authorization_fingerprint
-    ) == view.text
+    ) is None
+    bound, = bound_decisions
+    assert bound.allowed is True
+    assert bound.authorization_fingerprint != aggregate.authorization_fingerprint
+    assert vault.views.load("CURRENT.md", authorization=bound) == view.text
 
 
 def test_service_view_cache_uses_all_rendered_profile_memories(admitted_artifacts):

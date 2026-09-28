@@ -91,7 +91,9 @@ def test_disjoint_checkpoint_race_retries_and_preference_race_conflicts(
             executor.map(checkpoint, ("agent-alpha", "agent-beta"))
         )
 
-    assert all(result.ok for result in results)
+    assert all(result.ok for result in results), (
+        results, update_attempts, checkpoint_barrier.broken
+    )
     assert {result.result["session_id"] for result in results} == {
         "agent-alpha",
         "agent-beta",

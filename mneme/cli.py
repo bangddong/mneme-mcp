@@ -120,7 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--repair", action="store_true")
 
     context = commands.add_parser("context", help="render generated current context")
-    context.add_argument("--workstream", required=True)
+    context.add_argument("--workstream")
     context.add_argument(
         "--mode", choices=("portable", "effective-local"), default="portable"
     )
@@ -595,13 +595,14 @@ def _artifact_references(value: object) -> tuple[ArtifactReference, ...]:
     references = []
     for item in value:
         reference = _require_mapping(item, "artifact reference")
-        _require_keys(reference, {"kind", "storage_class", "value"}, "artifact reference")
+        _require_keys(reference, {"kind", "storage_class", "value"} | ({"target_family"} if "target_family" in reference else set()), "artifact reference")
         try:
             references.append(
                 ArtifactReference(
                     ReferenceKind(reference["kind"]),
                     StorageClass(reference["storage_class"]),
                     reference["value"],
+                    reference.get("target_family"),
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -761,7 +762,9 @@ def _command_hint(arguments: Sequence[str]) -> str:
 
 
 def _write_json(stream: TextIO, value: Mapping[str, Any]) -> None:
-    stream.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+    # ASCII JSON is also valid UTF-8 and survives Windows pipe encodings while
+    # retaining Unicode exactly after JSON decoding.
+    stream.write(json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

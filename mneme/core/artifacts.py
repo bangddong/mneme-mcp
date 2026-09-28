@@ -37,6 +37,7 @@ class ArtifactReference:
     kind: ReferenceKind
     storage_class: StorageClass
     value: str | int | bool
+    target_family: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ReferenceKind):
@@ -45,6 +46,10 @@ class ArtifactReference:
             raise InvalidArtifact(
                 "artifact reference storage_class must be a StorageClass"
             )
+        if self.target_family is not None and (
+            self.kind is not ReferenceKind.ID or self.target_family != "source"
+        ):
+            raise InvalidArtifact("unsupported typed provenance target family")
         if self.kind in {
             ReferenceKind.ID,
             ReferenceKind.PATH,

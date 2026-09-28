@@ -419,6 +419,9 @@ class PolicyAuthorizer:
         exact_projects: set[tuple[StorageClass, str]] = set()
         if workstream_id is not None:
             workstream = registries.load_workstream(workstream_id)
+            # Resolution choices and lifecycle affect CURRENT even when policies
+            # and the set of eligible heads have not changed.
+            inputs.append("registry:" + sha256(repr(workstream).encode("utf-8")).hexdigest())
             inputs.extend(
                 self._input_token("workstream", workstream.id, reference)
                 for reference in workstream.policy_refs

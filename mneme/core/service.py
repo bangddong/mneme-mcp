@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mneme.core.artifacts import (
+    ArtifactFamily,
     ArtifactReference,
     ReferenceKind,
     StorageClass,
@@ -22,7 +24,7 @@ from mneme.core.contracts import (
     ObservationResult,
     PolicyDenied,
 )
-from mneme.core.context import ContextReaders, ContextView, render_current
+from mneme.core.context import ContextReaders, ContextView, LocalOverlay, render_current
 from mneme.core.errors import InvalidArtifact
 from mneme.core.memories import (
     MemoryRecord,
@@ -39,7 +41,7 @@ from mneme.core.policy import (
     policy_admission_gate,
 )
 from mneme.core.registries import HeadRef, RegistryStore
-from mneme.core.resolver import SessionRevision
+from mneme.core.resolver import SessionRevision, ResolutionState, ResolvedWorkstream
 from mneme.core.security import PolicyArtifactRef, PolicyAuthorizer, PolicyDecision
 from mneme.core.search.index import (
     GeneratedIndex,
@@ -115,14 +117,15 @@ class CoreService:
     def _execute_get_context(self, value: Mapping[str, Any]) -> CommandResult:
         payload = _payload(
             value,
-            required={"workstream_id"},
-            optional={"mode"},
+            required=set(),
+            optional={"mode", "workstream_id"},
             label="get_context",
         )
         mode = payload.get("mode", "portable")
         if not isinstance(mode, str):
             raise InvalidArtifact("context mode must be text")
-        view = self.context(_text(payload["workstream_id"], "workstream id"), mode)
+        selected = payload.get("workstream_id")
+        view = self.context(None if selected is None else _text(selected, "workstream id"), mode)
         result = {
             "effective_status": view.effective_status.value,
             "mode": view.mode,
@@ -861,16 +864,23 @@ class CoreService:
             tuple(sorted(set(diagnostics))),
         )
 
-    def context(self, workstream_id: str, mode: str = "portable") -> ContextView:
+    def context(self, workstream_id: str | None = None, mode: str = "portable") -> ContextView:
+        if mode not in {"portable", "effective-local"}:
+            raise InvalidArtifact("CURRENT mode is invalid")
+        if workstream_id is None:
+            workstream_id, overview = self._select_workstream(mode)
+            if overview is not None:
+                return overview
         registries = RegistryStore(self.vault)
         sessions = SessionStore(self.vault)
+        local_sessions = SessionStore(self.vault, StorageClass.LOCAL_ONLY)
         _bindings, source_diagnostics = self._bound_sources()
         with policy_admission_gate(self.vault):
             view_decision = self.authorizer.authorize_context_view(
                 workstream_id, mode=mode
             )
             readers = ContextReaders(
-                registries.load_workstream,
+                lambda selected: self._authorized_workstream(selected, StorageClass.PORTABLE),
                 lambda selected, head: SessionRevision(
                     head,
                     sessions.read_revision(
@@ -878,6 +888,9 @@ class CoreService:
                         workstream_id=selected,
                     ),
                 ),
+                load_overlay=self._load_overlay,
+                load_overlay_revision=lambda selected, head: SessionRevision(
+                    head, local_sessions.read_revision(SessionRevisionRef(head.session, head.revision), workstream_id=selected)),
                 portable_optional_inputs=lambda _selected: (
                     self.index.db_path.is_file(),
                     not source_diagnostics,
@@ -888,9 +901,158 @@ class CoreService:
                     ),
                     "context",
                 ).allowed,
+                load_accepted_memories=self._context_memories,
             )
             view = render_current(readers, workstream_id, mode)
+            view_decision = self._bind_context_projection(
+                view_decision, view, source_diagnostics
+            )
             return self._cache_view("CURRENT.md", view, view_decision)
+
+    def _bind_context_projection(
+        self,
+        decision: PolicyDecision,
+        view: ContextView,
+        source_diagnostics: tuple[object, ...],
+    ) -> PolicyDecision:
+        if not decision.allowed or decision.authorization_fingerprint is None:
+            return decision
+        try:
+            memory_state = []
+            authorization_state = [decision.authorization_fingerprint]
+            if view.overlay is not None and view.overlay.registry is not None:
+                overlay_registry = view.overlay.registry
+                overlay_refs = (
+                    PolicyArtifactRef.workstream(
+                        overlay_registry.id, StorageClass.LOCAL_ONLY
+                    ),
+                    *(
+                        PolicyArtifactRef.session(
+                            overlay_registry.id,
+                            head.session,
+                            head.revision,
+                            StorageClass.LOCAL_ONLY,
+                        )
+                        for head, _revision in view.overlay.revisions
+                    ),
+                )
+                for reference in overlay_refs:
+                    current = self.authorizer.authorize_current(reference, "context")
+                    if not current.allowed or current.authorization_fingerprint is None:
+                        return PolicyDecision(False, current.issue_codes)
+                    authorization_state.append(current.authorization_fingerprint)
+            for storage_class, selected in (
+                (StorageClass.PORTABLE, view.workstream_id),
+                (
+                    StorageClass.LOCAL_ONLY,
+                    None if view.overlay is None or view.overlay.registry is None
+                    else view.overlay.registry.id,
+                ),
+            ):
+                if selected is None or (
+                    storage_class is StorageClass.LOCAL_ONLY
+                    and view.mode != "effective-local"
+                ):
+                    continue
+                for record in self._context_memories(selected, storage_class):
+                    current = self.authorizer.authorize_current(
+                        PolicyArtifactRef.memory(record.id, storage_class), "context"
+                    )
+                    if not current.allowed or current.authorization_fingerprint is None:
+                        return PolicyDecision(False, current.issue_codes)
+                    authorization_state.append(current.authorization_fingerprint)
+                    memory_state.append((
+                        storage_class.value,
+                        record.id,
+                        record.generation,
+                        record.semantic_hash,
+                        record.status.value,
+                    ))
+            from mneme.core.fs import normalize_text
+
+            inputs = repr(
+                (
+                    view.mode,
+                    view.portable.registry,
+                    None if view.overlay is None else view.overlay.registry,
+                    view.portable_status.value,
+                    None if view.overlay_status is None else view.overlay_status.value,
+                    view.effective_status.value,
+                    self.index.db_path.is_file(),
+                    source_diagnostics,
+                    tuple(memory_state),
+                    tuple(authorization_state),
+                    sha256(normalize_text(view.text).encode("utf-8")).hexdigest(),
+                )
+            )
+            fingerprint = sha256(
+                (decision.authorization_fingerprint + "\0" + inputs).encode("utf-8")
+            ).hexdigest()
+            return PolicyDecision(True, (), fingerprint)
+        except Exception:
+            return PolicyDecision(False, ("policy-current-unavailable",))
+
+    def _authorized_workstream(self, workstream_id: str, storage_class: StorageClass):
+        if not self.authorizer.authorize_current(PolicyArtifactRef.workstream(workstream_id, storage_class), "context").allowed:
+            raise InvalidArtifact("current policy withheld workstream")
+        return RegistryStore(self.vault, storage_class).load_workstream(workstream_id)
+
+    def _load_overlay(self, workstream_id: str) -> LocalOverlay | None:
+        store = RegistryStore(self.vault, StorageClass.LOCAL_ONLY)
+        overlays = []
+        for path in sorted((self.vault.local_root / "overlays/workstreams").glob("*/workstream.yaml")):
+            registry = store.load_workstream(path.parent.name)
+            if registry.overlay_of == workstream_id:
+                overlays.append(self._authorized_workstream(registry.id, StorageClass.LOCAL_ONLY))
+        if len(overlays) > 1:
+            raise InvalidArtifact("local overlay selection is ambiguous")
+        return None if not overlays else LocalOverlay(workstream_id, overlays[0])
+
+    def _context_memories(self, workstream_id: str, storage_class: StorageClass):
+        registry = RegistryStore(self.vault, storage_class).load_workstream(workstream_id)
+        store = MemoryStore(self.vault, storage_class)
+        memory_root = self.vault.router.location(
+            ArtifactFamily.MEMORY, storage_class, "memory/placeholder.md"
+        ).path.parent
+        if not memory_root.exists():
+            return ()
+        result = []
+        for record in store.iter_records():
+            applicable = (record.scope.type.value == "personal-global" or record.scope.workstream_id == workstream_id
+                or (registry.project is not None and record.scope.project_id == registry.project))
+            if applicable and self._accepted_memory_is_current(store, record) and self.authorizer.authorize_current(
+                PolicyArtifactRef.memory(record.id, storage_class), "context").allowed:
+                result.append(record)
+        return tuple(result[:5])
+
+    def _select_workstream(self, mode: str):
+        candidates = []
+        for path in sorted((self.vault.root / "workstreams").glob("*/workstream.yaml")):
+            try:
+                registry = self._authorized_workstream(path.parent.name, StorageClass.PORTABLE)
+                if registry.status == "active":
+                    candidates.append(registry)
+            except Exception:
+                continue
+        projects = set()
+        store = RegistryStore(self.vault)
+        for source in sorted((self.vault.root / "sources").glob("*.yaml")):
+            try:
+                binding = SourceBindingStore(self.vault).load(source.stem)
+                if binding is not None and Path.cwd().resolve().is_relative_to(binding.path):
+                    projects.add(store.load_source(source.stem).project)
+            except Exception:
+                continue
+        bound = [item for item in candidates if item.project is not None and item.project in projects]
+        if len(bound) == 1:
+            return bound[0].id, None
+        if len(candidates) == 1:
+            return candidates[0].id, None
+        lines = ["# CURRENT overview", "Select an explicit workstream."]
+        lines.extend(f"- {item.id} ({item.status})" for item in candidates[:64])
+        resolved = ResolvedWorkstream(ResolutionState.RESOLVED, None, (), (), None)
+        return None, ContextView("overview", mode, "\n".join(lines) + "\n", resolved, None,
+            ResolutionState.RESOLVED, None, ResolutionState.RESOLVED)
 
     def profile(
         self, scope: object, *, storage_class: StorageClass = StorageClass.PORTABLE
@@ -925,13 +1087,13 @@ class CoreService:
         if not decision.allowed:
             return view
         try:
+            from mneme.core.fs import normalize_text
+
+            view = replace(view, text=normalize_text(view.text))
             cached = self.vault.views.load(name, authorization=decision)
-            if cached is None:
+            if cached != view.text:
                 self.vault.views.write(name, view.text, authorization=decision)
-                cached = self.vault.views.load(name, authorization=decision)
-                if cached is None:
-                    return view
-            return replace(view, text=cached)
+            return view
         except OSError:
             return view
 
@@ -1248,17 +1410,14 @@ def _artifact_references(value: object) -> tuple[ArtifactReference, ...]:
         raise InvalidArtifact("artifact references must be a list")
     references: list[ArtifactReference] = []
     for item in value:
-        mapping = _exact_mapping(
-            item,
-            {"kind", "storage_class", "value"},
-            "artifact reference",
-        )
+        mapping = _payload(item, required={"kind", "storage_class", "value"}, optional={"target_family"}, label="artifact reference")
         try:
             references.append(
                 ArtifactReference(
                     ReferenceKind(mapping["kind"]),
                     StorageClass(mapping["storage_class"]),
                     mapping["value"],
+                    mapping.get("target_family"),
                 )
             )
         except (TypeError, ValueError) as exc:

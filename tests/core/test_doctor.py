@@ -249,8 +249,8 @@ def test_doctor_reports_unregistered_session_revision_as_orphan(vault):
     ]
 
 
-def test_doctor_marks_a_missing_active_head_invalid(vault):
-    """Catches a missing registry-selected revision being hidden as a cache problem."""
+def test_doctor_rejects_direct_head_tampering_before_following_it(vault):
+    """Catches a changed head bypassing its immutable Registry admission receipt."""
     from mneme.core.doctor import Doctor
     from mneme.core.fs import dump_yaml, read_yaml
 
@@ -264,7 +264,7 @@ def test_doctor_marks_a_missing_active_head_invalid(vault):
     report = Doctor(vault).run()
 
     assert report.status == "invalid"
-    assert ("missing-active-head", "invalid", "workstream:ws-01") in [
+    assert ("canonical-artifact-invalid", "invalid", "workstream:ws-01") in [
         (issue.code, issue.severity, issue.artifact) for issue in report.issues
     ]
 

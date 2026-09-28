@@ -146,7 +146,7 @@ def test_madi_checkpoint_rejects_detectable_credentials_without_writing(service)
     ("storage_class", "workstream_id"),
     [("portable", "ws-1"), ("local-only", "ws-local")],
 )
-def test_madi_checkpoint_rejects_detectable_credential_reference_without_writing(
+def test_madi_checkpoint_enforces_storage_boundary_for_credential_reference(
     service, storage_class, workstream_id
 ):
     """Catches stdio persisting a credential held only in a reference value."""
@@ -179,6 +179,14 @@ def test_madi_checkpoint_rejects_detectable_credential_reference_without_writing
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        assert result["ok"] is True
+        revisions = list(root.glob("workstreams/*/sessions/*/*.md"))
+        assert len(revisions) == 1
+        assert "SENSITIVE_SENTINEL" in revisions[0].read_text(encoding="utf-8")
+        assert registry.generation == 1 and len(registry.active_heads) == 1
+        assert not any("SENSITIVE_SENTINEL" in path.read_text(encoding="utf-8") for path in service.vault.root.rglob("*.md"))
+        return
     assert result["ok"] is False
     assert result["error"]["code"] == "invalid-artifact"
     assert "SENSITIVE_SENTINEL" not in encoded
@@ -191,7 +199,7 @@ def test_madi_checkpoint_rejects_detectable_credential_reference_without_writing
     ("storage_class", "workstream_id"),
     [("portable", "ws-1"), ("local-only", "ws-local")],
 )
-def test_madi_checkpoint_rejects_quoted_credential_reference_without_writing(
+def test_madi_checkpoint_enforces_storage_boundary_for_quoted_credential_reference(
     service, storage_class, workstream_id
 ):
     """Catches quote-wrapped reference credentials bypassing stdio validation."""
@@ -224,6 +232,14 @@ def test_madi_checkpoint_rejects_quoted_credential_reference_without_writing(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        assert result["ok"] is True
+        revisions = list(root.glob("workstreams/*/sessions/*/*.md"))
+        assert len(revisions) == 1
+        assert "SENSITIVE_SENTINEL" in revisions[0].read_text(encoding="utf-8")
+        assert registry.generation == 1 and len(registry.active_heads) == 1
+        assert not any("SENSITIVE_SENTINEL" in path.read_text(encoding="utf-8") for path in service.vault.root.rglob("*.md"))
+        return
     assert result["ok"] is False
     assert result["error"]["code"] == "invalid-artifact"
     assert "SENSITIVE_SENTINEL" not in encoded

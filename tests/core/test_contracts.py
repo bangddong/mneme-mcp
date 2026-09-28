@@ -44,14 +44,30 @@ def _command(name: str, payload: dict[str, object]):
     return CoreCommand(version=1, name=name, payload=payload)
 
 
+def _assert_local_evidence_preserved(service, result, workstream_id, credential):
+    from mneme.core.artifacts import StorageClass
+    from mneme.core.registries import HeadRef, RegistryStore
+    from mneme.core.sessions import SessionRevisionRef, SessionStore
+
+    assert result.ok is True
+    request = SessionStore(service.vault, StorageClass.LOCAL_ONLY).read_revision(
+        SessionRevisionRef("s1", "000001"), workstream_id=workstream_id
+    )
+    assert request.body.current_state == credential
+    registry = RegistryStore(service.vault, StorageClass.LOCAL_ONLY).load_workstream(workstream_id)
+    assert registry.generation == 1
+    assert registry.active_heads == (HeadRef("s1", "000001"),)
+    assert not any("SENSITIVE" in path.read_text(encoding="utf-8") for path in service.vault.root.rglob("*") if path.is_file())
+
+
 @pytest.mark.parametrize(
     ("storage_class", "workstream_id"),
     [("portable", "ws-1"), ("local-only", "ws-local")],
 )
-def test_checkpoint_rejects_detectable_credentials_before_any_session_write(
+def test_checkpoint_enforces_storage_boundary_for_detectable_credentials(
     service, storage_class, workstream_id
 ):
-    """Catches credentials entering durable portable or local-only Session revisions."""
+    """Portable credentials are rejected; confidential local evidence stays local."""
     from mneme.core.artifacts import StorageClass
     from mneme.core.registries import RegistryStore
 
@@ -73,6 +89,9 @@ def test_checkpoint_rejects_detectable_credentials_before_any_session_write(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, payload["body"]["current_state"])
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert "SENSITIVE_SENTINEL" not in encoded
@@ -86,7 +105,7 @@ def test_checkpoint_rejects_detectable_credentials_before_any_session_write(
     [("portable", "ws-1"), ("local-only", "ws-local")],
 )
 @pytest.mark.parametrize("reference_location", ["source", "relation-provenance"])
-def test_checkpoint_rejects_detectable_credentials_in_serialized_references_before_writing(
+def test_checkpoint_enforces_storage_boundary_for_serialized_credential_references(
     service, storage_class, workstream_id, reference_location
 ):
     """Catches a credential carried by a persisted reference value."""
@@ -128,6 +147,14 @@ def test_checkpoint_rejects_detectable_credentials_in_serialized_references_befo
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        assert result.ok is True
+        revisions = list(root.glob("workstreams/*/sessions/*/*.md"))
+        assert len(revisions) == 1
+        assert "SENSITIVE_SENTINEL" in revisions[0].read_text(encoding="utf-8")
+        assert registry.generation == 1 and len(registry.active_heads) == 1
+        assert not any("SENSITIVE_SENTINEL" in path.read_text(encoding="utf-8") for path in service.vault.root.rglob("*.md"))
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert "SENSITIVE_SENTINEL" not in encoded
@@ -149,7 +176,7 @@ def test_checkpoint_rejects_detectable_credentials_in_serialized_references_befo
         "private_key: SENSITIVE_SENTINEL",
     ],
 )
-def test_checkpoint_rejects_common_spaced_credential_labels_before_writing(
+def test_checkpoint_enforces_storage_boundary_for_spaced_credential_labels(
     service, storage_class, workstream_id, credential
 ):
     """Catches common separator variants evading the deterministic secret guard."""
@@ -173,6 +200,9 @@ def test_checkpoint_rejects_common_spaced_credential_labels_before_writing(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, credential)
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
@@ -193,7 +223,7 @@ def test_checkpoint_rejects_common_spaced_credential_labels_before_writing(
         'private-key : "SENSITIVE_SENTINEL"',
     ],
 )
-def test_checkpoint_rejects_quoted_credential_assignments_before_writing(
+def test_checkpoint_enforces_storage_boundary_for_quoted_credential_assignments(
     service, storage_class, workstream_id, credential
 ):
     """Catches quoted sensitive values bypassing the deterministic guard."""
@@ -218,6 +248,9 @@ def test_checkpoint_rejects_quoted_credential_assignments_before_writing(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, credential)
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert "SENSITIVE_SENTINEL" not in encoded
@@ -249,7 +282,7 @@ def test_checkpoint_rejects_quoted_credential_assignments_before_writing(
         "cr-split",
     ),
 )
-def test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writing(
+def test_checkpoint_enforces_storage_boundary_for_malformed_quoted_assignments(
     service, storage_class, workstream_id, credential
 ):
     """Catches malformed quoted assignments bypassing atomic Core admission."""
@@ -274,6 +307,9 @@ def test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writi
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, credential)
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert "SENSITIVE" not in encoded
@@ -323,7 +359,7 @@ def test_checkpoint_rejects_malformed_quoted_credential_assignments_before_writi
         "crlf-before-delimiter",
     ),
 )
-def test_checkpoint_rejects_the_complete_credential_assignment_remainder(
+def test_checkpoint_enforces_storage_boundary_for_complete_assignment_remainder(
     service, storage_class, workstream_id, credential
 ):
     """Catches an initial quoted fragment hiding later credential material."""
@@ -348,6 +384,9 @@ def test_checkpoint_rejects_the_complete_credential_assignment_remainder(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, credential)
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert credential not in encoded
@@ -421,7 +460,7 @@ def test_checkpoint_allows_explicit_whole_placeholder_assignments(
         "API Key: 'SENSITIVE_SENTINEL-REDACTED'",
     ],
 )
-def test_checkpoint_rejects_placeholder_tokens_with_extra_secret_material(
+def test_checkpoint_enforces_storage_boundary_for_placeholder_smuggling(
     service, storage_class, workstream_id, credential
 ):
     """Catches a placeholder allowance accepting extra material on either side."""
@@ -445,6 +484,9 @@ def test_checkpoint_rejects_placeholder_tokens_with_extra_secret_material(
         else service.vault.local_root / "overlays"
     )
     registry = RegistryStore(service.vault, selected_class).load_workstream(workstream_id)
+    if selected_class is StorageClass.LOCAL_ONLY:
+        _assert_local_evidence_preserved(service, result, workstream_id, credential)
+        return
     assert result.ok is False
     assert result.error.code == "invalid-artifact"
     assert list(root.glob("workstreams/*/sessions/*/*.md")) == []
@@ -642,11 +684,14 @@ def test_open_session_hides_confidential_workstream_existence(service):
         {"ceiling": "local-only"},
         StorageClass.PORTABLE,
     )
-    RegistryStore(service.vault).create_workstream(
+    registries = RegistryStore(service.vault)
+    workstream = registries.create_workstream(
         "secret-workstream",
         project=None,
         mode="parallel",
-        policy_refs=(restrictive,),
+    )
+    registries.update_workstream(
+        workstream.with_policy_refs((restrictive,)), expected_generation=0
     )
 
     forbidden = service.execute(

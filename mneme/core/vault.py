@@ -22,6 +22,7 @@ from mneme.core.validation.vault import (
     validate_owner_id,
     validate_separate_roots,
 )
+from mneme.core.validation.secrets import reject_detectable_secrets
 
 
 _PORTABLE_DIRECTORIES = (
@@ -143,6 +144,7 @@ class Vault:
         if schema_version != "1\n":
             raise InvalidArtifact(f"unsupported Vault schema version: {schema_version!r}")
         metadata = read_yaml(portable_root / ".madi/vault.yaml")
+        reject_detectable_secrets(metadata)
         vault_id = metadata.get("id")
         owner = metadata.get("owner")
         validate_identifier(vault_id, label="Vault id")
@@ -162,6 +164,7 @@ class Vault:
         ):
             raise InvalidArtifact("Vault metadata has an invalid foundational schema")
         policy_index = read_yaml(portable_root / ".madi/policy-index.yaml")
+        reject_detectable_secrets(policy_index)
         local_root = local_state_home / "vaults" / vault_id
         validate_path_chain(local_root, allow_missing=True)
         validate_separate_roots(portable_root, local_root)
@@ -197,6 +200,7 @@ class Vault:
         best-effort preflight rather than a race-free directory-handle walk.
         """
         validate_owner_id(owner_id)
+        reject_detectable_secrets(owner_id)
         requested_root = validate_path_chain(root, allow_missing=True)
         requested_state_home = validate_path_chain(state_home, allow_missing=True)
         portable_root = requested_root.resolve(strict=False)

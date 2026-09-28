@@ -50,7 +50,51 @@ _DEFAULT_POLICY_ID: Final = "vault-default"
 _DEFAULT_POLICY_REVISION: Final = "1"
 _DEFAULT_POLICY_RULE: Final = {"ceiling": "personal-vault"}
 _admission_locks_guard = threading.Lock()
-_admission_locks: dict[Path, threading.Lock] = {}
+_admission_states: dict[Path, _AdmissionState] = {}
+_admission_depth = threading.local()
+
+
+@dataclass
+class _AdmissionState:
+    """One process-local reader/writer front-end for the cross-process gate."""
+
+    condition: threading.Condition
+    readers: int = 0
+    writer: int | None = None
+    waiting_writers: int = 0
+    reader_file_guard: object | None = None
+
+
+def _admission_state(path: Path) -> tuple[Path, _AdmissionState]:
+    key = path.resolve(strict=False)
+    with _admission_locks_guard:
+        state = _admission_states.get(key)
+        if state is None:
+            state = _AdmissionState(threading.Condition(threading.Lock()))
+            _admission_states[key] = state
+    return key, state
+
+
+def _nested_admission(key: Path) -> bool:
+    depths = getattr(_admission_depth, "depths", None)
+    return depths is not None and key in depths
+
+
+def _push_admission(key: Path) -> None:
+    depths = getattr(_admission_depth, "depths", None)
+    if depths is None:
+        depths = {}
+        _admission_depth.depths = depths
+    depths[key] = depths.get(key, 0) + 1
+
+
+def _pop_admission(key: Path) -> None:
+    depths = _admission_depth.depths
+    depth = depths[key] - 1
+    if depth:
+        depths[key] = depth
+    else:
+        depths.pop(key)
 
 
 @contextmanager
@@ -62,11 +106,74 @@ def policy_admission_gate(vault: Vault):
     linearize between its canonical admission snapshot and immutable write.
     """
     path = vault.local_root / "locks" / "policy-admission.lock"
-    with _admission_locks_guard:
-        process_lock = _admission_locks.setdefault(path.resolve(strict=False), threading.Lock())
-    with process_lock:
-        with exclusive_file_lock(path):
+    key, state = _admission_state(path)
+    if _nested_admission(key):
+        _push_admission(key)
+        try:
             yield
+        finally:
+            _pop_admission(key)
+        return
+    identity = threading.get_ident()
+    with state.condition:
+        state.waiting_writers += 1
+        try:
+            while state.writer is not None or state.readers:
+                state.condition.wait()
+            state.writer = identity
+        finally:
+            state.waiting_writers -= 1
+    try:
+        with exclusive_file_lock(path):
+            _push_admission(key)
+            try:
+                yield
+            finally:
+                _pop_admission(key)
+    finally:
+        with state.condition:
+            state.writer = None
+            state.condition.notify_all()
+
+
+@contextmanager
+def policy_admission_snapshot(vault: Vault):
+    """Hold a stable policy snapshot while allowing peer checkpoint writers.
+
+    The first in-process reader holds the cross-process lock for the complete
+    group.  Additional readers may publish disjoint sessions concurrently,
+    while policy and applicability mutations wait for every reader to finish.
+    """
+    path = vault.local_root / "locks" / "policy-admission.lock"
+    key, state = _admission_state(path)
+    if _nested_admission(key):
+        _push_admission(key)
+        try:
+            yield
+        finally:
+            _pop_admission(key)
+        return
+    with state.condition:
+        while state.writer is not None or state.waiting_writers:
+            state.condition.wait()
+        if state.readers == 0:
+            guard = exclusive_file_lock(path)
+            guard.__enter__()
+            state.reader_file_guard = guard
+        state.readers += 1
+    _push_admission(key)
+    try:
+        yield
+    finally:
+        _pop_admission(key)
+        with state.condition:
+            state.readers -= 1
+            if state.readers == 0:
+                guard = state.reader_file_guard
+                state.reader_file_guard = None
+                if guard is not None:
+                    guard.__exit__(None, None, None)
+                state.condition.notify_all()
 
 
 def admission_mutation(method):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from hashlib import sha256
+import json
 from pathlib import Path, PureWindowsPath
 import re
 from urllib.parse import urlsplit
@@ -17,7 +19,13 @@ from mneme.core.artifacts import (
     StorageClass,
 )
 from mneme.core.errors import ConcurrentWrite, InvalidArtifact, MadiError
-from mneme.core.policy import PolicyRef, PolicyStore, admission_mutation
+from mneme.core.policy import (
+    PolicyRef,
+    PolicyStore,
+    Portability,
+    admission_mutation,
+    evaluate_portability,
+)
 from mneme.core.validation.vault import validate_identifier
 
 
@@ -107,9 +115,12 @@ class WorkstreamRegistry:
     active_heads: tuple[HeadRef, ...] = ()
     preferred_head: HeadRef | None = None
     policy_refs: tuple[PolicyRef, ...] = ()
+    overlay_of: str | None = None
 
     def __post_init__(self) -> None:
         validate_identifier(self.id, label="workstream id")
+        if self.overlay_of is not None:
+            validate_identifier(self.overlay_of, label="portable overlay base")
         if (
             not isinstance(self.generation, int)
             or isinstance(self.generation, bool)
@@ -205,6 +216,7 @@ def canonicalize_workstream_registry(value: object) -> WorkstreamRegistry:
             heads,
             preferred,
             policy_refs,
+            value.overlay_of,
         )
     except InvalidArtifact:
         raise
@@ -231,6 +243,7 @@ class RegistryStore:
         project: str | None,
         mode: str,
         policy_refs: tuple[PolicyRef, ...] = (),
+        overlay_of: str | None = None,
     ) -> WorkstreamRegistry:
         registry = WorkstreamRegistry(
             id=workstream_id,
@@ -239,6 +252,7 @@ class RegistryStore:
             status="active",
             mode=mode,
             policy_refs=policy_refs,
+            overlay_of=overlay_of,
         )
         self._validate_project_reference(registry.project)
         self._validate_workstream_policies(registry)
@@ -324,7 +338,7 @@ class RegistryStore:
                 ArtifactFamily.REGISTRY,
                 storage_class=self.storage_class,
                 relative_path=self._project_path(project_id),
-                document=self._project_document(updated),
+                document=self._project_document(updated, control=True),
                 expected_generation=expected_generation,
             )
         except ConcurrentWrite as exc:
@@ -346,7 +360,7 @@ class RegistryStore:
                 ArtifactFamily.REGISTRY,
                 storage_class=self.storage_class,
                 relative_path=self._source_path(source_id),
-                document=self._source_document(updated),
+                document=self._source_document(updated, control=True),
                 expected_generation=expected_generation,
             )
         except ConcurrentWrite as exc:
@@ -423,13 +437,17 @@ class RegistryStore:
             raise RegistryConflict("workstream generation does not match CAS base")
         self._validate_project_reference(registry.project)
         self._validate_workstream_policies(registry)
+        current = self.load_workstream(registry.id)
+        if current.generation != expected_generation:
+            raise RegistryConflict("workstream generation is stale")
         updated = replace(registry, generation=expected_generation + 1)
+        control = self._is_restrictive_workstream_control(current, updated)
         try:
             self._vault.artifacts.write_cas(
                 ArtifactFamily.REGISTRY,
                 storage_class=self.storage_class,
                 relative_path=self._workstream_path(registry.id),
-                document=self._workstream_document(updated),
+                document=self._workstream_document(updated, control=control),
                 expected_generation=expected_generation,
             )
         except ConcurrentWrite as exc:
@@ -451,9 +469,9 @@ class RegistryStore:
         validate_identifier(source_id, label="source id")
         return f"sources/{source_id}.yaml"
 
-    def _project_document(self, registry: ProjectRegistry) -> ArtifactDocument:
+    def _project_document(self, registry: ProjectRegistry, *, control: bool = False) -> ArtifactDocument:
         _validate_locator(registry.locator, self.storage_class)
-        return ArtifactDocument(
+        return self._admit_document(ArtifactDocument(
             metadata={
                 "schema": _PROJECT_SCHEMA,
                 "id": registry.id,
@@ -463,12 +481,15 @@ class RegistryStore:
                 "policy": self._serialize_policy_ref(registry.policy_ref),
             },
             references=self._policy_manifest(registry.policy_ref),
-        )
+        ), self._project_path(registry.id), (registry.policy_ref,), control=control)
 
-    def _source_document(self, registry: SourceRegistry) -> ArtifactDocument:
+    def _source_document(self, registry: SourceRegistry, *, control: bool = False) -> ArtifactDocument:
         _validate_locator(registry.locator, self.storage_class)
         self._validate_project_reference(registry.project)
-        return ArtifactDocument(
+        refs = [registry.policy_ref]
+        if registry.project is not None and self.storage_class is StorageClass.PORTABLE:
+            refs.append(self.load_project(registry.project).policy_ref)
+        return self._admit_document(ArtifactDocument(
             metadata={
                 "schema": _SOURCE_SCHEMA,
                 "id": registry.id,
@@ -480,10 +501,16 @@ class RegistryStore:
                 "policy": self._serialize_policy_ref(registry.policy_ref),
             },
             references=self._policy_manifest(registry.policy_ref),
-        )
+        ), self._source_path(registry.id), tuple(refs), control=control)
 
-    def _workstream_document(self, registry: WorkstreamRegistry) -> ArtifactDocument:
+    def _workstream_document(
+        self, registry: WorkstreamRegistry, *, control: bool = False
+    ) -> ArtifactDocument:
         self._validate_project_reference(registry.project)
+        if registry.overlay_of is not None:
+            if self.storage_class is not StorageClass.LOCAL_ONLY:
+                raise InvalidArtifact("portable registry cannot declare an overlay")
+            RegistryStore(self._vault).load_workstream(registry.overlay_of)
         metadata: dict[str, object] = {
             "schema": _WORKSTREAM_SCHEMA,
             "id": registry.id,
@@ -514,12 +541,82 @@ class RegistryStore:
             ArtifactReference(ReferenceKind.ID, self.storage_class, policy_ref.policy_id)
             for policy_ref in registry.policy_refs
         )
-        return ArtifactDocument(
+        if registry.overlay_of is not None:
+            metadata["overlay_of"] = registry.overlay_of
+        refs = list(registry.policy_refs)
+        if registry.project is not None and self.storage_class is StorageClass.PORTABLE:
+            refs.append(self.load_project(registry.project).policy_ref)
+        return self._admit_document(ArtifactDocument(
             metadata=metadata, references=ReferenceManifest.complete(metadata=references)
+        ), self._workstream_path(registry.id), tuple(refs), control=control)
+
+    def _is_restrictive_workstream_control(
+        self, current: WorkstreamRegistry, updated: WorkstreamRegistry
+    ) -> bool:
+        if self.storage_class is StorageClass.LOCAL_ONLY:
+            return False
+        if (
+            current.id != updated.id
+            or current.status != updated.status
+            or current.mode != updated.mode
+            or current.active_heads != updated.active_heads
+            or current.preferred_head != updated.preferred_head
+            or current.overlay_of != updated.overlay_of
+            or (current.project, current.policy_refs)
+            == (updated.project, updated.policy_refs)
+        ):
+            return False
+        before = self._workstream_policy_evaluation(current)
+        after = self._workstream_policy_evaluation(updated)
+        return after.effective_ceiling <= before.effective_ceiling
+
+    def _workstream_policy_evaluation(self, registry: WorkstreamRegistry):
+        policies = PolicyStore(self._vault)
+        refs = [policies.load_active("vault-default", StorageClass.PORTABLE)]
+        refs.extend(registry.policy_refs)
+        if registry.project is not None:
+            project = self.load_project(registry.project)
+            if project.policy_ref is not None:
+                refs.append(project.policy_ref)
+        return evaluate_portability(
+            Portability.PERSONAL_VAULT,
+            tuple(policies.load_rule(reference) for reference in refs),
+            "0" * 64,
         )
 
-    @staticmethod
-    def _parse_workstream(metadata: object, workstream_id: str) -> WorkstreamRegistry:
+    def _admit_document(self, document: ArtifactDocument, path: str, refs: tuple, *, control: bool = False) -> ArtifactDocument:
+        """Evaluate every new portable disclosure and preserve prior receipts.
+
+        Policy assignments are administrative control changes: recording a more
+        restrictive ceiling must remain possible even when it withholds identity.
+        Their denied evaluation is retained as an explicit control receipt.
+        """
+        if self.storage_class is StorageClass.LOCAL_ONLY:
+            return document
+        from mneme.core.memories import _receipt_dict
+        from mneme.core.policy import Portability, evaluate_portability
+
+        policies = PolicyStore(self._vault)
+        default = policies.load_active("vault-default", StorageClass.PORTABLE)
+        rules = tuple(policies.load_rule(ref) for ref in (default, *refs) if ref is not None)
+        evaluation = evaluate_portability(Portability.PERSONAL_VAULT, rules, _registry_hash(document.metadata))
+        if not control and not evaluation.allowed:
+            raise InvalidArtifact("registry disclosure exceeds current effective policy")
+        history = []
+        location = self._vault.router.location(ArtifactFamily.REGISTRY, self.storage_class, path)
+        if location.path.exists():
+            prior = self._vault.reader.read(ArtifactFamily.REGISTRY, location=location)
+            _strip_admission(prior.metadata, policies)
+            history = list(prior.metadata.get("admission_receipts", ()))
+        receipt = _receipt_dict(evaluation)
+        receipt["control"] = control
+        return replace(document, metadata={**document.metadata, "admission_receipts": [*history, receipt]})
+
+    def _parse_workstream(self, metadata: object, workstream_id: str) -> WorkstreamRegistry:
+        metadata = _strip_admission(metadata, PolicyStore(self._vault))
+        overlay_of = metadata.get("overlay_of") if isinstance(metadata, dict) else None
+        if isinstance(metadata, dict) and "overlay_of" in metadata:
+            metadata = {key: value for key, value in metadata.items() if key != "overlay_of"}
         if not isinstance(metadata, dict) or set(metadata) != {
             "schema",
             "id",
@@ -559,6 +656,7 @@ class RegistryStore:
             active_heads=parsed_heads,
             preferred_head=preferred,
             policy_refs=tuple(RegistryStore._parse_policy_ref(value) for value in policy_refs),
+            overlay_of=overlay_of,
         )
 
     @staticmethod
@@ -594,6 +692,7 @@ class RegistryStore:
             or current.mode != observed_base.mode
             or current.preferred_head != observed_base.preferred_head
             or current.policy_refs != observed_base.policy_refs
+            or current.overlay_of != observed_base.overlay_of
         ):
             return False
         base_heads = set(observed_base.active_heads)
@@ -632,6 +731,10 @@ class RegistryStore:
             raise InvalidArtifact("registry policy reference crosses storage classes")
 
     def _validate_workstream_policies(self, registry: WorkstreamRegistry) -> None:
+        if registry.overlay_of is not None:
+            if self.storage_class is not StorageClass.LOCAL_ONLY:
+                raise InvalidArtifact("portable registry cannot declare an overlay")
+            RegistryStore(self._vault).load_workstream(registry.overlay_of)
         for policy_ref in registry.policy_refs:
             self._validate_assignable_policy(policy_ref)
 
@@ -660,6 +763,7 @@ class RegistryStore:
         return PolicyRef(value.get("policy_id"), value.get("revision"), value.get("digest"))
 
     def _parse_project(self, metadata: object, project_id: str) -> ProjectRegistry:
+        metadata = _strip_admission(metadata, PolicyStore(self._vault))
         if not isinstance(metadata, dict) or set(metadata) != {
             "schema", "id", "generation", "authority", "locator", "policy"
         }:
@@ -676,6 +780,7 @@ class RegistryStore:
         )
 
     def _parse_source(self, metadata: object, source_id: str) -> SourceRegistry:
+        metadata = _strip_admission(metadata, PolicyStore(self._vault))
         if not isinstance(metadata, dict) or set(metadata) != {
             "schema", "id", "generation", "kind", "authority", "project", "locator", "policy"
         }:
@@ -692,6 +797,33 @@ class RegistryStore:
             metadata.get("locator"),
             RegistryStore._parse_policy_ref(metadata.get("policy")),
         )
+
+
+def _registry_hash(metadata: object) -> str:
+    return sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _strip_admission(metadata: object, policies: PolicyStore) -> object:
+    if not isinstance(metadata, dict) or "admission_receipts" not in metadata:
+        return metadata  # Existing v1 registries remain readable.
+    from mneme.core.memories import _parse_receipt
+
+    history = metadata["admission_receipts"]
+    if not isinstance(history, list) or not history:
+        raise InvalidArtifact("registry admission receipts are invalid")
+    for item in history:
+        if not isinstance(item, dict) or type(item.get("control")) is not bool:
+            raise InvalidArtifact("registry admission control marker is invalid")
+        receipt = _parse_receipt({key: value for key, value in item.items() if key != "control"})
+        if not receipt.allowed and not item["control"]:
+            raise InvalidArtifact("registry admission policy denied disclosure")
+        for reference in receipt.refs:
+            if isinstance(reference, PolicyRef):
+                policies.load_rule(reference)
+    semantic = {key: value for key, value in metadata.items() if key != "admission_receipts"}
+    if receipt.semantic_hash != _registry_hash(semantic):
+        raise InvalidArtifact("registry admission receipt does not bind content")
+    return semantic
 
 
 def _validate_generation(value: object, *, label: str) -> None:

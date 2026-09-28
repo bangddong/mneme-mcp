@@ -20,6 +20,7 @@ from mneme.core.artifacts import (
     StorageClass,
 )
 from mneme.core.errors import InvalidArtifact, PortabilityViolation
+from mneme.core.fs import normalize_text
 from mneme.core.policy import (
     ApprovedRuleProvenance,
     OpaquePolicyAttestation,
@@ -31,32 +32,16 @@ from mneme.core.policy import (
     PolicyStore,
     Portability,
     evaluate_portability,
-    policy_admission_gate,
+    policy_admission_snapshot,
 )
 from mneme.core.registries import HeadRef, RegistryConflict, RegistryStore
 from mneme.core.validation.vault import validate_identifier
+from mneme.core.validation.secrets import contains_detectable_secret as _contains_detectable_secret
 
 
 _SCHEMA = "madi.session-revision.v1"
 _REVISION = re.compile(r"^[0-9]{6}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
-_CREDENTIAL_ASSIGNMENT_PREFIX = re.compile(
-    r"""(?ix)
-    \b(?:api[\s_-]?key|access[\s_-]?(?:token|key)|auth[\s_-]?token|client[\s_-]?secret|private[\s_-]?key|secret|password|passwd|token)\b
-    \s*(?:=|:)\s*
-    """
-)
-_DETECTABLE_SECRET_MATERIAL = re.compile(
-    r"""(?ix)
-    (?:
-        \bbearer\s+[A-Za-z0-9._~+/=-]{8,}
-      | -----BEGIN(?:\s+[A-Z0-9]+)?\s+PRIVATE\s+KEY-----
-    )
-    """
-)
-_PLACEHOLDER_SECRET_VALUES = frozenset({"redacted", "placeholder"})
-_MINIMUM_SECRET_VALUE_LENGTH = 8
-_MAX_CREDENTIAL_ASSIGNMENT_CHARS = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,11 +197,12 @@ class SessionStore:
             raise InvalidArtifact("create_revision requires a CheckpointRequest")
         if request.storage_class is not self.storage_class:
             raise InvalidArtifact("checkpoint storage class does not match SessionStore")
-        _reject_detectable_secrets(request.body, request.relations)
-        # Lock order is admission gate then any ArtifactStore path lock.  Do not
-        # call registry mutation APIs here: head advancement intentionally runs
-        # after release so a later conflict leaves a doctor-visible orphan.
-        with policy_admission_gate(self._vault):
+        if self.storage_class is StorageClass.PORTABLE:
+            _reject_detectable_secrets(request.body, request.relations)
+        # Lock order is admission gate then any ArtifactStore/Registry path lock.
+        # The gate is reentrant so policy changes cannot linearize between the
+        # immutable revision write and its head publication.
+        with policy_admission_snapshot(self._vault):
             self._validate_request_references(request)
             observed = self.registries.load_workstream(request.workstream_id)
             if observed.generation != request.expected_registry_generation:
@@ -237,7 +223,7 @@ class SessionStore:
                 relative_path=self._revision_path(request.workstream_id, ref),
                 document=document,
             )
-        self._advance_head(request, ref, observed)
+            self._advance_head(request, ref, observed)
         return ref
 
     def _advance_head(
@@ -730,7 +716,7 @@ def _require_text(value: object, label: str) -> str:
 def _reject_detectable_secrets(
     body: SessionBody, relations: tuple[SessionRelation, ...]
 ) -> None:
-    """Keep recognizable credentials out of every durable Session storage class."""
+    """Keep recognizable credentials out of portable Session revisions."""
     values = [
         body.adapter_id,
         body.objective,
@@ -765,49 +751,6 @@ def _reject_detectable_secrets(
         raise InvalidArtifact("checkpoint contains a detectable credential")
 
 
-def _contains_detectable_secret(value: str) -> bool:
-    """Inspect one complete bounded assignment remainder without backtracking."""
-    match = _CREDENTIAL_ASSIGNMENT_PREFIX.search(value)
-    if match is not None:
-        if "\r" in match[0] or "\n" in match[0]:
-            return True
-        if _assignment_remainder_contains_secret(value[match.end():]):
-            return True
-    return _DETECTABLE_SECRET_MATERIAL.search(value) is not None
-
-
-def _assignment_remainder_contains_secret(remainder: str) -> bool:
-    if len(remainder) > _MAX_CREDENTIAL_ASSIGNMENT_CHARS:
-        return True
-    if "\r" in remainder or "\n" in remainder:
-        return bool(remainder.strip())
-
-    assigned = remainder.strip()
-    if not assigned:
-        return False
-
-    if assigned[0] in {'"', "'"}:
-        quote = assigned[0]
-        other_quote = "'" if quote == '"' else '"'
-        if (
-            len(assigned) < 2
-            or assigned[-1] != quote
-            or assigned.count(quote) != 2
-            or other_quote in assigned[1:-1]
-        ):
-            return True
-        normalized = assigned[1:-1].strip().casefold()
-    else:
-        if '"' in assigned or "'" in assigned:
-            return True
-        normalized = assigned.casefold()
-
-    return (
-        len(normalized) >= _MINIMUM_SECRET_VALUE_LENGTH
-        and normalized not in _PLACEHOLDER_SECRET_VALUES
-    )
-
-
 def _require_text_tuple(value: object, label: str) -> None:
     if not isinstance(value, tuple) or not all(isinstance(item, str) and item.strip() == item and item for item in value):
         raise InvalidArtifact(f"session {label} must be a tuple of non-empty trimmed text")
@@ -819,14 +762,17 @@ def _require_references(value: object, label: str) -> None:
 
 
 def _serialize_reference(reference: ArtifactReference) -> dict[str, Any]:
-    return {"kind": reference.kind.value, "storage_class": reference.storage_class.value, "value": reference.value}
+    result = {"kind": reference.kind.value, "storage_class": reference.storage_class.value, "value": reference.value}
+    if reference.target_family is not None:
+        result["target_family"] = reference.target_family
+    return result
 
 
 def _parse_reference(value: object) -> ArtifactReference:
-    if not isinstance(value, dict) or set(value) != {"kind", "storage_class", "value"}:
+    if not isinstance(value, dict) or set(value) not in ({"kind", "storage_class", "value"}, {"kind", "storage_class", "value", "target_family"}):
         raise InvalidArtifact("session artifact reference has an invalid schema")
     try:
-        return ArtifactReference(ReferenceKind(value["kind"]), StorageClass(value["storage_class"]), value["value"])
+        return ArtifactReference(ReferenceKind(value["kind"]), StorageClass(value["storage_class"]), value["value"], value.get("target_family"))
     except (TypeError, ValueError) as exc:
         raise InvalidArtifact("session artifact reference has invalid values") from exc
 
@@ -984,4 +930,4 @@ def _render_body(body: SessionBody, relations: tuple[SessionRelation, ...]) -> s
         if not items:
             rendered.append("- none")
         rendered.append("")
-    return "\n".join(rendered)
+    return normalize_text("\n".join(rendered))

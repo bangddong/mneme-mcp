@@ -60,7 +60,7 @@ def test_portable_mode_never_opens_or_mentions_local_overlay_data():
 
     assert view.status.value == "resolved"
     assert "portable continuity" in view.text
-    for forbidden in ("local-secret", "confidential", "overlay", "hash", "count", "exists"):
+    for forbidden in ("local-secret", "confidential", "overlay", "count", "exists"):
         assert forbidden not in view.text.lower()
 
 

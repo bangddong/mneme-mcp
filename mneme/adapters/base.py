@@ -89,7 +89,7 @@ class AdapterResult:
     command_result: CommandResult | None = None
 
     def __post_init__(self) -> None:
-        if self.version != CONTRACT_VERSION or isinstance(self.version, bool):
+        if type(self.version) is not int or self.version != CONTRACT_VERSION:
             raise InvalidArtifact("adapter result has an invalid version")
         if self.event not in LIFECYCLE_NAMES | {"unknown"}:
             raise InvalidArtifact("adapter result event is invalid")

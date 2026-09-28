@@ -19,6 +19,7 @@ from mneme.core.fs import (
     exclusive_file_lock,
     dump_yaml,
     is_symlink_or_reparse,
+    normalize_text,
     read_frontmatter,
     read_yaml,
     replace_text,
@@ -32,6 +33,7 @@ from mneme.core.validation.vault import (
     validate_relative_path,
     validate_separate_roots,
 )
+from mneme.core.validation.secrets import validate_portable_content
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ class ArtifactStore:
     ) -> ArtifactLocation:
         self.router.validate_location(family, location)
         validate_portability(location.storage_class, document)
+        validate_portable_content(location.storage_class, document, location.relative_path)
         encoded = self.router.codec(family, location.storage_class).encode(document)
         target = location.path
         validate_path_chain(target, allow_missing=True)
@@ -171,6 +174,7 @@ class ArtifactStore:
         location = self.router.location(family, storage_class, relative_path)
         self.router.validate_location(family, location)
         validate_portability(storage_class, document)
+        validate_portable_content(storage_class, document, location.relative_path)
         encoded = self.router.codec(family, storage_class).encode(document)
         self.router.validate_location(family, location)
         reader = ArtifactReader(self.router)
@@ -207,11 +211,14 @@ class ArtifactReader:
         else:
             self.router.validate_location(family, location)
         if family is ArtifactFamily.REGISTRY:
-            return self.router.codec(family, location.storage_class).decode(
+            document = self.router.codec(family, location.storage_class).decode(
                 read_yaml(location.path), None
             )
-        metadata, body = read_frontmatter(location.path)
-        return self.router.codec(family, location.storage_class).decode(metadata, body)
+        else:
+            metadata, body = read_frontmatter(location.path)
+            document = self.router.codec(family, location.storage_class).decode(metadata, body)
+        validate_portable_content(location.storage_class, document, location.relative_path)
+        return document
 
 
 class ViewStore:
@@ -262,6 +269,7 @@ class ViewStore:
                 {
                     "authorization_fingerprint": authorization_fingerprint,
                     "schema": self._AUTHORIZATION_SCHEMA,
+                    "content_hash": sha256(normalize_text(text).encode("utf-8")).hexdigest(),
                 }
             ),
         )
@@ -301,12 +309,14 @@ class ViewStore:
             ):
                 return None
             metadata = read_yaml(metadata_path)
+            content = target.read_bytes()
             if metadata != {
                 "authorization_fingerprint": authorization_fingerprint,
                 "schema": self._AUTHORIZATION_SCHEMA,
+                "content_hash": sha256(content).hexdigest(),
             }:
                 return None
-            return target.read_text(encoding="utf-8")
+            return content.decode("utf-8")
         except Exception:
             return None
 
