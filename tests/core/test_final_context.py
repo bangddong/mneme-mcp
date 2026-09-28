@@ -105,6 +105,48 @@ def test_current_bounds_large_policy_provenance():
     assert len(view.text) <= 65536
 
 
+def test_current_bounds_large_adapter_identity():
+    from mneme.core.context import ContextReaders, render_current
+    from mneme.core.policy import PolicyEvaluation, Portability
+    from mneme.core.registries import HeadRef, WorkstreamRegistry
+    from mneme.core.resolver import SessionRevision
+    from mneme.core.sessions import CheckpointRequest, SessionBody, session_semantic_hash
+
+    adapter = "a" * 70000
+    body = SessionBody(adapter, "Objective", "Current", (), (), (), (), ())
+    head = HeadRef("session", "000001")
+    timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    receipt = PolicyEvaluation(
+        Portability.PERSONAL_VAULT, Portability.PERSONAL_VAULT, True,
+        timestamp, "test", (), session_semantic_hash(body, ()),
+    )
+    revision = SessionRevision(
+        head,
+        CheckpointRequest(
+            "ws", head.session, StorageClass.PORTABLE, None, 0, body, (), receipt, timestamp,
+        ),
+    )
+    registry = WorkstreamRegistry("ws", 0, None, "active", "single", (head,))
+    readers = ContextReaders(
+        lambda _workstream: registry,
+        lambda _workstream, _head: revision,
+        authorize_revision=lambda *_args: True,
+    )
+    views = [render_current(readers, "ws", mode) for mode in ("portable", "effective-local")]
+
+    assert all(len(view.text) <= 65536 for view in views), [len(view.text) for view in views]
+    for view in views:
+        assert adapter not in view.text
+        assert "adapter: " + "a" * 256 + " … [bounded; inspect artifact]; timestamp:" in view.text
+        for section in (
+            "Objective: Objective", "Current state: Current", "### Verified facts / decisions",
+            "### Completed work / verification", "### Blockers / risks", "### Next actions",
+            "### Source references", "### Relations / handoffs", "provenance / policy_receipt:",
+        ):
+            assert section in view.text
+        assert render_current(readers, "ws", view.mode).text == view.text
+
+
 def test_preferred_head_change_binds_authorization_and_text(service):
     checkpoint(service, "first")
     checkpoint(service, "second", generation=1)

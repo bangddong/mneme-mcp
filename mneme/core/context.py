@@ -271,7 +271,7 @@ def _revision_text(revision: object) -> str:
     body = revision.body
     request = revision.request
     lines = [f"session: {request.session_id}; workstream: {request.workstream_id}; revision: {revision.head.revision}",
-        f"adapter: {body.adapter_id}; timestamp: {request.revision_timestamp.isoformat()}",
+        f"adapter: {_bounded(body.adapter_id)}; timestamp: {request.revision_timestamp.isoformat()}",
         f"predecessor: {request.expected_parent}",
         f"Objective: {_bounded(body.objective)}", f"Current state: {_bounded(body.current_state)}"]
     for label, values in (("Verified facts / decisions", body.verified_facts), ("Completed work / verification", body.completed_work),
