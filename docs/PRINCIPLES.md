@@ -1,16 +1,81 @@
 # 동작 원리 (Principles)
 
-> Mneme이 **무엇을, 어떻게 기억하고 성장하는지**에 대한 개념 문서입니다.
+> Madi가 **누구의 연속성을, 어떤 경계로 보존하는지**와 legacy Mneme Growth가
+> 어떤 역할로 남는지를 설명합니다.
 > 설치·사용 방법은 [USAGE.md](USAGE.md), 구성요소·데이터 흐름은 [ARCHITECTURE.md](ARCHITECTURE.md)를 참고하세요.
 
-**MNEME**(므네메)는 그리스 신화 '기억의 무사(Muse)'에서 온 이름입니다 — 원래 이 시스템의
-성장 두뇌를 부르던 내부 코드네임이었고, 2026-07-02 시스템 전체 이름으로 승격했습니다
-(구 이름 hermes는 Nous Hermes·Meta Hermes와 충돌). LLM의 가중치는
-건드리지 않고, **외부 레이어(기억·스킬·가치)만 갱신해 스스로 성장**하는 것이 핵심 설계입니다.
+승인된 상세 설계의 authority는
+[Madi D3 specification](superpowers/specs/2026-08-26-madi-d3-vault-design.md)입니다.
+
+## A. Madi Core 원칙
+
+### A-1. 사람 소유
+
+Madi의 ownership unit은 project, agent, model이 아니라 **person**입니다. 한 사람이
+private portable Vault를 소유하고 Claude, Codex, 미래 agent 및 여러 project가 그
+연속성을 읽고 씁니다.
+
+### A-2. Project truth와 personal continuity 분리
+
+- Project repository는 코드, ADR, 공식 규칙과 팀 합의 같은 **project truth**를 소유합니다.
+- Madi는 개인의 checkpoint, 교훈, preference, cross-project knowledge와 project source
+  reference 같은 **personal continuity**를 소유합니다.
+- 같은 project에 관해 충돌하면 project repository가 우선입니다. Madi는 공식 문서를
+  복제해 competing truth를 만들지 않고 reference나 개인적 consequence를 저장합니다.
+
+### A-3. Git + Markdown이 durable source of truth
+
+Portable Session revision, accepted Memory, Registry와 policy revision은 현재 파일 트리에
+완전해야 합니다. Shallow clone, squash, history rewrite 또는 생성 DB 삭제 후에도 durable
+state를 복원할 수 있어야 합니다. Git history는 추가 이력이지 checkpoint의 유일한 저장소가
+아닙니다.
+
+### A-4. Deterministic Core, semantic host
+
+Madi Core는 schema, validation, CAS, policy, storage, indexing과 deterministic recall을
+담당합니다. 무엇이 중요한지, 어떤 내용을 checkpoint로 정제할지는 현재 작업 문맥을 아는
+host agent가 판단합니다. Generation LLM, embedding, daemon은 Core의 필수 조건이 아닙니다.
+
+### A-5. Candidate-first, immutable accepted semantics
+
+Candidate는 검토 중 수정할 수 있습니다. Accepted Memory의 semantic body는 overwrite하지
+않고 새 Memory ID와 `supersedes` relation으로 교체합니다. Session checkpoint도
+`sessions/<session-id>/<revision>.md`의 immutable revision으로 누적합니다.
+
+### A-6. Privacy ceiling 상속
+
+Raw transcript, raw tool output, credential, 고객 데이터와 local evidence는 자동으로 portable
+Git에 들어가지 않습니다. Source/project policy는 파생 artifact의 portability 상한으로
+상속됩니다. Agent는 더 보수적으로 낮출 수 있지만 상한보다 높일 수 없습니다.
+
+Policy tightening은 이후 read/export/sync에 즉시 적용되지만 이미 Git commit, clone, backup,
+mirror에 전파된 정보의 retroactive deletion은 보장하지 않습니다.
+
+### A-7. 명시적 동시성
+
+Registry는 active heads와 preferred head를 portable하게 기록합니다. Intentional parallel
+work는 `divergent`, source 부재 등 제한된 상태는 `degraded`, 구조·policy 손상은 `invalid`로
+구분합니다. 같은 lineage나 preferred-head 충돌을 last-write-wins 또는 AI semantic merge로
+덮지 않습니다.
+
+### A-8. 실패 격리
+
+Madi와 adapter는 ordinary agent work를 막지 않아야 합니다. Adapter 장애는 닫힌 경고를
+남기되 host를 block하지 않습니다. Growth Lab의 실패나 부재도 Core를 깨뜨리지 않습니다.
 
 ---
 
-## 1. 왜 이렇게 만들었나
+## Legacy Mneme / Growth Lab 원칙
+
+아래 5층 기억, CIB, Inner/Outer Loop, self-model은 기존 Mneme의 연구적 성장 시스템입니다.
+가치를 보존하되 Madi Core의 필수 기능으로 해석하지 않습니다.
+
+**MNEME**(므네메)는 그리스 신화 '기억의 무사(Muse)'에서 온 이름입니다. 원래 시스템의
+성장 두뇌를 부르던 내부 코드네임이었고 2026-07-02 시스템 전체 이름으로 승격했습니다.
+
+---
+
+## Legacy 1. 왜 이렇게 만들었나
 
 보통의 RAG는 매 질문마다 원본을 다시 뒤져 답을 "재유도"합니다 — 지식이 **쌓이지 않습니다**.
 MNEME는 처리된 지식을 구조화된 Wiki에 **컴파일해 저장**하고(L2), 작업 경험에서 **스킬 성향을
@@ -30,7 +95,7 @@ LLM의 본체(θ_base)는 그대로 둔 채, 작은 적응값 δ만 외부에서
 
 ---
 
-## 2. 5층 기억 — 무엇을 기억하나
+## Legacy 2. 5층 기억 — 무엇을 기억하나
 
 | 층 | 내용 | 저장소 |
 |----|------|--------|
@@ -42,7 +107,7 @@ LLM의 본체(θ_base)는 그대로 둔 채, 작은 적응값 δ만 외부에서
 
 ---
 
-## 3. 5요소 — 어떻게 성장하나
+## Legacy 3. 5요소 — 어떻게 성장하나
 
 | 요소 | 역할 |
 |------|------|
@@ -96,7 +161,7 @@ seeding ──(use≥3)──► developing ──(use≥10 & 성공률≥0.7 & 
 
 ---
 
-## 4. 안전 — 헌법과 CIB
+## Legacy 4. 안전 — 헌법과 CIB
 
 `mneme/constitution.yaml`은 3층 구조입니다.
 
@@ -117,4 +182,5 @@ seeding ──(use≥3)──► developing ──(use≥10 & 성공률≥0.7 & 
 
 ---
 
-*MNEME 5요소·5층은 모두 가동 중입니다. 상세 진행 기록은 [PROGRESS.md](../PROGRESS.md)를 참고하세요.*
+*Legacy MNEME 5요소·5층은 호환 경로에서 유지됩니다. 현재 Madi 구현 진행은
+[PROGRESS.md](../PROGRESS.md)를 참고하세요.*

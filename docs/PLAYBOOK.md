@@ -1,9 +1,65 @@
-# MNEME 사용자 플레이북
+# Madi / Mneme 사용자 플레이북
 
 > **"지금 이 상황에서 뭘 하면 되지?"에 답하는 문서.**
 > 설치는 [USAGE.md](USAGE.md), 새 PC 이식은 [SETUP-NEW-PC.md](SETUP-NEW-PC.md),
 > 동작 원리는 [PRINCIPLES.md](PRINCIPLES.md), 왜 이렇게 만들었는지는 [DECISIONS.md](DECISIONS.md),
 > 새 프로젝트 연동·활용법(유스케이스 포함)은 [INTEGRATION.md](INTEGRATION.md).
+
+---
+
+## A. Madi 일상 운영
+
+### 작업을 시작하거나 다시 이어갈 때
+
+1. `doctor`로 Vault 구조와 policy 상태를 확인합니다.
+2. `context --workstream <id> --mode portable`로 선택된 portable head를 읽습니다.
+3. 이 머신의 confidential overlay까지 허용할 때만 `--mode effective-local`을 사용합니다.
+4. 필요한 세부 정보는 `recall`과 authoritative project docs에서 추가로 찾습니다.
+
+전체 Vault나 전체 session history를 매번 prompt에 넣지 않습니다.
+
+### 작업 중 중요한 경계가 생겼을 때
+
+다음 시점에는 host agent가 semantic checkpoint를 작성합니다.
+
+- compact/PreCompact 직전
+- 중요한 결정 또는 검증된 milestone
+- agent 전환
+- 다른 PC로 이동하기 전
+- 장시간 작업 중 명시적 중간 checkpoint
+
+Checkpoint에는 대화 원문이 아니라 다음 작업자가 실제로 이어가는 데 필요한 내용만
+넣습니다: objective, current state, verified facts, completed work, blockers, next actions.
+
+### Claude에서 Codex로 넘길 때
+
+1. Claude가 마지막 sanitized Session revision을 기록합니다.
+2. Handoff는 별도 파일이 아니라 revision 안의 relation/event로 남깁니다.
+3. Codex는 별도 Session을 만들고 `continues_from`으로 연결합니다.
+4. Registry의 active head/preferred head는 명시적 Core command로 선택합니다.
+5. Agent native memory는 실시간 세부 맥락에 사용하고 Madi는 durable flow를 제공합니다.
+
+### 다른 PC에서 이어갈 때
+
+1. Private Vault를 clone합니다.
+2. 새 machine-local state-home을 만듭니다.
+3. `doctor` → `reindex` → `context`를 실행합니다.
+4. 필요한 source mount의 local path를 이 PC에서 다시 binding합니다.
+
+Generated DB, CURRENT, PROFILE, cache는 복사하지 않습니다. 없어도 canonical state는
+Session/Memory/Registry에서 복원되어야 합니다.
+
+### Madi가 실패했을 때
+
+일반 agent 작업은 계속합니다. Adapter는 fail-open입니다. 실패한 checkpoint는 나중에
+수동으로 다시 제출하며, Madi 장애 때문에 coding/build/test 작업을 중단하지 않습니다.
+
+---
+
+## Legacy Mneme 운영
+
+이하의 상시 HTTP MCP, 외부 Wiki, `state.db`, Ollama, Growth 운영 절차는 기존 사용자를
+위해 보존합니다. Madi Core의 필수 운영 절차가 아닙니다.
 
 ---
 

@@ -2,6 +2,10 @@
 
 > 구성요소·데이터 흐름·저장 위치를 설명합니다.
 > 개념(왜/어떻게)은 [PRINCIPLES.md](PRINCIPLES.md), 사용 방법은 [USAGE.md](USAGE.md)를 참고하세요.
+>
+> **현재 문서 구조:** §1–5는 보존된 legacy Mneme HTTP/Wiki/Growth architecture이고,
+> §6은 opt-in Madi Vault architecture입니다. Madi D3의 binding authority는
+> [승인된 specification](superpowers/specs/2026-08-26-madi-d3-vault-design.md)입니다.
 
 ---
 
@@ -32,7 +36,7 @@
 
 | 모듈 | 역할 |
 |------|------|
-| `server.py` | FastMCP 서버. 13개 도구 등록, watcher·scheduler 기동/정지. |
+| `server.py` | Legacy compatibility facade. 실제 `transports/legacy_http.py`가 FastMCP 도구 16개와 watcher·scheduler lifecycle을 제공. |
 | `memory.py` | SQLite 스키마·연결. 모든 테이블의 단일 진입점. |
 | `wiki.py` | Wiki 마크다운 파일 읽기/쓰기/목록. |
 | `index.py` | FTS5 전문검색 인덱싱·재인덱싱·요약. |

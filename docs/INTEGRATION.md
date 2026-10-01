@@ -1,4 +1,8 @@
-# 프로젝트 연동 가이드 — raw 데이터를 쌓는 프로젝트가 mneme/위키를 활용하는 법
+# 프로젝트 연동 가이드 — Madi adapter와 legacy Mneme
+
+> **현재 문서 구조:** §1–7은 기존 Mneme HTTP MCP/Wiki/Growth 연동을 보존하고,
+> §8은 Madi Claude/Codex adapter와 policy lifecycle을 설명합니다. 새 integration 진입점은
+> [integration/README.md](../integration/README.md)입니다.
 
 > **대상 독자**: 자기 repo에 raw 데이터·코드를 쌓으면서,
 > 그 과정에서 생기는 지식을 위키로 축적·재사용하고 싶은 프로젝트 (사람 + 그 프로젝트의 Claude 에이전트).
@@ -169,9 +173,11 @@ growth_log()   skill_suggest   wiki_search    episode_reflect
 
 ## 8. Opt-in Madi adapters and policy lifecycle
 
-Madi adapters are optional, fail-open bridges into the agent-neutral Core. A
-Claude or Codex hook failure returns `block_host=False`; ordinary agent work
-continues. Adapters may observe lifecycle events and request a checkpoint, but a
+Madi adapters are optional, fail-open bridges into the agent-neutral Core.
+Claude uses an explicit stdio MCP + project-instruction workflow; its installer
+does not add a native lifecycle hook. Codex installs an observing `PreCompact`
+hook whose diagnostic always keeps `block_host=False`. Adapter failure does not
+stop ordinary agent work. A lifecycle observation may request a checkpoint, but a
 portable write requires a separately composed, sanitized Core command. Raw
 transcripts, tool output, native hook fields, credentials, logs, and required
 absolute source paths are not portable checkpoint inputs.
