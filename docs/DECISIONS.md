@@ -1,13 +1,62 @@
 # 결정 기록 (Decisions Log)
 
-> 시스템(mneme + 위키 + 게이트웨이)에 대한 굵직한 설계 결정을 시간순으로 남긴다.
-> **이 파일이 진실의 원천(source of truth)이다.** Claude Code의 `.claude` 자동 메모리는
+> 시스템(Madi Core + legacy Mneme)에 대한 굵직한 설계 결정을 시간순으로 남긴다.
+> 이 파일은 저장소 수준 결정의 요약 기록이며, Madi Vault 정보 구조의 binding authority는
+> [승인된 D3 specification](superpowers/specs/2026-08-26-madi-d3-vault-design.md)이다.
+> Claude Code의 `.claude` 자동 메모리는
 > 하네스 전용·경로 고정이라 이식 불가 → 거기엔 "이 파일을 봐라"는 포인터만 둔다.
 > 어떤 AI·머신이든 이 repo를 clone하면 결정 맥락을 그대로 복원할 수 있어야 한다.
 >
 > **2026-07-09**: repo public 전환에 따라 과거 항목에서 개인 상황에 기반한 판단 근거
 > (착수 트리거·수요 평가 상세)를 개인 위키로 분리했다. 분리 기준 — *"fork한 타인에게도
 > 유효한 근거인가"*. 여기 남은 것은 설계 결정과 그 기술적 근거다.
+
+---
+
+## 2026-08-26
+
+### 1. 제품 방향: Mneme에서 Madi로 점진적 진화 (승인)
+
+제품 thesis를 “self-improving shared brain”에서 **사람이 소유하고 여러 agent와 공유하는
+지속적·휴대 가능한 continuity layer**로 전환한다. 새 저장소를 만드는 Big Bang rewrite나
+즉시 rename 대신 기존 Mneme의 deterministic search, Markdown/Git 철학, lint, mounts,
+MCP 및 Growth 자산을 분류해 점진적으로 이동한다.
+
+Repository/package 이름은 설계와 migration이 안정될 때까지 `mneme-mcp`/`mneme`로 유지한다.
+Legacy HTTP MCP, 외부 Wiki, DB, watcher, scheduler 및 Growth data도 명시적 migration 전에는
+삭제하지 않는다.
+
+### 2. D0–D2: ownership, layer boundary, capture policy (승인)
+
+- **D0:** ownership unit은 person이다. Project repository는 project truth, Madi는 personal
+  continuity를 소유한다.
+- **D1:** generation LLM 없이 동작하는 Madi Core, agent-specific adapter, optional Growth
+  Lab으로 책임을 분리한다. MCP는 Core의 transport 중 하나다.
+- **D2:** raw conversation archive가 아니라 host agent가 선택·정제한 semantic candidate와
+  checkpoint만 저장한다. Compact를 first-class checkpoint boundary로 취급한다.
+
+### 3. D3: Portable Vault Information Architecture (승인)
+
+[2026-08-26 Madi D3](superpowers/specs/2026-08-26-madi-d3-vault-design.md)를
+authoritative specification으로 승인했다. 주요 결정은 다음과 같다.
+
+- Canonical portable artifact는 Session revision, Memory, Registry/policy revision이다.
+- CURRENT와 PROFILE, SQLite/FTS index는 generated view이며 삭제·재생성 가능하다.
+- Workstream Registry가 active heads와 preferred head를 명시하므로 clean/shallow clone에서도
+  deterministic context를 생성한다.
+- Accepted Memory 변경은 overwrite가 아니라 새 ID + `supersedes`를 사용한다.
+- Portable artifact는 local-only artifact의 ID, path, hash, count 또는 존재를 노출하지 않는다.
+- Source/project policy ceiling은 파생 memory에 상속되며 agent가 높일 수 없다.
+- Checkpoint persistence와 Git commit/push policy를 분리한다.
+- Concurrent semantic conflict는 자동 병합하지 않는다. 증명 가능한 disjoint head addition만
+  bounded structural retry를 허용한다.
+- Git에 이미 전파된 정보의 retroactive deletion은 보장하지 않는다.
+
+### 4. 실행 전략: coexistence-first migration (승인)
+
+Characterization tests로 기존 동작을 먼저 고정하고 Core extraction → Vault/schema →
+Session/Memory/Registry → recall/policy/sync → adapters → Growth 분리 → legacy staging 순으로
+이동한다. 각 단계는 runnable state를 유지하며 legacy durable data의 자동 삭제·승격을 금지한다.
 
 ---
 

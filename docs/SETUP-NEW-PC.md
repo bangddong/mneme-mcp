@@ -2,6 +2,10 @@
 
 > 다른 PC에서 mneme를 처음부터 띄우는 절차입니다. 기존 PC의 경험·지식을 그대로
 > 이어가려면 **0단계(원격 백업)** 가 반드시 선행돼야 합니다.
+>
+> **현재 문서 구조:** §0–7은 legacy Mneme/Wiki/`state.db` 이전 절차이고,
+> §8은 portable Madi Vault의 clean-clone bootstrap입니다. Legacy `state.db`와 Wiki는
+> 명시적 검토·승격 전까지 원본을 보존합니다.
 
 ---
 
@@ -116,7 +120,7 @@ CreateObject("WScript.Shell").Run """D:\dev\mneme-mcp\mneme-start.bat""", 0, Fal
 1. `ollama list` → 모델 보이는지
 2. `python -m mneme.server` 수동 실행 → `http://localhost:8080/mcp` 뜨는지
 3. 한 번 재부팅 → 로그인 후 자동으로 mneme·Ollama 떴는지 (`memory/server.log` 확인)
-4. Claude Code 재시작 → 도구 13개 (`mneme_status` 호출)
+4. Claude Code 재시작 → legacy 도구 16개 (`mneme_status` 호출)
 5. `wiki_list` → 옮겨온 위키 카테고리·페이지가 인덱싱됐는지
 
 ---
@@ -125,3 +129,67 @@ CreateObject("WScript.Shell").Run """D:\dev\mneme-mcp\mneme-start.bat""", 0, Fal
 
 > **코드·위키를 원격에 올려두는 것(0단계)이 이사의 90%입니다.** 새 PC에선 clone →
 > deps·모델 설치 → `.env`·런처 **경로만 새 위치로** 고치면 그대로 이어집니다.
+
+---
+
+## 8. Opt-in Vault bootstrap on another PC
+
+This is an independent Madi path; it does not require the legacy Ollama,
+three-repository clone, or `state.db` copy above. Install this package, clone the
+portable Vault, and choose a separate machine-local state root. Do not copy
+another machine's generated DB, views, bindings, overlays, evidence, caches,
+locks, or logs into portable Git.
+
+```powershell
+python -m pip install -e ".[dev]"
+$VaultRoot = (Resolve-Path .\madi-vault).Path
+$StateHome = Join-Path $env:LOCALAPPDATA "madi-state"
+```
+
+`doctor` validates the portable tree and atomically bootstraps the absent local
+directory skeleton. Use the actual parser order—global flags before the command:
+
+```powershell
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome doctor
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome reindex
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome context --workstream <workstream-id> --mode portable
+```
+
+With an editable/package install, `mneme-vault` is the equivalent provisional
+entry point. For a brand-new Vault rather than a clone, use the implemented API
+`Vault.initialize(Path(<vault>), Path(<state>), <owner-id>)`; it creates both
+roots and the default policy atomically. A clone intentionally does not carry
+machine-local source bindings, so missing optional mounts may make doctor,
+reindex, or context `degraded` without making the Vault invalid.
+
+If a cloned portable source registry already contains `project-docs`, bind its
+absolute path on this machine with the local-only API:
+
+```powershell
+@'
+from pathlib import Path
+import sys
+from mneme.core.sources.registry import SourceBindingStore
+from mneme.core.vault import Vault
+
+vault = Vault.open(Path(sys.argv[1]), Path(sys.argv[2]))
+SourceBindingStore(vault).bind(sys.argv[3], Path(sys.argv[4]))
+'@ | python - $VaultRoot $StateHome project-docs D:\development\my-project
+```
+
+The source ID must already exist in the portable Source Registry. A genuinely
+new source is first registered once with `RegistryStore.register_source`; only
+its machine absolute path belongs in `SourceBindingStore`. The binding is stored
+under local state and must never be committed to the Vault. Binding does not
+mutate a previously generated index, so run `reindex` again after adding or
+changing bindings:
+
+```powershell
+python -m mneme.cli --vault-root $VaultRoot --state-home $StateHome reindex
+```
+
+The legacy `state.db` copy instructions above remain unchanged. Opting out or
+rolling back means stopping the optional Madi adapters and continuing
+`mneme.server` with the existing Wiki, DB, watcher, scheduler, and Growth paths.
+This procedure neither renames the repository/package nor claims deletion of
+legacy durable data.

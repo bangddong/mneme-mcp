@@ -1,0 +1,10 @@
+<!-- MADI-CLAUDE-ADAPTER: BEGIN -->
+## Optional Madi continuity
+
+- Use the `madi` stdio tools only when this project has been explicitly configured.
+- At startup or resume, request bounded context for the selected workstream.
+- Before compaction, at a milestone, or on a manual checkpoint, select and sanitize the continuity facts yourself. Do not include raw conversation text or tool output.
+- Put the selected JSON checkpoint in this project's `.madi/checkpoints/` directory (or configured temporary storage) and use the Claude adapter to submit it.
+- A lifecycle event by itself never saves a revision. If Madi is unavailable, continue ordinary work and retry a manual checkpoint later.
+
+<!-- MADI-CLAUDE-ADAPTER: END -->

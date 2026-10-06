@@ -1,4 +1,8 @@
-# 프로젝트 연동 가이드 — raw 데이터를 쌓는 프로젝트가 mneme/위키를 활용하는 법
+# 프로젝트 연동 가이드 — Madi adapter와 legacy Mneme
+
+> **현재 문서 구조:** §1–7은 기존 Mneme HTTP MCP/Wiki/Growth 연동을 보존하고,
+> §8은 Madi Claude/Codex adapter와 policy lifecycle을 설명합니다. 새 integration 진입점은
+> [integration/README.md](../integration/README.md)입니다.
 
 > **대상 독자**: 자기 repo에 raw 데이터·코드를 쌓으면서,
 > 그 과정에서 생기는 지식을 위키로 축적·재사용하고 싶은 프로젝트 (사람 + 그 프로젝트의 Claude 에이전트).
@@ -164,3 +168,81 @@ growth_log()   skill_suggest   wiki_search    episode_reflect
 - [ ] `wiki_list(prefix="<카테고리>")`에 카테고리가 보이는가
 - [ ] `episode_log`(또는 `python -m mneme.log -a <에이전트명>`)에 이 프로젝트 이력이 쌓이고 있는가
 - [ ] `skill_suggest`가 `<prefix>` 스킬을 돌려주는가 (없으면 아직 seed 안 한 것 — 정상일 수 있음)
+
+---
+
+## 8. Opt-in Madi adapters and policy lifecycle
+
+Madi adapters are optional, fail-open bridges into the agent-neutral Core.
+Claude uses an explicit stdio MCP + project-instruction workflow; its installer
+does not add a native lifecycle hook. Codex installs an observing `PreCompact`
+hook whose diagnostic always keeps `block_host=False`. Adapter failure does not
+stop ordinary agent work. A lifecycle observation may request a checkpoint, but a
+portable write requires a separately composed, sanitized Core command. Raw
+transcripts, tool output, native hook fields, credentials, logs, and required
+absolute source paths are not portable checkpoint inputs.
+
+Policy changes must use the official generation-checked command surface, never
+edit policy or registry YAML directly:
+
+```python
+from mneme.core.contracts import CoreCommand
+from mneme.core.service import CoreService
+
+service = CoreService(vault)
+created = service.execute(CoreCommand(1, "create_policy_revision", {
+    "policy_id": "source-policy",
+    "revision": "2",
+    "rule": {"ceiling": "local-only"},
+    "storage_class": "portable",
+}))
+policy_ref = created.result["policy_ref"]
+service.execute(CoreCommand(1, "activate_policy_revision", {
+    "expected_generation": policy_index_generation,
+    "policy_ref": policy_ref,
+}))
+service.execute(CoreCommand(1, "assign_project_policy", {
+    "project_id": project_id,
+    "policy_ref": policy_ref,
+    "expected_generation": project_generation,
+    "storage_class": "portable",
+}))
+service.execute(CoreCommand(1, "assign_source_policy", {
+    "source_id": source_id,
+    "policy_ref": policy_ref,
+    "expected_generation": source_generation,
+    "storage_class": "portable",
+}))
+```
+
+Check each `CommandResult.ok` before using its result. After tightening, the live
+gate applies even when a generated index still says `allowed`; use
+`CoreService.recall`, `context`, `profile`, and `authorize_export`, plus
+`mneme.core.git_sync.sync_preflight`. Remediation can retire a record or create a
+sanitized successor, but it cannot erase already propagated copies.
+
+Legacy discovery is read-only, and staging is lossless and local-only:
+
+```powershell
+mneme-vault --vault-root <vault> --state-home <state> migrate inspect --db-path <closed-state.db>
+mneme-vault --vault-root <vault> --state-home <state> migrate stage --db-path <closed-state.db> --wiki-path <wiki>
+```
+
+Staged episodes remain `candidate-durable-local`, and unknown tables remain
+`needs-review`. Nothing is promoted to portable Memory automatically. A reviewer
+must deliberately issue `submit_memory` and then `promote_memory` through
+`CoreService.execute` with the current generations and policy-compatible,
+sanitized content.
+
+The Codex `PreCompact` adapter is pinned to schema ID
+`openai-codex-hooks/pre-compact@2026-08-26+a26f1806` and OpenAI Codex commit
+`a26f1806a4f4b8cfec2ea1be129963815a61e58c`. The exact generated schema URL,
+release-behavior source checked on 2026-08-26, required/optional fields, and the
+warning that repository `main` can include unreleased fields are recorded in
+[`integration/madi/codex/README.md`](../integration/madi/codex/README.md#pinned-provenance).
+The checked-in native fixture validates that pinned contract; the adapter does
+not infer a workstream from native data.
+
+To roll back this opt-in path, remove or stop invoking the optional adapter hooks.
+Continue the unchanged HTTP MCP, Wiki, DB, watcher, scheduler, and Growth paths;
+no repository/package rename or legacy-data deletion is part of this rollout.

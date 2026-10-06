@@ -20,6 +20,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 mneme = "mneme.server:main"
+mneme-vault = "mneme.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mneme"]

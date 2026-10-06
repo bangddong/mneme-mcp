@@ -1,0 +1,9 @@
+generation: 2
+policies:
+  fixture-policy:
+    digest: d07a643db446ed4fd4c9ffe7b873729e4cd237ca37163414e2bca87a086dd0c1
+    revision: '1'
+  vault-default:
+    digest: 7925a02d351f6423d2a08f7aa4000c92b6543fefe07980edb737de24230b6a69
+    revision: '1'
+schema: madi.policy-index.v1

@@ -1,61 +1,129 @@
-# mneme 연동 키트 (Integration Kit)
+# Agent integration
 
-새 Claude Code 프로젝트에서 **외부 성장 두뇌 mneme**를 쓰기 위한 최소 배선.
-mneme는 MCP 서버라 도구 자체는 떠 있지만, 에이전트가 *제대로* 쓰려면
-(어떤 agent 이름으로 / 작업 전·후 어떤 도구를 / 어느 위키 카테고리에) 두 가지가 필요하다:
+이 디렉터리에는 두 세대의 integration이 공존합니다.
 
-1. **`.mcp.json`** — 프로젝트가 mneme 서버를 보게 하는 연결 1줄
-2. **CLAUDE.md 규약 블록** — 에이전트가 따라야 할 호출 프로토콜
+| 경로 | 대상 | 상태 |
+|---|---|---|
+| `integration/madi/` | Madi Vault Core와 Claude/Codex 연결 | 현재 opt-in 경로 |
+| `integration/install.py` 및 legacy templates | Mneme HTTP MCP/Wiki/Growth 연결 | 호환 경로 |
 
-이 키트가 둘 다 자동으로 넣어준다.
+두 integration 모두 host project의 기존 설정을 보존하며, Madi 또는 Mneme 장애가 일반
+agent 작업을 막지 않는 선택적 의존성을 지향합니다.
 
-> mneme는 **선택적 의존**이다. 서버가 꺼져 있으면 도구가 안 보일 뿐, 프로젝트는 평소대로 동작한다.
+## Madi integration
 
----
+### Claude
 
-## 빠른 설치 (1단계, 크로스플랫폼)
+Claude adapter는 agent-neutral stdio transport와 project instruction block을 opt-in으로
+설치합니다.
 
-Python은 mneme의 필수 의존이라 어느 OS든 보장된다 → OS별 셸 스크립트 대신 단일 `install.py`로
-Windows/Linux/macOS를 모두 커버한다.
+```powershell
+$env:MADI_VAULT_ROOT = "D:\data\my-madi"
+$env:MADI_STATE_HOME = "D:\local\madi-state"
+$Project = (Resolve-Path -LiteralPath "D:\development\my-project").Path
 
-```bash
-python E:/development/mneme-mcp/integration/install.py \
-  --project  E:/development/my-new-proj \
-  --agent    my-proj-builder \   # episodes.agent 에 기록될 이름
-  --category my-new-proj \       # 위키 카테고리
-  --prefix   mnp-                # 이 프로젝트 스킬 접두어
+# Current installer limitation: prepare these as regular files in the trusted
+# project with your editor. Do not let this recipe create/follow link targets.
+if (-not (Test-Path -LiteralPath "$Project\.mcp.json" -PathType Leaf)) {
+  throw "Create a regular .mcp.json containing {} in the trusted project first."
+}
+if (-not (Test-Path -LiteralPath "$Project\CLAUDE.md" -PathType Leaf)) {
+  throw "Create a regular CLAUDE.md in the trusted project first."
+}
+
+python integration/madi/install_claude.py --project $Project
 ```
 
-스크립트가 하는 일 (멱등 — 다시 돌려도 안전):
-- `<project>/.mcp.json` 에 mneme 서버 항목 머지 (기존 서버 보존)
-- `<project>` CLAUDE.md 에 mneme 규약 블록 추가 (`{{AGENT_NAME}}` 등 치환)
+설치기는 기존 `.mcp.json` server와 `CLAUDE.md` 내용을 보존하고 Madi 항목을 한 번만
+추가합니다. Vault absolute path나 credential을 project repository에 기록하지 않습니다.
+현재 installer의 conservative path preflight는 두 target file이 없는 것을 unsafe로
+처리합니다. Trusted project에서 `.mcp.json`은 `{}`를 담은 regular file로,
+`CLAUDE.md`는 빈 regular file로 먼저 준비해야 합니다. 위 preflight는 누락 시 쓰기 전에
+중단하며, installer가 전체 path chain의 symlink/reparse 여부를 다시 검증합니다.
+`MADI_VAULT_ROOT`와 `MADI_STATE_HOME`은 Claude를 시작하는 process가 상속해야 합니다.
+위 예시는 현재 PowerShell process에만 적용됩니다. 지속 설정이 필요하면 machine-local
+launcher나 OS user environment를 사용하고 project repository에는 경로를 commit하지 않습니다.
 
----
+Claude installer는 native lifecycle hook을 설치하지 않습니다. Claude는 `CLAUDE.md`의
+지침과 stdio MCP tools를 이용해 context/checkpoint를 명시적으로 요청합니다.
 
-## 수동 설치 (스크립트 없이)
+관련 파일:
 
-1. `mcp-snippet.json` 의 `mneme` 항목을 프로젝트 `.mcp.json` 의 `mcpServers` 에 붙인다.
-2. `CLAUDE-mneme.md.template` 을 복사해 `{{AGENT_NAME}}`/`{{WIKI_CATEGORY}}`/`{{SKILL_PREFIX}}` 를
-   채운 뒤, 프로젝트 CLAUDE.md 맨 아래에 붙인다.
+- `madi/claude/mcp-stdio.json`
+- `madi/claude/CLAUDE.md.template`
+- `madi/install_claude.py`
 
----
+### Codex
 
-## 설치 후 남는 수동 단계
+Codex adapter는 pinned native `PreCompact` payload를 agent-neutral lifecycle event로
+변환합니다.
 
-| 단계 | 내용 |
-|------|------|
-| 위키 카테고리 | `E:/development/wiki/<Category>/` 생성 (기존 카테고리 구조 복사: `CLAUDE.md`/`index.md`/`log.md`/`pages/`/`sources/`) + 루트 `wiki/index.md`·`CLAUDE.md` 표에 행 추가 |
-| 서버 가동 | `python -m mneme.server` (자동시작 설정 시 부팅 시 자동) |
-| 확인 | Claude Code 재시작 → 도구 16개 노출 (`mneme_status` 호출) |
+```powershell
+$env:MADI_CODEX_WORKSTREAM_ID = "ws-1"
+python integration/madi/install_codex.py --project D:\development\my-project
+```
 
----
+`PreCompact` event는 checkpoint 필요성을 알릴 뿐 Session revision을 자동 작성하지
+않습니다. Transcript path, cwd, model, turn ID와 agent field를 열거나 portable artifact에
+복사하지 않습니다. Workstream binding은 machine-local configuration에서만 가져옵니다.
+`MADI_CODEX_WORKSTREAM_ID`는 Codex를 시작하는 process가 상속해야 하며 project file에
+기록하지 않습니다. Hook output은 `checkpoint_required` diagnostic일 뿐입니다. 실제
+checkpoint는 host가 sanitize한 payload를 CLI/stdio/Core command로 별도 제출합니다.
 
-## 키트 파일
+관련 파일:
 
-| 파일 | 역할 |
-|------|------|
-| `install.py` | 1단계 설치 스크립트 (크로스플랫폼 — Win/Linux/macOS) |
-| `mcp-snippet.json` | 수동 머지용 `.mcp.json` 조각 |
-| `CLAUDE-mneme.md.template` | 프로젝트 CLAUDE.md 에 넣을 규약 블록 (치환 변수 포함) |
+- `madi/codex/hooks.json`
+- `madi/codex/pre_compact_hook.py`
+- `madi/codex/AGENTS.md.template`
+- [Pinned schema and provenance](madi/codex/README.md)
+- `madi/install_codex.py`
 
-규약 자세히는 템플릿 본문 참고. 동작 원리·아키텍처는 `../docs/` 참고.
+### 실제 checkpoint 흐름
+
+```text
+Claude: project instruction + stdio MCP tool ───────────────┐
+Codex: native PreCompact → validation → checkpoint requested ├─→ host agent가 semantic content 선택·sanitize
+                                                            │
+                                                            └─→ explicit Core command
+                                                                → policy/CAS 검증
+                                                                → immutable Session revision
+```
+
+Raw transcript나 raw tool output은 이 흐름에서 portable Vault로 자동 유입되지 않습니다.
+Adapter/Core 실패 시 host 작업은 계속되고 수동 checkpoint를 나중에 재시도할 수 있습니다.
+
+## Legacy Mneme integration
+
+기존 Claude 프로젝트를 HTTP MCP/Wiki/Growth 경로에 연결하려면 legacy installer를
+사용합니다.
+
+```powershell
+python integration/install.py `
+  --project D:\development\my-project `
+  --agent my-project-builder `
+  --category my-project `
+  --prefix my-project-
+```
+
+설치기는 다음을 멱등적으로 추가합니다.
+
+1. Project `.mcp.json`에 `http://localhost:8080/mcp` server 항목
+2. Project `CLAUDE.md`에 Wiki/Growth tool 호출 규약
+
+Legacy 수동 설치 파일:
+
+- `mcp-snippet.json`
+- `CLAUDE-mneme.md.template`
+
+Legacy integration은 `python -m mneme.server`, 외부 Wiki, `.env`, 필요시 local LLM을
+사용합니다. 이 조건들은 Madi Core의 필수 조건이 아닙니다.
+
+## 선택 기준
+
+- Cross-agent/cross-machine personal continuity가 목적이면 `integration/madi/`를 사용합니다.
+- 기존 Wiki 인제스트 및 Growth workflow를 유지하려면 legacy integration을 사용합니다.
+- Migration 중에는 둘을 동시에 사용할 수 있지만 같은 사실을 자동으로 양쪽에 복제하지
+  않습니다.
+
+구조와 policy 경계는 [docs/INTEGRATION.md](../docs/INTEGRATION.md), 기존 데이터 staging은
+[docs/MIGRATION-MNEME-TO-MADI.md](../docs/MIGRATION-MNEME-TO-MADI.md)를 참고하세요.

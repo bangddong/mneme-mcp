@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "madi": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "mneme.transports.mcp_stdio"]
+    }
+  }
+}

@@ -17,5 +17,8 @@ dist/
 .venv/
 .pytest_cache/
 
+# Local SDD planning and execution scratch
+.superpowers/sdd/
+
 # 잡파일
 *.stackdump

@@ -1,0 +1,5 @@
+policy_id: fixture-policy
+revision: '2'
+rule:
+  ceiling: local-only
+schema: madi.policy-revision.v1

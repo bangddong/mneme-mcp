@@ -1,7 +1,167 @@
 # 사용 방법 (Usage)
 
-> 설치·기동부터 일상 사용, 관찰·운영, 트러블슈팅까지 다룹니다.
-> 개념(왜/어떻게)은 [PRINCIPLES.md](PRINCIPLES.md), 구조는 [ARCHITECTURE.md](ARCHITECTURE.md)를 참고하세요.
+> Madi Vault와 호환성을 위해 유지되는 legacy Mneme 사용법을 함께 설명합니다.
+> 개념은 [PRINCIPLES.md](PRINCIPLES.md), 구조는 [ARCHITECTURE.md](ARCHITECTURE.md)를 참고하세요.
+
+## 현재 경로 선택
+
+| 목적 | 사용할 경로 |
+|---|---|
+| 개인이 소유하는 cross-agent/cross-machine 연속성 | **Madi Vault Core** |
+| 기존 Wiki, HTTP MCP, episode/Growth 기능 유지 | **Legacy Mneme** |
+
+두 경로는 현재 공존합니다. Madi를 선택해도 기존 Wiki와 `state.db`를 삭제하거나
+자동 변환하지 않습니다.
+
+## A. Madi Vault 사용
+
+### A-1. 설치와 초기화
+
+```powershell
+python -m pip install -e ".[dev]"
+
+@'
+from pathlib import Path
+from mneme.core.vault import Vault
+
+Vault.initialize(
+    Path(r"D:\data\my-madi"),
+    Path(r"D:\local\madi-state"),
+    "my-owner-id",
+)
+'@ | python -
+```
+
+Portable Vault와 machine-local state는 다른 경로를 사용합니다. API key, absolute
+source binding, raw evidence, index, cache, lock, log는 Vault Git에 넣지 않습니다.
+
+### A-2. 상태·복구·검색
+
+```powershell
+$Vault = "D:\data\my-madi"
+$State = "D:\local\madi-state"
+
+python -m mneme.cli --vault-root $Vault --state-home $State status
+python -m mneme.cli --vault-root $Vault --state-home $State doctor
+python -m mneme.cli --vault-root $Vault --state-home $State reindex
+python -m mneme.cli --vault-root $Vault --state-home $State context --mode portable
+python -m mneme.cli --vault-root $Vault --state-home $State recall "검색어" --limit 10
+```
+
+- `doctor`: canonical artifact와 local layout을 검사합니다.
+- `reindex`: Markdown/YAML source of truth에서 disposable SQLite index를 재생성합니다.
+- `context`: Registry에 기록된 head를 사용해 bounded CURRENT view를 생성합니다.
+- `recall`: generation LLM 없이 deterministic FTS를 수행합니다.
+- `effective-local` mode는 portable state와 허용된 local overlay를 합성합니다.
+
+### A-3. Memory candidate
+
+Project-scoped artifact를 만들기 전에 project와 workstream을 등록합니다. Project에는
+CLI가 있지만 workstream bootstrap은 현재 typed Registry API를 사용합니다.
+
+```powershell
+python -m mneme.cli --vault-root $Vault --state-home $State project `
+  --id project-1 --authority project
+
+@'
+from pathlib import Path
+import sys
+from mneme.core.registries import RegistryStore
+from mneme.core.vault import Vault
+
+vault = Vault.open(Path(sys.argv[1]), Path(sys.argv[2]))
+RegistryStore(vault).create_workstream(
+    "ws-1",
+    project="project-1",
+    mode="parallel",
+)
+'@ | python - $Vault $State
+```
+
+그다음 project-scoped candidate를 제출할 수 있습니다.
+
+```powershell
+python -m mneme.cli --vault-root $Vault --state-home $State remember `
+  --kind knowledge `
+  --scope project `
+  --scope-id project-1 `
+  --authority external-reference `
+  --portability personal-vault `
+  --body-file .\sanitized-memory.md
+```
+
+`kind`, `scope`, `authority`, `portability`, `status`는 독립 축입니다. `remember`는
+candidate만 제출합니다. Accepted Memory의 semantic body를 고치려면 기존 파일을
+덮어쓰지 않고 새 Memory ID와 supersedes 관계를 사용해야 합니다.
+
+### A-4. Checkpoint
+
+Checkpoint는 Git commit이 아니라 immutable Session revision입니다. Host agent가
+대화 전체가 아닌 objective, 현재 상태, 검증된 사실, 완료 작업, blocker, next action을
+정제한 JSON payload를 작성한 뒤 제출합니다.
+
+새 `ws-1`의 첫 revision을 위한 `checkpoint.json` 최소 예시는 다음과 같습니다.
+
+```json
+{
+  "workstream_id": "ws-1",
+  "session_id": "session-1",
+  "storage_class": "portable",
+  "expected_parent": null,
+  "expected_registry_generation": 0,
+  "body": {
+    "adapter_id": "host-agent",
+    "objective": "현재 작업 목표",
+    "current_state": "현재까지 확인된 상태",
+    "verified_facts": ["검증된 사실"],
+    "completed_work": [],
+    "blockers": [],
+    "next_actions": ["다음 작업"],
+    "source_refs": []
+  },
+  "relations": []
+}
+```
+
+```powershell
+python -m mneme.cli --vault-root $Vault --state-home $State checkpoint `
+  --payload .\checkpoint.json
+```
+
+동일 Session lineage의 경쟁 write나 preferred-head 변경은 자동 semantic merge하지
+않습니다. 현재 Registry generation/head를 다시 읽고 명시적으로 재시도해야 합니다.
+서로 다른 Session의 안전한 disjoint head addition만 bounded structural retry 대상입니다.
+후속 revision은 `expected_parent`에 직전 `session`/`revision`을 넣고 현재 Registry
+generation을 사용합니다.
+
+### A-5. Git과 다른 PC
+
+Checkpoint persistence와 Git commit/push는 분리되어 있습니다. `sync`는 force push나
+semantic merge를 하지 않는 명시적 primitive입니다.
+
+```powershell
+python -m mneme.cli --vault-root $Vault --state-home $State sync status
+python -m mneme.cli --vault-root $Vault --state-home $State sync fetch
+```
+
+새 PC에서는 portable Vault를 clone한 뒤 새 state-home을 지정해 `doctor`, `reindex`,
+`context` 순으로 실행합니다. 자세한 절차는
+[SETUP-NEW-PC.md](SETUP-NEW-PC.md#8-opt-in-vault-bootstrap-on-another-pc)를 참고하세요.
+
+### A-6. Privacy 원칙
+
+- raw transcript/tool output/evidence는 portable Git에 자동 저장하지 않습니다.
+- Source/project policy ceiling은 파생 artifact에 상속됩니다.
+- Agent는 portability를 낮출 수 있지만 source policy보다 높일 수 없습니다.
+- Policy가 강화되면 stale index를 신뢰하지 않고 recall/context/profile/sync에서 다시 평가합니다.
+- 이미 Git commit, clone, backup에 전파된 정보의 retroactive deletion은 보장하지 않습니다.
+
+---
+
+## Legacy Mneme 사용법
+
+아래 내용은 기존 HTTP MCP, 외부 Wiki, Ollama 및 Growth Lab 경로를 위한 호환 문서입니다.
+Madi Core를 사용하는 데 Ollama나 항상 켜진 서버는 필요하지 않습니다.
 
 ---
 
@@ -81,7 +241,7 @@ python -m mneme.server
 ```
 
 > ⚠️ MCP 서버는 **Claude Code 재시작 시점에 연결**됩니다. 서버에 새 도구를 추가했다면
-> Claude Code를 껐다 켜야 13개가 모두 보입니다.
+> Claude Code를 껐다 켜야 현재 legacy 도구 16개가 모두 보입니다.
 
 ---
 
@@ -210,7 +370,7 @@ episode_reflect(
 ## 4. 트러블슈팅 / FAQ
 
 **Q. 도구가 5개(또는 옛날 개수)만 보입니다.**
-→ MCP는 Claude Code 재시작 때 연결됩니다. Claude Code를 껐다 켜세요. 현재 13개입니다.
+→ MCP는 Claude Code 재시작 때 연결됩니다. Claude Code를 껐다 켜세요. 현재 legacy transport는 16개입니다.
 
 **Q. 검색이 빈약하거나 보정오차가 계속 None입니다.**
 → 로컬 LLM(Ollama)이 떠 있지 않을 때입니다. `ollama serve` 여부, `LLM_MODEL` 모델 pull
@@ -239,6 +399,6 @@ TODO입니다. 기능에는 영향이 없습니다.
 1. `ollama serve` + `ollama pull qwen2.5:7b`
 2. `cp .env.example .env` → 값 확인
 3. `python -m mneme.server` → `http://localhost:8080/mcp`가 뜨는지 확인
-4. Claude Code 재시작 → 도구 13개가 보이는지 확인 (`mneme_status` 호출)
+4. Claude Code 재시작 → legacy 도구 16개가 보이는지 확인 (`mneme_status` 호출)
 5. `wiki_search`로 검색 → `skill_seed` → 작업 → `episode_reflect`로 첫 학습 루프 한 바퀴
 6. `outer_loop_run(force=True)` → `self_model_status()`로 성장 지표 확인

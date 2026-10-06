@@ -1,0 +1,5 @@
+policy_id: vault-default
+revision: '1'
+rule:
+  ceiling: personal-vault
+schema: madi.policy-revision.v1

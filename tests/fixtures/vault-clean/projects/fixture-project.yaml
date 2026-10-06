@@ -1,0 +1,9 @@
+authority: project
+generation: 1
+id: fixture-project
+locator: null
+policy:
+  digest: d07a643db446ed4fd4c9ffe7b873729e4cd237ca37163414e2bca87a086dd0c1
+  policy_id: fixture-policy
+  revision: '1'
+schema: madi.project-registry.v1
