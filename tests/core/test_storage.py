@@ -32,6 +32,13 @@ def _directory_link(link: Path, target: Path, kind: str) -> None:
     _directory_symlink(link, target)
 
 
+def _remove_directory_link(link: Path) -> None:
+    if link.is_symlink():
+        link.unlink()
+        return
+    link.rmdir()
+
+
 @pytest.fixture
 def storage(tmp_path):
     from mneme.core.storage import ArtifactReader, ArtifactStore, StorageRouter
@@ -655,7 +662,7 @@ def test_local_memory_rejects_linked_overlays_to_portable_vault(
             )
         assert not leaked.exists()
     finally:
-        overlays.rmdir()
+        _remove_directory_link(overlays)
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "junction"])
@@ -678,4 +685,4 @@ def test_view_store_rejects_linked_views_without_external_creation(
             views_store.write("CURRENT.md", "must stay local")
         assert not (external / "CURRENT.md").exists()
     finally:
-        views.rmdir()
+        _remove_directory_link(views)

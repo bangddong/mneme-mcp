@@ -525,7 +525,7 @@ def test_approved_sanitized_derivative_rule_is_retained_immutably_in_receipt():
 
     assert receipt.approved_rule_ids == (DERIVATIVE_RULE,)
     with pytest.raises(FrozenInstanceError):
-        receipt.approved_rule_ids = ()
+        receipt.approved_rules = ()
 
 
 def test_policy_rule_and_receipt_validate_runtime_values_and_are_immutable():
