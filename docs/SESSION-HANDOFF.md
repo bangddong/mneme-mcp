@@ -68,7 +68,7 @@ blocker, next action을 남겨 다른 agent/session에서도 작업을 이어가
 | 방식 | 설명과 주의점 |
 | --- | --- |
 | 공식 모바일 Remote | Mac 데스크톱 앱의 Connections에서 설정하고 iPhone과 페어링하는 경로를 확인했다. 메뉴·제공 여부는 계정과 설치 버전에서 재확인한다. 임의의 standalone CLI 세션이 자동으로 보인다고 단정하지 않는다. |
-| CLI remote | `app-server` + `codex --remote`는 별도 experimental 경로다. 기존 CLI 세션에 자동 attach되는 것으로 설명하지 않는다. |
+| CLI remote | 이전 조사에서는 `app-server` + `codex --remote`가 별도 experimental 경로로 안내됐다. 현재 지원 상태는 재확인하며, 기존 CLI 세션에 자동 attach되는 것으로 설명하지 않는다. |
 | SSH + tmux | 같은 터미널 화면에 재접속하는 별도 방법이다. 사용자는 현재 ChatGPT 앱을 더 선호한다. |
 | ChatGPT 웹사이트 | 기존 Mac CLI 세션에 직접 attach하는 공식 경로는 확인하지 못했다. Work Cloud의 local computer access와 기존 CLI 세션 attach를 혼동하지 않는다. |
 
@@ -88,7 +88,7 @@ QR, pairing code, 인증 토큰은 대화나 이 문서에 기록하지 않는�
 - MCP 문서: https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp/
 - 초기 문서 조사에서 stdio MCP 연결 구조가 기존 Madi와 맞는 것으로 확인했다.
 - 실제 설치·설정·호환성 검증은 하지 않았다. Mac CPU/OS와 지원 범위부터 확인한다.
-- Hermes의 native memory는 Madi와 함께 사용할 수 있다.
+- Hermes의 native memory와 Madi의 병행 사용을 검토할 수 있다. 실제 연동 동작은 미검증이다.
 
 ### Octo
 
